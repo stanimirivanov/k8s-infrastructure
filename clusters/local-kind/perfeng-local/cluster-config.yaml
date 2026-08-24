@@ -1,0 +1,24 @@
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: perfeng-local
+
+nodes:
+  # Control plane node
+  - role: control-plane
+    image: kindest/node:v1.29.0
+    labels:
+      workload: control-plane
+
+  # Worker node for performance generators
+  - role: worker
+    image: kindest/node:v1.29.0
+    labels:
+      workload: performance-generator
+      perfeng.io/node-type: generator
+
+  # Worker node for system under test
+  - role: worker
+    image: kindest/node:v1.29.0
+    labels:
+      workload: sut
+      perfeng.io/node-type: sut
