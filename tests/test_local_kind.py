@@ -24,6 +24,28 @@ from scripts.cluster import (
 
 
 class ClusterTests(unittest.TestCase):
+    def test_private_stdin_is_delivered_without_printing(self):
+        captured = io.StringIO()
+        with redirect_stdout(captured):
+            output = run(
+                [sys.executable, "-c", "import sys; print(len(sys.stdin.buffer.read()))"],
+                input_data=b"private-password",
+            )
+        self.assertEqual(output.strip(), "16")
+        self.assertNotIn("private-password", captured.getvalue())
+
+    def test_private_stdin_is_not_resubmitted_after_timeout(self):
+        with patch("scripts.cluster.subprocess.Popen") as popen, redirect_stdout(io.StringIO()):
+            process = popen.return_value.__enter__.return_value
+            process.returncode = 0
+            process.communicate.side_effect = [subprocess.TimeoutExpired("kubectl", 10), (b"", b"")]
+            run(["kubectl", "create", "-f", "-"], input_data=b"private-password")
+            self.assertEqual(
+                process.communicate.call_args_list[0].kwargs["input"], b"private-password"
+            )
+            self.assertIsNone(process.communicate.call_args_list[1].kwargs["input"])
+            self.assertEqual(popen.call_args.kwargs["stdin"], subprocess.PIPE)
+
     def test_utf8_output_and_non_locale_stderr(self):
         captured = io.StringIO()
         with redirect_stdout(captured):

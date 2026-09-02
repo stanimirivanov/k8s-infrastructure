@@ -16,7 +16,7 @@ CONTEXT = f"kind-{NAME}"
 PROGRESS_INTERVAL = 10
 
 
-def run(command: list[str]) -> str:
+def run(command: list[str], *, input_data: bytes | None = None) -> str:
     environment = {
         key: value
         for key, value in os.environ.items()
@@ -30,15 +30,18 @@ def run(command: list[str]) -> str:
     # on kind's UTF-8 progress symbols, even when the child succeeds.
     with subprocess.Popen(
         command,
+        stdin=subprocess.PIPE if input_data is not None else None,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         env={**environment, "KIND_EXPERIMENTAL_PROVIDER": "docker"},
     ) as process:
         while True:
             try:
-                stdout, _ = process.communicate(timeout=PROGRESS_INTERVAL)
+                stdout, _ = process.communicate(input=input_data, timeout=PROGRESS_INTERVAL)
                 break
             except subprocess.TimeoutExpired:
+                # communicate() retains pending input; never submit credentials twice.
+                input_data = None
                 elapsed = int(time.monotonic() - started)
                 print(f"Still running {label} command ({elapsed}s elapsed)...", flush=True)
     if process.returncode:
