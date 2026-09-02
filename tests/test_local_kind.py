@@ -1,7 +1,11 @@
+import io
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -13,12 +17,68 @@ from scripts.cluster import (
     check_nodes,
     commands,
     execute,
+    run,
     verify_context,
     verify_local_docker,
 )
 
 
 class ClusterTests(unittest.TestCase):
+    def test_utf8_output_and_non_locale_stderr(self):
+        captured = io.StringIO()
+        with redirect_stdout(captured):
+            output = run(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import os; os.write(1, b'caf\\xc3\\xa9'); "
+                        "os.write(2, b'private-progress-\\xe2\\x8f\\xb3\\x8f')"
+                    ),
+                ]
+            )
+        self.assertEqual(output, "caf\u00e9")
+        self.assertIn("Starting", captured.getvalue())
+        self.assertIn("Completed", captured.getvalue())
+        self.assertNotIn("private-progress", captured.getvalue())
+
+    def test_waiting_progress_preserves_private_output(self):
+        captured = io.StringIO()
+        with patch("scripts.cluster.subprocess.Popen") as popen, redirect_stdout(captured):
+            process = popen.return_value.__enter__.return_value
+            process.returncode = 0
+            process.communicate.side_effect = [
+                subprocess.TimeoutExpired("kind", 10),
+                (b"private-kubeconfig", b"private-stderr"),
+            ]
+            self.assertEqual(run(["kind", "get", "kubeconfig"]), "private-kubeconfig")
+        self.assertIn("Still running kind command", captured.getvalue())
+        self.assertNotIn("private-", captured.getvalue())
+        self.assertEqual(process.communicate.call_count, 2)
+        self.assertNotIn("text", popen.call_args.kwargs)
+
+    def test_failure_withholds_output_and_completion(self):
+        captured = io.StringIO()
+        with redirect_stdout(captured), self.assertRaisesRegex(ValueError, "exit 7"):
+            run(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import os; os.write(1, b'private-output'); "
+                        "os.write(2, b'private-error'); raise SystemExit(7)"
+                    ),
+                ]
+            )
+        self.assertNotIn("private-", captured.getvalue())
+        self.assertNotIn("Completed", captured.getvalue())
+
+    def test_invalid_stdout_fails_without_false_completion(self):
+        captured = io.StringIO()
+        with redirect_stdout(captured), self.assertRaisesRegex(ValueError, "invalid UTF-8"):
+            run([sys.executable, "-c", "import os; os.write(1, b'\\x8f')"])
+        self.assertNotIn("Completed", captured.getvalue())
+
     def test_remote_docker_endpoints_rejected(self):
         with (
             patch.dict(os.environ, {"DOCKER_HOST": "tcp://remote:2376"}),

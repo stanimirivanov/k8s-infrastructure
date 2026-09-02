@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +13,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 NAME = "perfeng-local"
 CONTEXT = f"kind-{NAME}"
+PROGRESS_INTERVAL = 10
 
 
 def run(command: list[str]) -> str:
@@ -20,19 +22,34 @@ def run(command: list[str]) -> str:
         for key, value in os.environ.items()
         if key not in {"KUBECONFIG", "KUBERNETES_MASTER"} and not key.startswith("HELM_KUBE")
     }
-    result = subprocess.run(
+    # Only show the executable, never arguments/output that may contain credentials.
+    label = Path(command[0]).stem
+    print(f"Starting {label} command...", flush=True)
+    started = time.monotonic()
+    # Capture bytes: Windows' locale decoder can crash a subprocess reader thread
+    # on kind's UTF-8 progress symbols, even when the child succeeds.
+    with subprocess.Popen(
         command,
-        capture_output=True,
-        text=True,
-        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         env={**environment, "KIND_EXPERIMENTAL_PROVIDER": "docker"},
-    )
-    if result.returncode:
+    ) as process:
+        while True:
+            try:
+                stdout, _ = process.communicate(timeout=PROGRESS_INTERVAL)
+                break
+            except subprocess.TimeoutExpired:
+                elapsed = int(time.monotonic() - started)
+                print(f"Still running {label} command ({elapsed}s elapsed)...", flush=True)
+    if process.returncode:
         # Never echo a kubeconfig or captured authentication data.
-        raise ValueError(
-            f"{command[0]} failed (exit {result.returncode}); inspect the local cluster"
-        )
-    return result.stdout
+        raise ValueError(f"{label} failed (exit {process.returncode}); inspect the local cluster")
+    try:
+        output = stdout.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError(f"{label} returned invalid UTF-8; output withheld") from None
+    print(f"Completed {label} command.", flush=True)
+    return output
 
 
 def kubeconfig(root: Path) -> Path:
@@ -154,9 +171,11 @@ def execute(action: str, root: Path = ROOT, confirmation: str | None = None) -> 
         raise ValueError(
             "Deletion requires --confirm-delete perfeng-local; all cluster data is lost"
         )
+    print("Checking kind version...", flush=True)
     version = run(["kind", "version"]).split()
     if len(version) < 2 or version[1] != "v0.31.0":
         raise ValueError("This local layout requires kind v0.31.0")
+    print("Discovering local clusters...", flush=True)
     existing = run(["kind", "get", "clusters"]).splitlines()
     config = kubeconfig(root)
     if action == "up":
@@ -164,6 +183,7 @@ def execute(action: str, root: Path = ROOT, confirmation: str | None = None) -> 
             raise ValueError(
                 "Cluster or kubeconfig already exists; startup never deletes or adopts it"
             )
+        print("Checking local Docker endpoint and engine...", flush=True)
         verify_local_docker()
         run(["docker", "info"])
         config.parent.mkdir(mode=0o700, exist_ok=True)
@@ -174,9 +194,24 @@ def execute(action: str, root: Path = ROOT, confirmation: str | None = None) -> 
     else:
         if NAME not in existing:
             raise ValueError("Named local cluster does not exist")
+        print("Checking local Docker endpoint and cluster credentials...", flush=True)
         verify_local_docker()
         verify_context(root)
+    steps = {
+        "up": [
+            "Creating kind cluster (initial image download may take several minutes)",
+            "Waiting for nodes to become Ready",
+        ],
+        "deploy": ["Applying local namespaces", "Installing or upgrading sample SUT"],
+        "health": [
+            "Checking node readiness and placement",
+            "Checking CoreDNS rollout",
+            "Checking sample SUT rollout",
+        ],
+        "down": ["Deleting the confirmed local cluster"],
+    }
     for index, command in enumerate(commands(action, root)):
+        print(f"[{index + 1}/{len(steps[action])}] {steps[action][index]}...", flush=True)
         if action == "up" and index > 0:
             verify_context(root)
         output = run(command)
