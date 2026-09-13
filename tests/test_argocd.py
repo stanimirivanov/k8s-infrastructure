@@ -103,18 +103,21 @@ class GitOpsTests(unittest.TestCase):
         self.assertEqual(apply.args[0][-3:], ["apply", "-f", "-"])
         self.assertIn(b"name: perfeng-local-root", apply.kwargs["input_data"])
 
-    def test_root_health_requires_sync_and_health(self) -> None:
+    def test_application_health_requires_creation_sync_and_health(self) -> None:
         with patch("scripts.gitops.cluster.run") as run:
-            gitops.wait_for_root(["kubectl"])
+            gitops.wait_for_application(["kubectl"], gitops.SAMPLE_SUT_APPLICATION)
 
         conditions = [call.args[0][2] for call in run.call_args_list]
         self.assertEqual(
             conditions,
             [
+                "--for=create",
                 "--for=jsonpath={.status.sync.status}=Synced",
                 "--for=jsonpath={.status.health.status}=Healthy",
             ],
         )
+        for call in run.call_args_list:
+            self.assertIn(f"application/{gitops.SAMPLE_SUT_APPLICATION}", call.args[0])
 
 
 if __name__ == "__main__":

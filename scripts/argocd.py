@@ -22,6 +22,7 @@ else:
 NAMESPACE = "argocd"
 OWNER = "perfeng-environment"
 ROOT_APPLICATION = "perfeng-local-root"
+SAMPLE_SUT_APPLICATION = "perfeng-local-sample-sut"
 REPOSITORY_CREDENTIALS = "perfeng-github-repository-credentials"
 REPOSITORY_PREFIX = "https://github.com/stanimirivanov"
 REPOSITORY_URL = REPOSITORY_PREFIX + "/perfeng-environment.git"
@@ -37,7 +38,7 @@ DEPLOYMENTS = (
 STATEFULSETS = ("argocd-application-controller",)
 
 
-def kubectl(root: Path) -> list[str]:
+def kubectl(root: Path, *, namespace: str = NAMESPACE) -> list[str]:
     """Return the explicitly bound local-cluster command prefix."""
     return [
         "kubectl",
@@ -46,7 +47,7 @@ def kubectl(root: Path) -> list[str]:
         "--context",
         cluster.CONTEXT,
         "--namespace",
-        NAMESPACE,
+        namespace,
         "--request-timeout=30s",
     ]
 
@@ -124,15 +125,63 @@ def validate_configuration(root: Path = cluster.ROOT) -> str:
 
     root_kustomization = load_yaml(root / "gitops/environments/local/kustomization.yaml")
     project = load_yaml(root / "gitops/environments/local/project.yaml")
+    sample_sut = load_yaml(root / "gitops/environments/local/sample-sut-application.yaml")
     workspace = json.loads((root / "workspace.json").read_text(encoding="utf-8"))
     repository_urls = sorted(item["url"] for item in workspace["repositories"])
+    project_spec = project.get("spec", {})
     if (
-        root_kustomization.get("resources") != ["project.yaml"]
+        root_kustomization.get("resources") != ["project.yaml", "sample-sut-application.yaml"]
         or project.get("kind") != "AppProject"
         or project.get("metadata", {}).get("name") != "perfeng-local"
-        or sorted(project.get("spec", {}).get("sourceRepos", [])) != repository_urls
+        or project.get("metadata", {}).get("annotations", {}).get("argocd.argoproj.io/sync-wave")
+        != "-1"
+        or set(project_spec)
+        != {
+            "description",
+            "sourceRepos",
+            "destinations",
+            "namespaceResourceWhitelist",
+        }
+        or sorted(project_spec.get("sourceRepos", [])) != repository_urls
+        or project_spec.get("destinations")
+        != [
+            {"server": "https://kubernetes.default.svc", "namespace": namespace}
+            for namespace in ("monitoring", "perf-generators", "perf-platform", "perf-sut")
+        ]
+        or project_spec.get("namespaceResourceWhitelist") != [{"group": "*", "kind": "*"}]
     ):
         raise ValueError("Invalid local root Kustomize configuration")
+    sample_metadata = sample_sut.get("metadata", {})
+    sample_spec = sample_sut.get("spec", {})
+    if (
+        sample_sut.get("apiVersion") != "argoproj.io/v1alpha1"
+        or sample_sut.get("kind") != "Application"
+        or set(sample_metadata) != {"name", "namespace", "labels"}
+        or sample_metadata.get("name") != SAMPLE_SUT_APPLICATION
+        or sample_metadata.get("namespace") != NAMESPACE
+        or sample_metadata.get("labels")
+        != {
+            "app.kubernetes.io/managed-by": OWNER,
+            "perfeng.io/environment": "local",
+            "perfeng.io/workload": "sample-sut",
+        }
+        or set(sample_spec) != {"project", "source", "destination", "syncPolicy"}
+        or sample_spec.get("project") != "perfeng-local"
+        or sample_spec.get("source")
+        != {
+            "repoURL": REPOSITORY_URL,
+            "targetRevision": "main",
+            "path": "charts/sample-sut",
+            "helm": {"releaseName": "sample-sut"},
+        }
+        or sample_spec.get("destination")
+        != {"server": "https://kubernetes.default.svc", "namespace": "perf-sut"}
+        or sample_spec.get("syncPolicy", {}).get("automated")
+        != {"enabled": True, "prune": False, "selfHeal": False}
+        or set(sample_spec.get("syncPolicy", {})) != {"automated", "syncOptions"}
+        or sample_spec.get("syncPolicy", {}).get("syncOptions") != ["CreateNamespace=true"]
+    ):
+        raise ValueError("Invalid local sample SUT Application")
     return version
 
 
@@ -253,15 +302,16 @@ def ensure_root(kube: list[str], root: Path, *, apply: bool) -> None:
         cluster.run([*kube, "apply", "-f", "-"], input_data=content)
 
 
-def wait_for_root(kube: list[str]) -> None:
-    """Require the local root Application to synchronize and become healthy."""
+def wait_for_application(kube: list[str], name: str) -> None:
+    """Require an Application to exist, synchronize and become healthy."""
+    cluster.run([*kube, "wait", "--for=create", f"application/{name}", "--timeout=180s"])
     for field, value in (("sync", "Synced"), ("health", "Healthy")):
         cluster.run(
             [
                 *kube,
                 "wait",
                 f"--for=jsonpath={{.status.{field}.status}}={value}",
-                f"application/{ROOT_APPLICATION}",
+                f"application/{name}",
                 "--timeout=180s",
             ]
         )
@@ -288,7 +338,17 @@ def execute(action: str, root: Path = cluster.ROOT) -> None:
     wait_for_argocd(kube)
     ensure_credentials(kube, create=action == "deploy")
     ensure_root(kube, root, apply=action == "deploy")
-    wait_for_root(kube)
+    wait_for_application(kube, ROOT_APPLICATION)
+    wait_for_application(kube, SAMPLE_SUT_APPLICATION)
+    cluster.run(
+        [
+            *kubectl(root, namespace="perf-sut"),
+            "rollout",
+            "status",
+            "deployment/sample-sut",
+            "--timeout=180s",
+        ]
+    )
     print(f"Local Argo CD GitOps action completed: {action}", flush=True)
 
 
@@ -300,7 +360,7 @@ def main() -> int:
     try:
         if args.action == "validate":
             version = validate_configuration()
-            print(f"Validated official Argo CD {version} manifest and local root Application.")
+            print(f"Validated official Argo CD {version} manifest and local Applications.")
         elif args.execute:
             execute(args.action)
         else:
