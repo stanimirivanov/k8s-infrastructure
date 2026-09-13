@@ -6,9 +6,9 @@ import argparse
 import base64
 import json
 import os
-import re
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import yaml
 
@@ -59,75 +59,47 @@ def load_yaml(path: Path) -> dict[str, Any]:
     return value
 
 
-def validate_configuration(root: Path = cluster.ROOT) -> str:
-    """Validate release pins and local GitOps objects without external access."""
-    release = json.loads((root / "gitops/argocd/release.json").read_text(encoding="utf-8"))
-    try:
-        if not isinstance(release, dict) or set(release) != {
-            "schemaVersion",
-            "version",
-            "kubernetesVersion",
-            "sourceRepository",
-            "sourceRevision",
-            "manifestPath",
-            "images",
-        }:
-            raise ValueError()
-        version = release["version"]
-        kubernetes_version = release["kubernetesVersion"]
-        revision = release["sourceRevision"]
-        images = release["images"]
-        if (
-            release["schemaVersion"] != 1
-            or not isinstance(version, str)
-            or re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", version) is None
-            or not isinstance(kubernetes_version, str)
-            or re.fullmatch(r"[0-9]+\.[0-9]+", kubernetes_version) is None
-            or release["sourceRepository"] != "https://github.com/argoproj/argo-cd.git"
-            or not isinstance(revision, str)
-            or re.fullmatch(r"[0-9a-f]{40}", revision) is None
-            or release["manifestPath"] != "manifests/install.yaml"
-            or not isinstance(images, list)
-            or len(images) != 3
-        ):
-            raise ValueError()
-        for image in images:
-            if (
-                not isinstance(image, dict)
-                or set(image) != {"name", "digest"}
-                or not isinstance(image["name"], str)
-                or re.fullmatch(r"[a-z0-9./_-]+", image["name"]) is None
-                or not isinstance(image["digest"], str)
-                or re.fullmatch(r"sha256:[0-9a-f]{64}", image["digest"]) is None
-            ):
-                raise ValueError()
-        if len({image["name"] for image in images}) != len(images):
-            raise ValueError()
-    except (KeyError, TypeError, ValueError):
-        raise ValueError("Invalid Argo CD release lock") from None
-
-    kind = load_yaml(root / "local/kind/cluster-config.yaml")
-    node_images = [node.get("image") for node in kind.get("nodes", [])]
-    expected_node = f"kindest/node:v{kubernetes_version}."
-    if len(node_images) != 3 or any(
-        not isinstance(image, str) or not image.startswith(expected_node) for image in node_images
-    ):
-        raise ValueError("Argo CD lock does not match the local Kubernetes minor version")
-
-    kustomization = load_yaml(root / "gitops/bootstrap/argocd/kustomization.yaml")
-    expected_source = (
-        f"https://raw.githubusercontent.com/argoproj/argo-cd/{revision}/{release['manifestPath']}"
-    )
-    expected_images = [
-        {"name": image["name"], "newName": image["name"], "digest": image["digest"]}
-        for image in images
-    ]
+def argocd_version(kustomization: dict[str, Any]) -> str:
+    """Return the explicit release selected by the official manifest resource."""
+    resources = kustomization.get("resources")
     if (
-        kustomization.get("namespace") != NAMESPACE
-        or kustomization.get("resources") != ["namespace.yaml", expected_source]
-        or kustomization.get("images") != expected_images
+        set(kustomization) != {"apiVersion", "kind", "namespace", "resources"}
+        or kustomization.get("apiVersion") != "kustomize.config.k8s.io/v1beta1"
+        or kustomization.get("kind") != "Kustomization"
+        or kustomization.get("namespace") != NAMESPACE
+        or not isinstance(resources, list)
+        or len(resources) != 2
+        or resources[0] != "namespace.yaml"
+        or not isinstance(resources[1], str)
     ):
-        raise ValueError("Argo CD Kustomize bootstrap differs from the release lock")
+        raise ValueError("Invalid Argo CD Kustomize bootstrap")
+    manifest = urlparse(resources[1])
+    parts = manifest.path.split("/")
+    if (
+        manifest.scheme != "https"
+        or manifest.netloc != "raw.githubusercontent.com"
+        or manifest.query
+        or manifest.fragment
+        or len(parts) != 6
+        or parts[1:3] != ["argoproj", "argo-cd"]
+        or parts[4:] != ["manifests", "install.yaml"]
+    ):
+        raise ValueError("Argo CD must use the official versioned install manifest")
+    version = parts[3]
+    numbers = version.removeprefix("v").split(".")
+    if (
+        not version.startswith("v")
+        or len(numbers) != 3
+        or not all(item.isdigit() for item in numbers)
+    ):
+        raise ValueError("Argo CD must use an explicit semantic release tag")
+    return version
+
+
+def validate_configuration(root: Path = cluster.ROOT) -> str:
+    """Validate the explicit Argo CD release and local objects without external access."""
+    kustomization = load_yaml(root / "gitops/bootstrap/argocd/kustomization.yaml")
+    version = argocd_version(kustomization)
 
     application = load_yaml(root / "gitops/bootstrap/local-root-application.yaml")
     metadata = application.get("metadata", {})
@@ -328,7 +300,7 @@ def main() -> int:
     try:
         if args.action == "validate":
             version = validate_configuration()
-            print(f"Validated Argo CD {version}, immutable images and local root Application.")
+            print(f"Validated official Argo CD {version} manifest and local root Application.")
         elif args.execute:
             execute(args.action)
         else:

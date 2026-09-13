@@ -25,8 +25,26 @@ def stored_credentials() -> dict[str, object]:
 
 
 class GitOpsTests(unittest.TestCase):
-    def test_repository_configuration_is_internally_consistent(self) -> None:
+    def test_repository_configuration_selects_an_explicit_release(self) -> None:
         self.assertEqual(gitops.validate_configuration(), "v3.5.2")
+
+    def test_mutable_or_foreign_manifest_source_is_rejected(self) -> None:
+        prefix = "https://raw.githubusercontent.com/argoproj/argo-cd/"
+        sources = [
+            f"{prefix}stable/manifests/install.yaml",
+            f"{prefix}main/manifests/install.yaml",
+            "https://raw.githubusercontent.com/someone/argo-cd/v3.5.2/manifests/install.yaml",
+        ]
+        for source in sources:
+            with self.subTest(source=source):
+                kustomization = {
+                    "apiVersion": "kustomize.config.k8s.io/v1beta1",
+                    "kind": "Kustomization",
+                    "namespace": "argocd",
+                    "resources": ["namespace.yaml", source],
+                }
+                with self.assertRaises(ValueError):
+                    gitops.argocd_version(kustomization)
 
     def test_credentials_are_immutable_and_scoped_to_the_github_owner(self) -> None:
         document = gitops.credential_document(TOKEN)
