@@ -40,6 +40,27 @@ class GitOpsTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "control-plane Application"):
             gitops.validate_control_plane_application(application, release)
 
+    def test_only_workload_applications_self_heal(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        applications = {
+            "root": gitops.load_yaml(root / "gitops/bootstrap/local-root-application.yaml"),
+            "sample-sut": gitops.load_yaml(
+                root / "gitops/environments/local/sample-sut-application.yaml"
+            ),
+            "control-plane": gitops.load_yaml(
+                root / "gitops/environments/local/control-plane-application.yaml"
+            ),
+        }
+
+        policies = {
+            name: application["spec"]["syncPolicy"]["automated"]
+            for name, application in applications.items()
+        }
+        self.assertIs(policies["root"]["selfHeal"], False)
+        self.assertIs(policies["sample-sut"]["selfHeal"], True)
+        self.assertIs(policies["control-plane"]["selfHeal"], True)
+        self.assertTrue(all(policy["prune"] is False for policy in policies.values()))
+
     def test_mutable_or_foreign_manifest_source_is_rejected(self) -> None:
         prefix = "https://raw.githubusercontent.com/argoproj/argo-cd/"
         sources = [

@@ -155,7 +155,7 @@ def validate_control_plane_application(
             "namespace": CONTROL_PLANE_NAMESPACE,
         }
         or spec.get("syncPolicy", {}).get("automated")
-        != {"enabled": True, "prune": False, "selfHeal": False}
+        != {"enabled": True, "prune": False, "selfHeal": True}
         or set(spec.get("syncPolicy", {})) != {"automated", "syncOptions"}
         or spec.get("syncPolicy", {}).get("syncOptions") != ["CreateNamespace=false"]
     ):
@@ -245,7 +245,7 @@ def validate_configuration(root: Path = cluster.ROOT) -> str:
         or sample_spec.get("destination")
         != {"server": "https://kubernetes.default.svc", "namespace": "perf-sut"}
         or sample_spec.get("syncPolicy", {}).get("automated")
-        != {"enabled": True, "prune": False, "selfHeal": False}
+        != {"enabled": True, "prune": False, "selfHeal": True}
         or set(sample_spec.get("syncPolicy", {})) != {"automated", "syncOptions"}
         or sample_spec.get("syncPolicy", {}).get("syncOptions") != ["CreateNamespace=true"]
     ):
