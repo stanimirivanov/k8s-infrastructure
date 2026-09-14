@@ -13,12 +13,13 @@ from urllib.parse import urlparse
 import yaml
 
 if __package__:
-    from . import cluster, control_plane_deployment
+    from . import cluster, control_plane_deployment, gitops_status
     from .control_plane_registry import valid_token
     from .control_plane_release import DEPLOYMENT_REPOSITORY, DeploymentLock, load_lock
 else:
     import cluster
     import control_plane_deployment
+    import gitops_status
     from control_plane_registry import valid_token
     from control_plane_release import DEPLOYMENT_REPOSITORY, DeploymentLock, load_lock
 
@@ -32,15 +33,6 @@ REPOSITORY_CREDENTIALS = "perfeng-github-repository-credentials"
 REPOSITORY_PREFIX = "https://github.com/stanimirivanov"
 REPOSITORY_URL = REPOSITORY_PREFIX + "/perfeng-environment.git"
 TOKEN_ENVIRONMENT_VARIABLE = "PERFENG_REPOSITORIES_CONTENTS_READ_TOKEN"
-DEPLOYMENTS = (
-    "argocd-applicationset-controller",
-    "argocd-dex-server",
-    "argocd-notifications-controller",
-    "argocd-redis",
-    "argocd-repo-server",
-    "argocd-server",
-)
-STATEFULSETS = ("argocd-application-controller",)
 CONTROL_PLANE_REGISTRY_ITEMS = [
     {"key": "jobs--analysis.yaml", "path": "jobs/analysis.yaml"},
     {"key": "jobs--execution.json", "path": "jobs/execution.json"},
@@ -347,14 +339,6 @@ def verify_namespace(kube: list[str], *, create: bool) -> None:
         raise ValueError("Existing argocd namespace is not owned by perfeng-environment")
 
 
-def wait_for_argocd(kube: list[str]) -> None:
-    """Wait for every workload in the pinned non-HA installation."""
-    for name in DEPLOYMENTS:
-        cluster.run([*kube, "rollout", "status", f"deployment/{name}", "--timeout=300s"])
-    for name in STATEFULSETS:
-        cluster.run([*kube, "rollout", "status", f"statefulset/{name}", "--timeout=300s"])
-
-
 def ensure_root(kube: list[str], root: Path, *, apply: bool) -> None:
     """Ownership-check and optionally apply the local root Application."""
     current = cluster.run(
@@ -369,21 +353,6 @@ def ensure_root(kube: list[str], root: Path, *, apply: bool) -> None:
     if apply:
         content = (root / "gitops/bootstrap/local-root-application.yaml").read_bytes()
         cluster.run([*kube, "apply", "-f", "-"], input_data=content)
-
-
-def wait_for_application(kube: list[str], name: str) -> None:
-    """Require an Application to exist, synchronize and become healthy."""
-    cluster.run([*kube, "wait", "--for=create", f"application/{name}", "--timeout=180s"])
-    for field, value in (("sync", "Synced"), ("health", "Healthy")):
-        cluster.run(
-            [
-                *kube,
-                "wait",
-                f"--for=jsonpath={{.status.{field}.status}}={value}",
-                f"application/{name}",
-                "--timeout=180s",
-            ]
-        )
 
 
 def execute(action: str, root: Path = cluster.ROOT) -> None:
@@ -404,12 +373,12 @@ def execute(action: str, root: Path = cluster.ROOT) -> None:
                 str(root / "gitops/bootstrap/argocd"),
             ]
         )
-    wait_for_argocd(kube)
+    gitops_status.wait_for_argocd(kube)
     ensure_credentials(kube, create=action == "deploy")
     ensure_root(kube, root, apply=action == "deploy")
-    wait_for_application(kube, ROOT_APPLICATION)
-    wait_for_application(kube, SAMPLE_SUT_APPLICATION)
-    wait_for_application(kube, CONTROL_PLANE_APPLICATION)
+    gitops_status.wait_for_application(kube, ROOT_APPLICATION)
+    gitops_status.wait_for_application(kube, SAMPLE_SUT_APPLICATION)
+    gitops_status.wait_for_application(kube, CONTROL_PLANE_APPLICATION)
     cluster.run(
         [
             *kubectl(root, namespace="perf-sut"),
