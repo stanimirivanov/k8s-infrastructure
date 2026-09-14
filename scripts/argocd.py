@@ -15,13 +15,23 @@ import yaml
 if __package__:
     from . import cluster, control_plane_deployment, gitops_status
     from .control_plane_registry import valid_token
-    from .control_plane_release import DEPLOYMENT_REPOSITORY, DeploymentLock, load_lock
+    from .control_plane_release import (
+        CONTROL_PLANE_HTTP_PORT,
+        DEPLOYMENT_REPOSITORY,
+        DeploymentLock,
+        load_lock,
+    )
 else:
     import cluster
     import control_plane_deployment
     import gitops_status
     from control_plane_registry import valid_token
-    from control_plane_release import DEPLOYMENT_REPOSITORY, DeploymentLock, load_lock
+    from control_plane_release import (
+        CONTROL_PLANE_HTTP_PORT,
+        DEPLOYMENT_REPOSITORY,
+        DeploymentLock,
+        load_lock,
+    )
 
 NAMESPACE = "argocd"
 OWNER = "perfeng-environment"
@@ -133,6 +143,7 @@ def validate_control_plane_application(
                     "image": release.image,
                     "imagePullSecret": control_plane_deployment.IMAGE_PULL_SECRET,
                     "executionNamespace": control_plane_deployment.EXECUTION_NAMESPACE,
+                    "httpPort": CONTROL_PLANE_HTTP_PORT,
                     "runtimeConfigMap": release.runtime_config_map,
                     "runtimeSecret": "perfeng-control-plane-runtime",
                     "authenticationSecret": "perfeng-control-plane-authentication",
