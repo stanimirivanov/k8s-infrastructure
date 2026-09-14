@@ -13,20 +13,25 @@ from urllib.parse import urlparse
 import yaml
 
 if __package__:
-    from . import cluster
+    from . import cluster, control_plane_deployment
     from .control_plane_registry import valid_token
+    from .control_plane_release import DEPLOYMENT_REPOSITORY, DeploymentLock, load_lock
 else:
     import cluster
+    import control_plane_deployment
     from control_plane_registry import valid_token
+    from control_plane_release import DEPLOYMENT_REPOSITORY, DeploymentLock, load_lock
 
 NAMESPACE = "argocd"
 OWNER = "perfeng-environment"
 ROOT_APPLICATION = "perfeng-local-root"
 SAMPLE_SUT_APPLICATION = "perfeng-local-sample-sut"
+CONTROL_PLANE_APPLICATION = "perfeng-local-control-plane"
+CONTROL_PLANE_NAMESPACE = "perf-platform"
 REPOSITORY_CREDENTIALS = "perfeng-github-repository-credentials"
 REPOSITORY_PREFIX = "https://github.com/stanimirivanov"
 REPOSITORY_URL = REPOSITORY_PREFIX + "/perfeng-environment.git"
-TOKEN_ENVIRONMENT_VARIABLE = "PERFENG_REPOSITORIES_READ_TOKEN"
+TOKEN_ENVIRONMENT_VARIABLE = "PERFENG_REPOSITORIES_CONTENTS_READ_TOKEN"
 DEPLOYMENTS = (
     "argocd-applicationset-controller",
     "argocd-dex-server",
@@ -36,6 +41,14 @@ DEPLOYMENTS = (
     "argocd-server",
 )
 STATEFULSETS = ("argocd-application-controller",)
+CONTROL_PLANE_REGISTRY_ITEMS = [
+    {"key": "jobs--analysis.yaml", "path": "jobs/analysis.yaml"},
+    {"key": "jobs--execution.json", "path": "jobs/execution.json"},
+    {"key": "jobs--reporting.yaml", "path": "jobs/reporting.yaml"},
+    {"key": "policies--checkout-smoke.json", "path": "policies/checkout-smoke.json"},
+    {"key": "policies--pod-startup.json", "path": "policies/pod-startup.json"},
+    {"key": "registry.json", "path": "registry.json"},
+]
 
 
 def kubectl(root: Path, *, namespace: str = NAMESPACE) -> list[str]:
@@ -97,6 +110,58 @@ def argocd_version(kustomization: dict[str, Any]) -> str:
     return version
 
 
+def validate_control_plane_application(
+    application: dict[str, Any], release: DeploymentLock
+) -> None:
+    """Require the control-plane child to match the reviewed deployment lock."""
+    metadata = application.get("metadata", {})
+    spec = application.get("spec", {})
+    if (
+        application.get("apiVersion") != "argoproj.io/v1alpha1"
+        or application.get("kind") != "Application"
+        or set(metadata) != {"name", "namespace", "labels"}
+        or metadata.get("name") != CONTROL_PLANE_APPLICATION
+        or metadata.get("namespace") != NAMESPACE
+        or metadata.get("labels")
+        != {
+            "app.kubernetes.io/managed-by": OWNER,
+            "perfeng.io/environment": "local",
+            "perfeng.io/workload": "control-plane",
+        }
+        or set(spec) != {"project", "source", "destination", "syncPolicy"}
+        or spec.get("project") != "perfeng-local"
+        or spec.get("source")
+        != {
+            "repoURL": DEPLOYMENT_REPOSITORY,
+            "targetRevision": release.deployment_revision,
+            "path": release.chart_path,
+            "helm": {
+                "releaseName": control_plane_deployment.RELEASE,
+                "valuesObject": {
+                    "image": release.image,
+                    "imagePullSecret": control_plane_deployment.IMAGE_PULL_SECRET,
+                    "executionNamespace": control_plane_deployment.EXECUTION_NAMESPACE,
+                    "runtimeConfigMap": "perfeng-control-plane-runtime",
+                    "runtimeSecret": "perfeng-control-plane-runtime",
+                    "authenticationSecret": "perfeng-control-plane-authentication",
+                    "registryConfigMap": "perfeng-runtime-registry",
+                    "registryItems": CONTROL_PLANE_REGISTRY_ITEMS,
+                },
+            },
+        }
+        or spec.get("destination")
+        != {
+            "server": "https://kubernetes.default.svc",
+            "namespace": CONTROL_PLANE_NAMESPACE,
+        }
+        or spec.get("syncPolicy", {}).get("automated")
+        != {"enabled": True, "prune": False, "selfHeal": False}
+        or set(spec.get("syncPolicy", {})) != {"automated", "syncOptions"}
+        or spec.get("syncPolicy", {}).get("syncOptions") != ["CreateNamespace=false"]
+    ):
+        raise ValueError("Invalid local control-plane Application")
+
+
 def validate_configuration(root: Path = cluster.ROOT) -> str:
     """Validate the explicit Argo CD release and local objects without external access."""
     kustomization = load_yaml(root / "gitops/bootstrap/argocd/kustomization.yaml")
@@ -126,11 +191,14 @@ def validate_configuration(root: Path = cluster.ROOT) -> str:
     root_kustomization = load_yaml(root / "gitops/environments/local/kustomization.yaml")
     project = load_yaml(root / "gitops/environments/local/project.yaml")
     sample_sut = load_yaml(root / "gitops/environments/local/sample-sut-application.yaml")
+    control_plane = load_yaml(root / "gitops/environments/local/control-plane-application.yaml")
+    release = load_lock(root / "deployments/local-control-plane.json")
     workspace = json.loads((root / "workspace.json").read_text(encoding="utf-8"))
     repository_urls = sorted(item["url"] for item in workspace["repositories"])
     project_spec = project.get("spec", {})
     if (
-        root_kustomization.get("resources") != ["project.yaml", "sample-sut-application.yaml"]
+        root_kustomization.get("resources")
+        != ["project.yaml", "sample-sut-application.yaml", "control-plane-application.yaml"]
         or project.get("kind") != "AppProject"
         or project.get("metadata", {}).get("name") != "perfeng-local"
         or project.get("metadata", {}).get("annotations", {}).get("argocd.argoproj.io/sync-wave")
@@ -182,6 +250,7 @@ def validate_configuration(root: Path = cluster.ROOT) -> str:
         or sample_spec.get("syncPolicy", {}).get("syncOptions") != ["CreateNamespace=true"]
     ):
         raise ValueError("Invalid local sample SUT Application")
+    validate_control_plane_application(control_plane, release)
     return version
 
 
@@ -340,6 +409,7 @@ def execute(action: str, root: Path = cluster.ROOT) -> None:
     ensure_root(kube, root, apply=action == "deploy")
     wait_for_application(kube, ROOT_APPLICATION)
     wait_for_application(kube, SAMPLE_SUT_APPLICATION)
+    wait_for_application(kube, CONTROL_PLANE_APPLICATION)
     cluster.run(
         [
             *kubectl(root, namespace="perf-sut"),
@@ -349,6 +419,7 @@ def execute(action: str, root: Path = cluster.ROOT) -> None:
             "--timeout=180s",
         ]
     )
+    control_plane_deployment.verify_managed_workload(root)
     print(f"Local Argo CD GitOps action completed: {action}", flush=True)
 
 

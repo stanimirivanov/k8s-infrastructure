@@ -28,6 +28,18 @@ class GitOpsTests(unittest.TestCase):
     def test_repository_configuration_selects_an_explicit_release(self) -> None:
         self.assertEqual(gitops.validate_configuration(), "v3.5.2")
 
+    def test_control_plane_application_is_bound_to_the_deployment_lock(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        application = gitops.load_yaml(
+            root / "gitops/environments/local/control-plane-application.yaml"
+        )
+        release = gitops.load_lock(root / "deployments/local-control-plane.json")
+
+        gitops.validate_control_plane_application(application, release)
+        application["spec"]["source"]["targetRevision"] = "main"
+        with self.assertRaisesRegex(ValueError, "control-plane Application"):
+            gitops.validate_control_plane_application(application, release)
+
     def test_mutable_or_foreign_manifest_source_is_rejected(self) -> None:
         prefix = "https://raw.githubusercontent.com/argoproj/argo-cd/"
         sources = [
