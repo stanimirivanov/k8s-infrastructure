@@ -40,12 +40,24 @@ class GitOpsTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "control-plane Application"):
             gitops.validate_control_plane_application(application, release)
 
-    def test_only_workload_applications_self_heal(self) -> None:
+    def test_postgres_application_preserves_the_existing_release(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        application = gitops.load_yaml(root / "gitops/environments/local/postgres-application.yaml")
+
+        gitops.validate_postgres_application(application)
+        application["spec"]["source"]["helm"]["releaseName"] = "postgres-gitops"
+        with self.assertRaisesRegex(ValueError, "PostgreSQL Application"):
+            gitops.validate_postgres_application(application)
+
+    def test_self_healing_is_limited_to_stateless_workloads(self) -> None:
         root = Path(__file__).resolve().parents[1]
         applications = {
             "root": gitops.load_yaml(root / "gitops/bootstrap/local-root-application.yaml"),
             "sample-sut": gitops.load_yaml(
                 root / "gitops/environments/local/sample-sut-application.yaml"
+            ),
+            "postgres": gitops.load_yaml(
+                root / "gitops/environments/local/postgres-application.yaml"
             ),
             "control-plane": gitops.load_yaml(
                 root / "gitops/environments/local/control-plane-application.yaml"
@@ -58,6 +70,7 @@ class GitOpsTests(unittest.TestCase):
         }
         self.assertIs(policies["root"]["selfHeal"], False)
         self.assertIs(policies["sample-sut"]["selfHeal"], True)
+        self.assertIs(policies["postgres"]["selfHeal"], False)
         self.assertIs(policies["control-plane"]["selfHeal"], True)
         self.assertTrue(all(policy["prune"] is False for policy in policies.values()))
 

@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 import yaml
 
 if __package__:
-    from . import cluster, control_plane_deployment, gitops_status
+    from . import cluster, control_plane_deployment, gitops_status, postgres
     from .control_plane_registry import valid_token
     from .control_plane_release import (
         CONTROL_PLANE_HTTP_PORT,
@@ -25,6 +25,7 @@ else:
     import cluster
     import control_plane_deployment
     import gitops_status
+    import postgres
     from control_plane_registry import valid_token
     from control_plane_release import (
         CONTROL_PLANE_HTTP_PORT,
@@ -37,6 +38,7 @@ NAMESPACE = "argocd"
 OWNER = "perfeng-environment"
 ROOT_APPLICATION = "perfeng-local-root"
 SAMPLE_SUT_APPLICATION = "perfeng-local-sample-sut"
+POSTGRES_APPLICATION = "perfeng-local-postgres"
 CONTROL_PLANE_APPLICATION = "perfeng-local-control-plane"
 CONTROL_PLANE_NAMESPACE = "perf-platform"
 REPOSITORY_CREDENTIALS = "perfeng-github-repository-credentials"
@@ -165,6 +167,41 @@ def validate_control_plane_application(
         raise ValueError("Invalid local control-plane Application")
 
 
+def validate_postgres_application(application: dict[str, Any]) -> None:
+    """Require conservative adoption of the existing PostgreSQL release."""
+    metadata = application.get("metadata", {})
+    spec = application.get("spec", {})
+    if (
+        application.get("apiVersion") != "argoproj.io/v1alpha1"
+        or application.get("kind") != "Application"
+        or set(metadata) != {"name", "namespace", "labels"}
+        or metadata.get("name") != POSTGRES_APPLICATION
+        or metadata.get("namespace") != NAMESPACE
+        or metadata.get("labels")
+        != {
+            "app.kubernetes.io/managed-by": OWNER,
+            "perfeng.io/environment": "local",
+            "perfeng.io/workload": "postgres",
+        }
+        or set(spec) != {"project", "source", "destination", "syncPolicy"}
+        or spec.get("project") != "perfeng-local"
+        or spec.get("source")
+        != {
+            "repoURL": REPOSITORY_URL,
+            "targetRevision": "main",
+            "path": "charts/postgres",
+            "helm": {"releaseName": postgres.RELEASE},
+        }
+        or spec.get("destination")
+        != {"server": "https://kubernetes.default.svc", "namespace": postgres.NAMESPACE}
+        or spec.get("syncPolicy", {}).get("automated")
+        != {"enabled": True, "prune": False, "selfHeal": False}
+        or set(spec.get("syncPolicy", {})) != {"automated", "syncOptions"}
+        or spec.get("syncPolicy", {}).get("syncOptions") != ["CreateNamespace=false"]
+    ):
+        raise ValueError("Invalid local PostgreSQL Application")
+
+
 def validate_configuration(root: Path = cluster.ROOT) -> str:
     """Validate the explicit Argo CD release and local objects without external access."""
     kustomization = load_yaml(root / "gitops/bootstrap/argocd/kustomization.yaml")
@@ -194,6 +231,7 @@ def validate_configuration(root: Path = cluster.ROOT) -> str:
     root_kustomization = load_yaml(root / "gitops/environments/local/kustomization.yaml")
     project = load_yaml(root / "gitops/environments/local/project.yaml")
     sample_sut = load_yaml(root / "gitops/environments/local/sample-sut-application.yaml")
+    postgres_application = load_yaml(root / "gitops/environments/local/postgres-application.yaml")
     control_plane = load_yaml(root / "gitops/environments/local/control-plane-application.yaml")
     release = load_lock(root / "deployments/local-control-plane.json")
     workspace = json.loads((root / "workspace.json").read_text(encoding="utf-8"))
@@ -201,7 +239,12 @@ def validate_configuration(root: Path = cluster.ROOT) -> str:
     project_spec = project.get("spec", {})
     if (
         root_kustomization.get("resources")
-        != ["project.yaml", "sample-sut-application.yaml", "control-plane-application.yaml"]
+        != [
+            "project.yaml",
+            "sample-sut-application.yaml",
+            "postgres-application.yaml",
+            "control-plane-application.yaml",
+        ]
         or project.get("kind") != "AppProject"
         or project.get("metadata", {}).get("name") != "perfeng-local"
         or project.get("metadata", {}).get("annotations", {}).get("argocd.argoproj.io/sync-wave")
@@ -253,6 +296,7 @@ def validate_configuration(root: Path = cluster.ROOT) -> str:
         or sample_spec.get("syncPolicy", {}).get("syncOptions") != ["CreateNamespace=true"]
     ):
         raise ValueError("Invalid local sample SUT Application")
+    validate_postgres_application(postgres_application)
     validate_control_plane_application(control_plane, release)
     return version
 
@@ -389,6 +433,7 @@ def execute(action: str, root: Path = cluster.ROOT) -> None:
     ensure_root(kube, root, apply=action == "deploy")
     gitops_status.wait_for_application(kube, ROOT_APPLICATION)
     gitops_status.wait_for_application(kube, SAMPLE_SUT_APPLICATION)
+    gitops_status.wait_for_application(kube, POSTGRES_APPLICATION)
     gitops_status.wait_for_application(kube, CONTROL_PLANE_APPLICATION)
     cluster.run(
         [
@@ -399,6 +444,7 @@ def execute(action: str, root: Path = cluster.ROOT) -> None:
             "--timeout=180s",
         ]
     )
+    postgres.execute("health", root)
     control_plane_deployment.verify_managed_workload(root)
     print(f"Local Argo CD GitOps action completed: {action}", flush=True)
 
