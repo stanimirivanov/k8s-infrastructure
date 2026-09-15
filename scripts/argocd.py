@@ -242,7 +242,6 @@ def validate_configuration(root: Path = cluster.ROOT) -> str:
         != [
             "project.yaml",
             "sample-sut-application.yaml",
-            "postgres-application.yaml",
             "control-plane-application.yaml",
         ]
         or project.get("kind") != "AppProject"
@@ -433,7 +432,6 @@ def execute(action: str, root: Path = cluster.ROOT) -> None:
     ensure_root(kube, root, apply=action == "deploy")
     gitops_status.wait_for_application(kube, ROOT_APPLICATION)
     gitops_status.wait_for_application(kube, SAMPLE_SUT_APPLICATION)
-    gitops_status.wait_for_application(kube, POSTGRES_APPLICATION)
     gitops_status.wait_for_application(kube, CONTROL_PLANE_APPLICATION)
     cluster.run(
         [

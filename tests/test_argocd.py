@@ -49,6 +49,12 @@ class GitOpsTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "PostgreSQL Application"):
             gitops.validate_postgres_application(application)
 
+    def test_postgres_application_is_inactive_during_rollback_rehearsal(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        kustomization = gitops.load_yaml(root / "gitops/environments/local/kustomization.yaml")
+
+        self.assertNotIn("postgres-application.yaml", kustomization["resources"])
+
     def test_self_healing_is_limited_to_stateless_workloads(self) -> None:
         root = Path(__file__).resolve().parents[1]
         applications = {
