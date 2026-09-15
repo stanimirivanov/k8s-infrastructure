@@ -55,7 +55,7 @@ class GitOpsTests(unittest.TestCase):
 
         self.assertIn("postgres-application.yaml", kustomization["resources"])
 
-    def test_self_healing_is_limited_to_stateless_workloads(self) -> None:
+    def test_all_active_workloads_self_heal_without_pruning(self) -> None:
         root = Path(__file__).resolve().parents[1]
         applications = {
             "root": gitops.load_yaml(root / "gitops/bootstrap/local-root-application.yaml"),
@@ -76,7 +76,7 @@ class GitOpsTests(unittest.TestCase):
         }
         self.assertIs(policies["root"]["selfHeal"], False)
         self.assertIs(policies["sample-sut"]["selfHeal"], True)
-        self.assertIs(policies["postgres"]["selfHeal"], False)
+        self.assertIs(policies["postgres"]["selfHeal"], True)
         self.assertIs(policies["control-plane"]["selfHeal"], True)
         self.assertTrue(all(policy["prune"] is False for policy in policies.values()))
 
