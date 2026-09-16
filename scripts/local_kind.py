@@ -208,19 +208,41 @@ def execute(action: str, root: Path = ROOT, confirmation: str | None = None) -> 
         print(f"Local cluster action completed: {action}")
 
 
+def ensure(root: Path = ROOT) -> None:
+    """Create the named cluster when absent or validate the existing cluster."""
+    print("Discovering the named local cluster...", flush=True)
+    existing = run(["kind", "get", "clusters"]).splitlines()
+    config = kubeconfig(root)
+    if NAME in existing:
+        if not config.exists():
+            raise ValueError("Named local cluster exists without its dedicated kubeconfig")
+        print("Reusing the existing named local cluster after health validation.", flush=True)
+        execute("health", root)
+        return
+    if config.exists():
+        raise ValueError("Dedicated kubeconfig exists without the named local cluster")
+    execute("up", root)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["up", "bootstrap", "health", "down"])
+    parser.add_argument("action", choices=["up", "ensure", "bootstrap", "health", "down"])
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--confirm-delete")
     args = parser.parse_args()
     try:
         if not args.execute:
-            for command in commands(args.action):
-                print(json.dumps(command))
+            if args.action == "ensure":
+                print(json.dumps(["kind", "get", "clusters"]))
+                print("Execution creates the missing named cluster or validates the existing one.")
+            else:
+                for command in commands(args.action):
+                    print(json.dumps(command))
             print(
                 "Preview only. Add --execute to run; down also requires --confirm-delete perfeng-local."
             )
+        elif args.action == "ensure":
+            ensure()
         else:
             execute(args.action, confirmation=args.confirm_delete)
     except (OSError, ValueError, yaml.YAMLError) as error:

@@ -16,6 +16,7 @@ from scripts.cluster import (
     NAME,
     check_nodes,
     commands,
+    ensure,
     execute,
     run,
     verify_context,
@@ -188,6 +189,42 @@ class ClusterTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 execute("up")
             self.assertEqual(run.call_count, 2)
+
+    def test_ensure_reuses_only_a_healthy_owned_cluster(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            (root / ".local").mkdir()
+            (root / ".local/perfeng-local.kubeconfig").write_text("owned")
+            with (
+                patch("scripts.cluster.run", return_value=NAME),
+                patch("scripts.cluster.execute") as execute,
+            ):
+                ensure(root)
+            execute.assert_called_once_with("health", root)
+
+    def test_ensure_creates_only_when_cluster_and_kubeconfig_are_absent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            with (
+                patch("scripts.cluster.run", return_value=""),
+                patch("scripts.cluster.execute") as execute,
+            ):
+                ensure(root)
+            execute.assert_called_once_with("up", root)
+
+    def test_ensure_rejects_incomplete_local_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            (root / ".local").mkdir()
+            config = root / ".local/perfeng-local.kubeconfig"
+            config.write_text("orphaned")
+            with patch("scripts.cluster.run", return_value=""):
+                with self.assertRaisesRegex(ValueError, "without the named local cluster"):
+                    ensure(root)
+            config.unlink()
+            with patch("scripts.cluster.run", return_value=NAME):
+                with self.assertRaisesRegex(ValueError, "without its dedicated kubeconfig"):
+                    ensure(root)
 
     def test_wrong_kind_version_is_rejected(self):
         with patch("scripts.cluster.run", return_value="kind v0.30.0") as run:
