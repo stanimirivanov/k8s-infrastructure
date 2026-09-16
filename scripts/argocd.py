@@ -39,6 +39,7 @@ else:
 NAMESPACE = "argocd"
 OWNER = "perfeng-environment"
 ROOT_APPLICATION = "perfeng-local-root"
+ACTIONS = ("validate", "bootstrap", "health")
 SAMPLE_SUT_APPLICATION = "perfeng-local-sample-sut"
 POSTGRES_APPLICATION = "perfeng-local-postgres"
 SEAWEEDFS_APPLICATION = "perfeng-local-seaweedfs"
@@ -453,12 +454,14 @@ def ensure_root(kube: list[str], root: Path, *, apply: bool) -> None:
 
 
 def execute(action: str, root: Path = cluster.ROOT) -> None:
-    """Bootstrap, deploy or health-check the pinned local GitOps control plane."""
+    """Bootstrap or health-check the pinned local GitOps control plane."""
+    if action not in {"bootstrap", "health"}:
+        raise ValueError("Unknown executable GitOps action")
     validate_configuration(root)
     cluster.verify_local_docker()
     cluster.verify_context(root)
     kube = kubectl(root)
-    mutating = action in {"bootstrap", "deploy"}
+    mutating = action == "bootstrap"
     verify_namespace(kube, create=mutating)
     if mutating:
         cluster.run(
@@ -500,7 +503,7 @@ def execute(action: str, root: Path = cluster.ROOT) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["validate", "bootstrap", "deploy", "health"])
+    parser.add_argument("action", choices=ACTIONS)
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args()
     try:
@@ -511,7 +514,7 @@ def main() -> int:
             execute(args.action)
         else:
             print(f"Preview: {args.action} the pinned local Argo CD GitOps control plane.")
-            if args.action in {"bootstrap", "deploy"}:
+            if args.action == "bootstrap":
                 print(f"Missing Git credentials use {TOKEN_ENVIRONMENT_VARIABLE}.")
             print("Preview only. Add --execute to access the network or local cluster.")
     except (

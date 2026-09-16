@@ -25,6 +25,13 @@ def stored_credentials() -> dict[str, object]:
 
 
 class GitOpsTests(unittest.TestCase):
+    def test_supported_actions_exclude_superseded_deploy(self) -> None:
+        self.assertEqual(gitops.ACTIONS, ("validate", "bootstrap", "health"))
+        with patch("scripts.gitops.validate_configuration") as validate:
+            with self.assertRaisesRegex(ValueError, "Unknown executable"):
+                gitops.execute("deploy")
+        validate.assert_not_called()
+
     def test_repository_configuration_selects_an_explicit_release(self) -> None:
         self.assertEqual(gitops.validate_configuration(), "v3.5.2")
 
@@ -222,6 +229,37 @@ class GitOpsTests(unittest.TestCase):
         postgres_health.assert_called_once_with("health", gitops.cluster.ROOT)
         object_store_health.assert_not_called()
         control.assert_not_called()
+
+    def test_health_observes_without_applying_resources(self) -> None:
+        kube = ["kubectl"]
+        with (
+            patch("scripts.gitops.validate_configuration"),
+            patch("scripts.gitops.cluster.verify_local_docker"),
+            patch("scripts.gitops.cluster.verify_context"),
+            patch("scripts.gitops.kubectl", return_value=kube),
+            patch("scripts.gitops.verify_namespace") as namespace,
+            patch("scripts.gitops.cluster.run") as run,
+            patch("scripts.gitops.gitops_status.wait_for_argocd"),
+            patch("scripts.gitops.ensure_credentials") as credentials,
+            patch("scripts.gitops.ensure_root") as root,
+            patch("scripts.gitops.gitops_status.wait_for_application") as wait,
+            patch("scripts.gitops.postgres.execute") as postgres_health,
+            patch("scripts.gitops.object_store.execute") as object_store_health,
+            patch("scripts.gitops.control_plane_health.verify") as control,
+        ):
+            gitops.execute("health")
+
+        namespace.assert_called_once_with(kube, create=False)
+        credentials.assert_called_once_with(kube, create=False)
+        root.assert_called_once_with(kube, gitops.cluster.ROOT, apply=False)
+        self.assertTrue(
+            all(call.kwargs.get("require_health", True) for call in wait.call_args_list)
+        )
+        self.assertEqual(run.call_count, 1)
+        self.assertIn("rollout", run.call_args.args[0])
+        postgres_health.assert_called_once_with("health", gitops.cluster.ROOT)
+        object_store_health.assert_called_once()
+        control.assert_called_once_with(gitops.cluster.ROOT)
 
 
 if __name__ == "__main__":
