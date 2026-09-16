@@ -1,0 +1,25 @@
+[project]
+name = "k8s-infrastructure"
+version = "0.1.0"
+description = "Reusable Kubernetes substrate provisioning and qualification"
+requires-python = ">=3.12"
+dependencies = []
+
+[dependency-groups]
+dev = ["ruff>=0.16.4,<0.17", "ty>=0.0.1,<1"]
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "UP", "B"]
+
+[tool.ty.src]
+include = ["scripts", "tests"]
+
+[tool.ty.terminal]
+error-on-warning = true
