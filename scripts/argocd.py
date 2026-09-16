@@ -408,7 +408,7 @@ def ensure_credentials(kube: list[str], *, create: bool) -> None:
         print("Reusing existing Argo CD repository credentials (not rotated).", flush=True)
         return
     if not create:
-        raise ValueError("Argo CD repository credentials are missing; run deploy first")
+        raise ValueError("Argo CD repository credentials are missing; run bootstrap first")
     token = os.environ.get(TOKEN_ENVIRONMENT_VARIABLE)
     if token is None:
         raise ValueError(f"{TOKEN_ENVIRONMENT_VARIABLE} is required to read the private repository")
@@ -427,7 +427,7 @@ def verify_namespace(kube: list[str], *, create: bool) -> None:
     if not current.strip():
         if create:
             return
-        raise ValueError("Argo CD namespace is missing; run deploy first")
+        raise ValueError("Argo CD namespace is missing; run bootstrap first")
     labels = json.loads(current).get("metadata", {}).get("labels", {})
     if (
         labels.get("app.kubernetes.io/managed-by") != OWNER
@@ -446,20 +446,21 @@ def ensure_root(kube: list[str], root: Path, *, apply: bool) -> None:
         if labels.get("app.kubernetes.io/managed-by") != OWNER:
             raise ValueError("Existing root Application is not owned by perfeng-environment")
     elif not apply:
-        raise ValueError("Local root Application is missing; run deploy first")
+        raise ValueError("Local root Application is missing; run bootstrap first")
     if apply:
         content = (root / "gitops/bootstrap/local-root-application.yaml").read_bytes()
         cluster.run([*kube, "apply", "-f", "-"], input_data=content)
 
 
 def execute(action: str, root: Path = cluster.ROOT) -> None:
-    """Deploy or health-check the pinned local GitOps control plane."""
+    """Bootstrap, deploy or health-check the pinned local GitOps control plane."""
     validate_configuration(root)
     cluster.verify_local_docker()
     cluster.verify_context(root)
     kube = kubectl(root)
-    verify_namespace(kube, create=action == "deploy")
-    if action == "deploy":
+    mutating = action in {"bootstrap", "deploy"}
+    verify_namespace(kube, create=mutating)
+    if mutating:
         cluster.run(
             [
                 *kube,
@@ -471,12 +472,16 @@ def execute(action: str, root: Path = cluster.ROOT) -> None:
             ]
         )
     gitops_status.wait_for_argocd(kube)
-    ensure_credentials(kube, create=action == "deploy")
-    ensure_root(kube, root, apply=action == "deploy")
-    gitops_status.wait_for_application(kube, ROOT_APPLICATION)
+    ensure_credentials(kube, create=mutating)
+    ensure_root(kube, root, apply=mutating)
+    gitops_status.wait_for_application(kube, ROOT_APPLICATION, require_health=action != "bootstrap")
     gitops_status.wait_for_application(kube, SAMPLE_SUT_APPLICATION)
     gitops_status.wait_for_application(kube, POSTGRES_APPLICATION)
     gitops_status.wait_for_application(kube, SEAWEEDFS_APPLICATION)
+    if action == "bootstrap":
+        postgres.execute("health", root)
+        print("Local Argo CD GitOps action completed: bootstrap", flush=True)
+        return
     gitops_status.wait_for_application(kube, CONTROL_PLANE_APPLICATION)
     cluster.run(
         [
@@ -495,7 +500,7 @@ def execute(action: str, root: Path = cluster.ROOT) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["validate", "deploy", "health"])
+    parser.add_argument("action", choices=["validate", "bootstrap", "deploy", "health"])
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args()
     try:
@@ -506,7 +511,7 @@ def main() -> int:
             execute(args.action)
         else:
             print(f"Preview: {args.action} the pinned local Argo CD GitOps control plane.")
-            if args.action == "deploy":
+            if args.action in {"bootstrap", "deploy"}:
                 print(f"Missing Git credentials use {TOKEN_ENVIRONMENT_VARIABLE}.")
             print("Preview only. Add --execute to access the network or local cluster.")
     except (

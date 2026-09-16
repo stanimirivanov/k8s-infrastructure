@@ -187,6 +187,42 @@ class GitOpsTests(unittest.TestCase):
         self.assertEqual(apply.args[0][-3:], ["apply", "-f", "-"])
         self.assertIn(b"name: perfeng-local-root", apply.kwargs["input_data"])
 
+    def test_bootstrap_stops_after_stateful_workloads_are_ready(self) -> None:
+        kube = ["kubectl"]
+        with (
+            patch("scripts.gitops.validate_configuration"),
+            patch("scripts.gitops.cluster.verify_local_docker"),
+            patch("scripts.gitops.cluster.verify_context"),
+            patch("scripts.gitops.kubectl", return_value=kube),
+            patch("scripts.gitops.verify_namespace") as namespace,
+            patch("scripts.gitops.cluster.run"),
+            patch("scripts.gitops.gitops_status.wait_for_argocd"),
+            patch("scripts.gitops.ensure_credentials") as credentials,
+            patch("scripts.gitops.ensure_root") as root,
+            patch("scripts.gitops.gitops_status.wait_for_application") as wait,
+            patch("scripts.gitops.postgres.execute") as postgres_health,
+            patch("scripts.gitops.object_store.execute") as object_store_health,
+            patch("scripts.gitops.control_plane_deployment.verify_managed_workload") as control,
+        ):
+            gitops.execute("bootstrap")
+
+        namespace.assert_called_once_with(kube, create=True)
+        credentials.assert_called_once_with(kube, create=True)
+        root.assert_called_once_with(kube, gitops.cluster.ROOT, apply=True)
+        self.assertIs(wait.call_args_list[0].kwargs["require_health"], False)
+        self.assertEqual(
+            [call.args[1] for call in wait.call_args_list],
+            [
+                gitops.ROOT_APPLICATION,
+                gitops.SAMPLE_SUT_APPLICATION,
+                gitops.POSTGRES_APPLICATION,
+                gitops.SEAWEEDFS_APPLICATION,
+            ],
+        )
+        postgres_health.assert_called_once_with("health", gitops.cluster.ROOT)
+        object_store_health.assert_not_called()
+        control.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

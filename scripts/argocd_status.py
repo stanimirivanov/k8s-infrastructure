@@ -277,8 +277,8 @@ def wait_for_application_state(kube: list[str], name: str, field: str, expected:
             ) from grace_error
 
 
-def wait_for_application(kube: list[str], name: str) -> None:
-    """Require an Application to exist, synchronize and become healthy."""
+def wait_for_application(kube: list[str], name: str, *, require_health: bool = True) -> None:
+    """Require an Application to exist and sync, with optional health convergence."""
     print(
         f"Waiting for Application {name} to be created ({APPLICATION_WAIT_TIMEOUT}s)...",
         flush=True,
@@ -301,4 +301,5 @@ def wait_for_application(kube: list[str], name: str) -> None:
             raise ValueError(f"Application {name} was not created") from error
         print(f"Application {name} appeared as the creation wait expired; continuing.", flush=True)
     wait_for_application_state(kube, name, "sync", "Synced")
-    wait_for_application_state(kube, name, "health", "Healthy")
+    if require_health:
+        wait_for_application_state(kube, name, "health", "Healthy")

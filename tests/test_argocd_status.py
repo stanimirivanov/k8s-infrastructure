@@ -26,6 +26,16 @@ class GitOpsStatusTests(unittest.TestCase):
         for call in run.call_args_list:
             self.assertIn("application/example", call.args[0])
 
+    def test_staged_application_wait_can_stop_after_sync(self) -> None:
+        with patch("scripts.gitops_status.cluster.run") as run:
+            gitops_status.wait_for_application(["kubectl"], "example", require_health=False)
+
+        conditions = [call.args[0][2] for call in run.call_args_list]
+        self.assertEqual(
+            conditions,
+            ["--for=create", "--for=jsonpath={.status.sync.status}=Synced"],
+        )
+
     def test_application_accepts_state_reached_at_primary_timeout_boundary(self) -> None:
         status = {
             "status": {
