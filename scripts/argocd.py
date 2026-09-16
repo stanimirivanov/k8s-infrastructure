@@ -206,7 +206,7 @@ def validate_postgres_application(application: dict[str, Any]) -> None:
 
 
 def validate_seaweedfs_application(application: dict[str, Any]) -> None:
-    """Require conservative adoption of the existing SeaweedFS release."""
+    """Require reviewed self-healing ownership of the existing SeaweedFS release."""
     metadata = application.get("metadata", {})
     spec = application.get("spec", {})
     if (
@@ -233,7 +233,7 @@ def validate_seaweedfs_application(application: dict[str, Any]) -> None:
         or spec.get("destination")
         != {"server": "https://kubernetes.default.svc", "namespace": object_store.NAMESPACE}
         or spec.get("syncPolicy", {}).get("automated")
-        != {"enabled": True, "prune": False, "selfHeal": False}
+        != {"enabled": True, "prune": False, "selfHeal": True}
         or set(spec.get("syncPolicy", {})) != {"automated", "syncOptions"}
         or spec.get("syncPolicy", {}).get("syncOptions") != ["CreateNamespace=false"]
     ):

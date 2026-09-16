@@ -66,13 +66,24 @@ class GitOpsTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "SeaweedFS Application"):
             gitops.validate_seaweedfs_application(application)
 
+    def test_seaweedfs_application_requires_self_healing_without_pruning(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        application = gitops.load_yaml(
+            root / "gitops/environments/local/seaweedfs-application.yaml"
+        )
+
+        gitops.validate_seaweedfs_application(application)
+        application["spec"]["syncPolicy"]["automated"]["selfHeal"] = False
+        with self.assertRaisesRegex(ValueError, "SeaweedFS Application"):
+            gitops.validate_seaweedfs_application(application)
+
     def test_seaweedfs_application_is_active_after_rollback_rehearsal(self) -> None:
         root = Path(__file__).resolve().parents[1]
         kustomization = gitops.load_yaml(root / "gitops/environments/local/kustomization.yaml")
 
         self.assertIn("seaweedfs-application.yaml", kustomization["resources"])
 
-    def test_stateful_adoption_limits_self_healing_without_pruning(self) -> None:
+    def test_workload_applications_self_heal_without_pruning(self) -> None:
         root = Path(__file__).resolve().parents[1]
         applications = {
             "root": gitops.load_yaml(root / "gitops/bootstrap/local-root-application.yaml"),
@@ -97,7 +108,7 @@ class GitOpsTests(unittest.TestCase):
         self.assertIs(policies["root"]["selfHeal"], False)
         self.assertIs(policies["sample-sut"]["selfHeal"], True)
         self.assertIs(policies["postgres"]["selfHeal"], True)
-        self.assertIs(policies["seaweedfs"]["selfHeal"], False)
+        self.assertIs(policies["seaweedfs"]["selfHeal"], True)
         self.assertIs(policies["control-plane"]["selfHeal"], True)
         self.assertTrue(all(policy["prune"] is False for policy in policies.values()))
 
