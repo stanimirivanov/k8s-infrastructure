@@ -44,6 +44,7 @@ class GitOpsStatusTests(unittest.TestCase):
             gitops_status.wait_for_application(["kubectl"], "example")
 
         self.assertIn("as the primary wait expired; continuing", output.getvalue())
+        self.assertFalse(any("annotate" in call.args[0] for call in run.call_args_list))
         self.assertFalse(
             any(
                 f"--timeout={gitops_status.APPLICATION_GRACE_TIMEOUT}s" in call.args[0]
@@ -72,6 +73,7 @@ class GitOpsStatusTests(unittest.TestCase):
                     "",
                     ValueError("primary wait expired"),
                     json.dumps(status),
+                    "",
                     ValueError("grace wait expired"),
                     json.dumps(status),
                 ],
@@ -87,6 +89,20 @@ class GitOpsStatusTests(unittest.TestCase):
         rendered = output.getvalue()
         self.assertIn("Condition ComparisonError: repository server unavailable", rendered)
         self.assertIn("Application example: sync=Unknown, health=Healthy", rendered)
+        refreshes = [call.args[0] for call in run.call_args_list if "annotate" in call.args[0]]
+        self.assertEqual(
+            refreshes,
+            [
+                [
+                    "kubectl",
+                    "--request-timeout=10s",
+                    "annotate",
+                    "application/example",
+                    "argocd.argoproj.io/refresh=normal",
+                    "--overwrite",
+                ]
+            ],
+        )
         waits = [call.args[0] for call in run.call_args_list if "wait" in call.args[0]]
         self.assertEqual(
             [
@@ -97,6 +113,119 @@ class GitOpsStatusTests(unittest.TestCase):
             ],
             ["--timeout=180s", "--timeout=180s", "--timeout=60s"],
         )
+
+    def test_refresh_allows_sync_to_converge_during_grace(self) -> None:
+        output = StringIO()
+        with (
+            patch(
+                "scripts.gitops_status.cluster.run",
+                side_effect=[
+                    ValueError("primary expired"),
+                    json.dumps({"status": {}}),
+                    "",
+                    "",
+                ],
+            ) as run,
+            redirect_stdout(output),
+        ):
+            gitops_status.wait_for_application_state(["kubectl"], "example", "sync", "Synced")
+
+        self.assertEqual(run.call_args_list[2].args[0][2], "annotate")
+        self.assertIn("--timeout=60s", run.call_args_list[3].args[0])
+        self.assertIn("Requesting normal refresh", output.getvalue())
+
+    def test_refresh_failure_does_not_replace_original_timeout(self) -> None:
+        output = StringIO()
+        with (
+            patch(
+                "scripts.gitops_status.cluster.run",
+                side_effect=[
+                    ValueError("primary expired"),
+                    "{}",
+                    ValueError("refresh forbidden"),
+                    ValueError("grace expired"),
+                    "{}",
+                ],
+            ),
+            redirect_stdout(output),
+            self.assertRaisesRegex(ValueError, "failed after 180s plus 60s grace") as raised,
+        ):
+            gitops_status.wait_for_application_state(["kubectl"], "example", "health", "Healthy")
+
+        self.assertIn("refresh request failed", output.getvalue())
+        self.assertEqual(str(raised.exception.__cause__), "grace expired")
+
+    def test_application_accepts_state_reached_at_grace_timeout_boundary(self) -> None:
+        status = {"status": {"sync": {"status": "Synced"}}}
+        output = StringIO()
+        with (
+            patch(
+                "scripts.gitops_status.cluster.run",
+                side_effect=[
+                    ValueError("primary expired"),
+                    "{}",
+                    "",
+                    ValueError("grace expired"),
+                    json.dumps(status),
+                ],
+            ),
+            redirect_stdout(output),
+        ):
+            gitops_status.wait_for_application_state(["kubectl"], "example", "sync", "Synced")
+
+        self.assertIn("as the grace wait expired; continuing", output.getvalue())
+
+    def test_drift_diagnostics_identify_resources_without_reading_contents(self) -> None:
+        status = {
+            "status": {
+                "resources": [
+                    {
+                        "group": "argoproj.io",
+                        "kind": "Application",
+                        "namespace": "argocd",
+                        "name": "child",
+                        "status": "OutOfSync",
+                        "health": {"status": "Healthy"},
+                    },
+                    {
+                        "kind": "Secret",
+                        "name": "credentials",
+                        "status": "OutOfSync",
+                        "requiresPruning": True,
+                        "data": {"token": "must-not-be-printed"},
+                    },
+                    {"kind": "Service", "name": "healthy", "status": "Synced"},
+                    None,
+                ]
+            }
+        }
+        with patch("scripts.gitops_status.cluster.run") as run:
+            rendered = "\n".join(gitops_status.application_diagnostics("example", status))
+
+        run.assert_not_called()
+        self.assertIn(
+            "argoproj.io/Application argocd/child: sync=OutOfSync, health=Healthy", rendered
+        )
+        self.assertIn("core/Secret cluster-scoped/credentials", rendered)
+        self.assertIn("requiresPruning=True", rendered)
+        self.assertNotIn("must-not-be-printed", rendered)
+        self.assertNotIn("healthy:", rendered)
+
+    def test_drift_diagnostics_are_bounded_and_redacted(self) -> None:
+        token = "github_pat_" + "x" * 30
+        resources = [{"status": "OutOfSync", "name": token}] * 25
+        rendered = gitops_status.out_of_sync_resources(resources)
+
+        self.assertEqual(len(rendered), 21)
+        self.assertIn("5 additional resources omitted", rendered[-1])
+        self.assertNotIn(token, "\n".join(rendered))
+        self.assertIn("[redacted]", "\n".join(rendered))
+
+    def test_drift_diagnostics_distinguish_missing_status_from_no_reported_drift(self) -> None:
+        self.assertEqual(
+            gitops_status.out_of_sync_resources(None), ["Out-of-sync resources: status unavailable"]
+        )
+        self.assertIn("comparison may be stale", gitops_status.out_of_sync_resources([])[0])
 
     def test_argocd_rollout_failure_identifies_workload_and_pod_state(self) -> None:
         workload = {

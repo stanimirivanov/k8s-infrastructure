@@ -14,6 +14,8 @@ else:
 ARGOCD_ROLLOUT_TIMEOUT = 300
 APPLICATION_WAIT_TIMEOUT = 180
 APPLICATION_GRACE_TIMEOUT = 60
+APPLICATION_REFRESH_TIMEOUT = 10
+RESOURCE_DIAGNOSTIC_LIMIT = 20
 DEPLOYMENTS = (
     "argocd-applicationset-controller",
     "argocd-dex-server",
@@ -172,7 +174,59 @@ def application_diagnostics(name: str, value: dict[str, Any] | None) -> list[str
                 )
     if operation.get("message"):
         lines.append(f"Operation message: {compact_message(operation['message'])}")
+    lines.extend(out_of_sync_resources(status.get("resources")))
     return lines
+
+
+def out_of_sync_resources(resources: Any) -> list[str]:
+    """Summarize reported drift without retrieving manifests or Secret contents."""
+    if not isinstance(resources, list):
+        return ["Out-of-sync resources: status unavailable"]
+    drift = [
+        resource
+        for resource in resources
+        if isinstance(resource, dict) and resource.get("status") == "OutOfSync"
+    ]
+    if not drift:
+        return ["Out-of-sync resources: none reported; comparison may be stale"]
+    lines = []
+    for resource in drift[:RESOURCE_DIAGNOSTIC_LIMIT]:
+        group = compact_message(resource.get("group") or "core", limit=100)
+        kind = compact_message(resource.get("kind"), limit=100)
+        namespace = compact_message(resource.get("namespace") or "cluster-scoped", limit=100)
+        name = compact_message(resource.get("name"), limit=100)
+        health = resource.get("health")
+        health_status = health.get("status") if isinstance(health, dict) else None
+        lines.append(
+            f"Out-of-sync resource {group}/{kind} {namespace}/{name}: "
+            f"sync=OutOfSync, health={compact_message(health_status)}, "
+            f"requiresPruning={resource.get('requiresPruning') is True}"
+        )
+    omitted = len(drift) - RESOURCE_DIAGNOSTIC_LIMIT
+    if omitted > 0:
+        lines.append(f"Out-of-sync resources: {omitted} additional resources omitted")
+    return lines
+
+
+def request_application_refresh(kube: list[str], name: str) -> None:
+    """Request one normal comparison refresh without explicitly starting a sync."""
+    print(f"Requesting normal refresh for Application {name}...", flush=True)
+    try:
+        cluster.run(
+            [
+                *kube,
+                f"--request-timeout={APPLICATION_REFRESH_TIMEOUT}s",
+                "annotate",
+                f"application/{name}",
+                "argocd.argoproj.io/refresh=normal",
+                "--overwrite",
+            ]
+        )
+    except (OSError, ValueError):
+        print(
+            f"Application {name} refresh request failed; continuing with the bounded grace period.",
+            flush=True,
+        )
 
 
 def application_reached(value: dict[str, Any] | None, field: str, expected: str) -> bool:
@@ -202,6 +256,7 @@ def wait_for_application_state(kube: list[str], name: str, field: str, expected:
         if application_reached(current, field, expected):
             print(f"{target} as the primary wait expired; continuing.", flush=True)
             return
+        request_application_refresh(kube, name)
         print(
             f"Allowing one {APPLICATION_GRACE_TIMEOUT}s grace period for {target}...",
             flush=True,
@@ -213,6 +268,9 @@ def wait_for_application_state(kube: list[str], name: str, field: str, expected:
             current = application_status(kube, name)
             for line in application_diagnostics(name, current):
                 print(line, flush=True)
+            if application_reached(current, field, expected):
+                print(f"{target} as the grace wait expired; continuing.", flush=True)
+                return
             raise ValueError(
                 f"{target} failed after {APPLICATION_WAIT_TIMEOUT}s plus "
                 f"{APPLICATION_GRACE_TIMEOUT}s grace"
