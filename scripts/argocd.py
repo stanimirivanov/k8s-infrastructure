@@ -14,7 +14,7 @@ from urllib.parse import urlparse
 import yaml
 
 if __package__:
-    from . import cluster, control_plane_deployment, gitops_status, object_store, postgres
+    from . import cluster, control_plane_health, gitops_status, object_store, postgres
     from .control_plane_registry import valid_token
     from .control_plane_release import (
         CONTROL_PLANE_HTTP_PORT,
@@ -24,7 +24,7 @@ if __package__:
     )
 else:
     import cluster
-    import control_plane_deployment
+    import control_plane_health
     import gitops_status
     import object_store
     import postgres
@@ -143,11 +143,11 @@ def validate_control_plane_application(
             "targetRevision": release.deployment_revision,
             "path": release.chart_path,
             "helm": {
-                "releaseName": control_plane_deployment.RELEASE,
+                "releaseName": control_plane_health.RELEASE,
                 "valuesObject": {
                     "image": release.image,
-                    "imagePullSecret": control_plane_deployment.IMAGE_PULL_SECRET,
-                    "executionNamespace": control_plane_deployment.EXECUTION_NAMESPACE,
+                    "imagePullSecret": control_plane_health.IMAGE_PULL_SECRET,
+                    "executionNamespace": control_plane_health.EXECUTION_NAMESPACE,
                     "httpPort": CONTROL_PLANE_HTTP_PORT,
                     "runtimeConfigMap": release.runtime_config_map,
                     "runtimeSecret": "perfeng-control-plane-runtime",
@@ -494,7 +494,7 @@ def execute(action: str, root: Path = cluster.ROOT) -> None:
     )
     postgres.execute("health", root)
     object_store.execute("health", uuid.uuid4().hex, root)
-    control_plane_deployment.verify_managed_workload(root)
+    control_plane_health.verify(root)
     print(f"Local Argo CD GitOps action completed: {action}", flush=True)
 
 

@@ -202,7 +202,7 @@ class GitOpsTests(unittest.TestCase):
             patch("scripts.gitops.gitops_status.wait_for_application") as wait,
             patch("scripts.gitops.postgres.execute") as postgres_health,
             patch("scripts.gitops.object_store.execute") as object_store_health,
-            patch("scripts.gitops.control_plane_deployment.verify_managed_workload") as control,
+            patch("scripts.gitops.control_plane_health.verify") as control,
         ):
             gitops.execute("bootstrap")
 
