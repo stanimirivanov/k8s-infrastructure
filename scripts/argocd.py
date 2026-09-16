@@ -279,6 +279,7 @@ def validate_configuration(root: Path = cluster.ROOT) -> str:
     if (
         root_kustomization.get("resources")
         != [
+            "namespaces.yaml",
             "project.yaml",
             "sample-sut-application.yaml",
             "postgres-application.yaml",
@@ -333,7 +334,7 @@ def validate_configuration(root: Path = cluster.ROOT) -> str:
         or sample_spec.get("syncPolicy", {}).get("automated")
         != {"enabled": True, "prune": False, "selfHeal": True}
         or set(sample_spec.get("syncPolicy", {})) != {"automated", "syncOptions"}
-        or sample_spec.get("syncPolicy", {}).get("syncOptions") != ["CreateNamespace=true"]
+        or sample_spec.get("syncPolicy", {}).get("syncOptions") != ["CreateNamespace=false"]
     ):
         raise ValueError("Invalid local sample SUT Application")
     validate_postgres_application(postgres_application)
