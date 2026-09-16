@@ -66,11 +66,11 @@ class GitOpsTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "SeaweedFS Application"):
             gitops.validate_seaweedfs_application(application)
 
-    def test_seaweedfs_application_is_inactive_during_rollback_rehearsal(self) -> None:
+    def test_seaweedfs_application_is_active_after_rollback_rehearsal(self) -> None:
         root = Path(__file__).resolve().parents[1]
         kustomization = gitops.load_yaml(root / "gitops/environments/local/kustomization.yaml")
 
-        self.assertNotIn("seaweedfs-application.yaml", kustomization["resources"])
+        self.assertIn("seaweedfs-application.yaml", kustomization["resources"])
 
     def test_stateful_adoption_limits_self_healing_without_pruning(self) -> None:
         root = Path(__file__).resolve().parents[1]
