@@ -1,0 +1,8 @@
+# Repository-wide review ownership. GitHub enforces this only when branch
+# protection requires review from Code Owners and the owner has write access.
+* @stanimirivanov
+
+# Infrastructure state, provider, cluster and security boundaries.
+/clusters/ @stanimirivanov
+/docs/decisions/ @stanimirivanov
+/.github/workflows/ @stanimirivanov

@@ -1,0 +1,45 @@
+# Operating-system and IDE-local state
+.DS_Store
+Thumbs.db
+/.idea/
+*.iml
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+/.local/
+*.kubeconfig
+kubeconfig
+
+# Terraform/OpenTofu state, plans and crash data
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.plan
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+
+# Python environments, caches and reports
+/.venv/
+/.ruff_cache/
+/.mypy_cache/
+/.pytest_cache/
+__pycache__/
+*.py[cod]
+.coverage
+htmlcov/
+
+# Build and temporary output
+build/
+dist/
+*.egg-info/
+*.tmp
+*.log
