@@ -94,25 +94,14 @@ def commands(action: str, root: Path = ROOT) -> list[list[str]]:
             ],
             [*kubectl, "wait", "--for=condition=Ready", "nodes", "--all", "--timeout=300s"],
         ]
-    if action == "deploy":
+    if action == "bootstrap":
         return [
-            [*kubectl, "apply", "-f", str(root / "local/namespaces.yaml")],
             [
-                "helm",
-                "upgrade",
-                "--install",
-                "sample-sut",
-                str(root / "charts/sample-sut"),
-                "--kubeconfig",
-                config,
-                "--kube-context",
-                CONTEXT,
-                "--namespace",
-                "perf-sut",
-                "--wait",
-                "--timeout",
-                "180s",
-            ],
+                *kubectl,
+                "apply",
+                "-f",
+                str(root / "gitops/environments/local/namespaces.yaml"),
+            ]
         ]
     if action == "health":
         return [
@@ -124,15 +113,6 @@ def commands(action: str, root: Path = ROOT) -> list[list[str]]:
                 "rollout",
                 "status",
                 "deployment/coredns",
-                "--timeout=60s",
-            ],
-            [
-                *kubectl,
-                "-n",
-                "perf-sut",
-                "rollout",
-                "status",
-                "deployment/sample-sut",
                 "--timeout=60s",
             ],
         ]
@@ -205,11 +185,10 @@ def execute(action: str, root: Path = ROOT, confirmation: str | None = None) -> 
             "Creating kind cluster (initial image download may take several minutes)",
             "Waiting for nodes to become Ready",
         ],
-        "deploy": ["Applying local namespaces", "Installing or upgrading sample SUT"],
+        "bootstrap": ["Applying declarative local namespaces"],
         "health": [
             "Checking node readiness and placement",
             "Checking CoreDNS rollout",
-            "Checking sample SUT rollout",
         ],
         "down": ["Deleting the confirmed local cluster"],
     }
@@ -231,7 +210,7 @@ def execute(action: str, root: Path = ROOT, confirmation: str | None = None) -> 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["up", "deploy", "health", "down"])
+    parser.add_argument("action", choices=["up", "bootstrap", "health", "down"])
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--confirm-delete")
     args = parser.parse_args()

@@ -159,14 +159,23 @@ class ClusterTests(unittest.TestCase):
             self.assertEqual(sentinel.read_text(), "keep")
 
     def test_commands_always_pin_context_and_kubeconfig(self):
-        for action in ["up", "deploy", "health", "down"]:
+        for action in ["up", "bootstrap", "health", "down"]:
             for command in commands(action):
                 self.assertIn("--kubeconfig", command)
                 if command[0] == "kubectl":
                     self.assertEqual(command[command.index("--context") + 1], CONTEXT)
-                if command[0] == "helm":
-                    self.assertEqual(command[command.index("--kube-context") + 1], CONTEXT)
+                self.assertNotEqual(command[0], "helm")
         self.assertFalse(any("delete" in command for command in commands("up")))
+
+    def test_bootstrap_applies_only_declarative_namespaces(self):
+        command = commands("bootstrap")[0]
+
+        self.assertEqual(command[-3:-1], ["apply", "-f"])
+        self.assertEqual(
+            Path(command[-1]).parts[-4:],
+            ("gitops", "environments", "local", "namespaces.yaml"),
+        )
+        self.assertEqual(len(commands("bootstrap")), 1)
 
     def test_down_requires_confirmation_before_any_command(self):
         with patch("scripts.cluster.run") as run:
@@ -240,7 +249,7 @@ class ClusterTests(unittest.TestCase):
 
     def test_preview_has_no_execution(self):
         with patch("scripts.cluster.run") as run:
-            for action in ["up", "deploy", "health", "down"]:
+            for action in ["up", "bootstrap", "health", "down"]:
                 self.assertTrue(commands(action))
             run.assert_not_called()
 
