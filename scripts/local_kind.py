@@ -1,4 +1,4 @@
-"""Dormant local-kind lifecycle imported for a later ownership cutover."""
+"""Operate the reviewed local-kind substrate profile."""
 
 import argparse
 import json
@@ -14,10 +14,8 @@ ROOT = Path(__file__).resolve().parents[1]
 NAME = "perfeng-local"
 CONTEXT = f"kind-{NAME}"
 PROGRESS_INTERVAL = 10
+COMMAND_TIMEOUT = 600
 PROFILE = ROOT / "clusters/local-kind/perfeng-local/cluster-config.yaml"
-DORMANT_MESSAGE = (
-    "Live execution remains owned by perfeng-environment until the reviewed ownership cutover"
-)
 ACTIONS = ("up", "ensure", "health", "down")
 NODE_IMAGE = (
     "kindest/node:v1.35.0@sha256:452d707d4862f52530247495d180205e029056831160e22870e37e3f6c1ac31f"
@@ -58,7 +56,15 @@ def load_profile(path: Path = PROFILE) -> dict[str, Any]:
     return value
 
 
-def run(command: list[str], *, input_data: bytes | None = None) -> str:
+def run(
+    command: list[str],
+    *,
+    input_data: bytes | None = None,
+    timeout: int = COMMAND_TIMEOUT,
+) -> str:
+    """Run one external command with bounded, private output handling."""
+    if timeout <= 0:
+        raise ValueError("Command timeout must be positive")
     environment = {
         key: value
         for key, value in os.environ.items()
@@ -68,6 +74,7 @@ def run(command: list[str], *, input_data: bytes | None = None) -> str:
     label = Path(command[0]).stem
     print(f"Starting {label} command...", flush=True)
     started = time.monotonic()
+    deadline = started + timeout
     # Capture bytes: Windows' locale decoder can crash a subprocess reader thread
     # on kind's UTF-8 progress symbols, even when the child succeeds.
     with subprocess.Popen(
@@ -78,8 +85,16 @@ def run(command: list[str], *, input_data: bytes | None = None) -> str:
         env={**environment, "KIND_EXPERIMENTAL_PROVIDER": "docker"},
     ) as process:
         while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                process.kill()
+                process.communicate()
+                raise ValueError(f"{label} timed out after {timeout}s; inspect the local target")
             try:
-                stdout, _ = process.communicate(input=input_data, timeout=PROGRESS_INTERVAL)
+                stdout, _ = process.communicate(
+                    input=input_data,
+                    timeout=min(PROGRESS_INTERVAL, remaining),
+                )
                 break
             except subprocess.TimeoutExpired:
                 # communicate() retains pending input; never submit credentials twice.
@@ -95,6 +110,23 @@ def run(command: list[str], *, input_data: bytes | None = None) -> str:
         raise ValueError(f"{label} returned invalid UTF-8; output withheld") from None
     print(f"Completed {label} command.", flush=True)
     return output
+
+
+def normalize_state_root(root: Path) -> Path:
+    """Return an existing ordinary directory without following redirection."""
+    absolute = Path(os.path.abspath(root))
+    try:
+        resolved = absolute.resolve(strict=True)
+    except OSError as error:
+        raise ValueError("State root must be an existing ordinary directory") from error
+    if not resolved.is_dir():
+        raise ValueError("State root must be an existing ordinary directory")
+    if any(
+        candidate.is_symlink() or candidate.is_junction()
+        for candidate in (absolute, *absolute.parents)
+    ):
+        raise ValueError("Redirected local state is not allowed")
+    return resolved
 
 
 def kubeconfig(root: Path) -> Path:
@@ -184,6 +216,9 @@ def check_nodes(data: dict[str, Any]) -> None:
 
 
 def execute(action: str, root: Path = ROOT, confirmation: str | None = None) -> None:
+    if action not in {"up", "health", "down"}:
+        raise ValueError("Unknown executable local-kind action")
+    root = normalize_state_root(root)
     if action == "down" and confirmation != NAME:
         raise ValueError(
             "Deletion requires --confirm-delete perfeng-local; all cluster data is lost"
@@ -243,6 +278,7 @@ def execute(action: str, root: Path = ROOT, confirmation: str | None = None) -> 
 
 def ensure(root: Path = ROOT) -> None:
     """Create the named cluster when absent or validate the existing cluster."""
+    root = normalize_state_root(root)
     print("Discovering the named local cluster...", flush=True)
     existing = run(["kind", "get", "clusters"]).splitlines()
     config = kubeconfig(root)
@@ -266,16 +302,20 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         load_profile()
+        state_root = normalize_state_root(args.state_root)
         if args.execute:
-            raise ValueError(DORMANT_MESSAGE)
-        state_root = args.state_root.resolve()
-        if args.action == "ensure":
-            print(json.dumps(["kind", "get", "clusters"]))
-            print("Activation would create the missing named cluster or validate the existing one.")
+            if args.action == "ensure":
+                ensure(state_root)
+            else:
+                execute(args.action, state_root, args.confirm_delete)
         else:
-            for command in commands(args.action, state_root):
-                print(json.dumps(command))
-        print("Preview only. Live execution is disabled until the reviewed ownership cutover.")
+            if args.action == "ensure":
+                print(json.dumps(["kind", "get", "clusters"]))
+                print("Execution creates the missing named cluster or validates the existing one.")
+            else:
+                for command in commands(args.action, state_root):
+                    print(json.dumps(command))
+            print("Preview only. Add --execute to operate the selected local substrate.")
     except (OSError, ValueError, yaml.YAMLError) as error:
         print(f"Local kind lifecycle error: {error}")
         return 1

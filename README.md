@@ -8,24 +8,24 @@ capability qualification.
 - This repository will own reusable local and cloud Kubernetes substrates.
 - It will install and qualify Argo CD, but it will not own applications that
   Argo CD reconciles for consuming projects.
-- The existing Perfeng local-kind lifecycle has been imported with filtered
-  source history, but live execution is deliberately disabled.
-- The Argo CD bootstrap and controller-readiness logic are also imported and
-  dormant; consumer Applications and repository credentials remain elsewhere.
+- The imported local-kind and Argo CD lifecycles are cutover-ready, preserve
+  the existing Perfeng identities and require explicit live execution.
+- Consumer Applications and repository credentials remain outside this
+  repository.
 - No existing cluster has transferred ownership; `perfeng-environment` remains
-  the active owner until a reviewed cutover.
+  the active operator entry point until it selects this provider release.
 - Run `make validate` before proposing a change.
 
 ## Status
 
 The repository contains its contributor harness, the initial
-[substrate capability boundary](docs/architecture/substrate-capability.md) and
-the dormant [local-kind lifecycle](docs/local-kind.md) and
-[Argo CD bootstrap](docs/local-argocd.md). Until an explicit cutover is
-accepted, `perfeng-environment` remains the owner of the existing
-`perfeng-local` kind cluster and Argo CD installation. Both imported CLIs
-provide offline previews but reject live execution before invoking external
-tools.
+[substrate capability boundary](docs/architecture/substrate-capability.md), the
+[local-kind lifecycle](docs/local-kind.md) and the
+[Argo CD bootstrap](docs/local-argocd.md). Their CLIs provide offline previews
+and explicit live execution with target, ownership and timeout checks. Until
+the consumer cutover is accepted, `perfeng-environment` remains the supported
+operator entry point for the existing `perfeng-local` cluster and Argo CD
+installation.
 
 ## Responsibility
 
@@ -76,10 +76,9 @@ uv sync --locked
 make validate
 ```
 
-The individual commands are documented in
-[CONTRIBUTING.md](CONTRIBUTING.md). The imported local-kind command remains
-dormant, as does the imported Argo CD bootstrap. See their guides for the exact
-preview and activation boundaries.
+The individual checks are documented in
+[CONTRIBUTING.md](CONTRIBUTING.md). See the local-kind and Argo CD guides for
+their preview, execution and staged consumer-cutover boundaries.
 
 ## Project governance
 

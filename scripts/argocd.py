@@ -1,4 +1,4 @@
-"""Validate and preview the dormant local Argo CD bootstrap."""
+"""Install and verify Argo CD on the reviewed local substrate."""
 
 from __future__ import annotations
 
@@ -15,11 +15,9 @@ from . import argocd_status, local_kind
 ROOT = Path(__file__).resolve().parents[1]
 NAMESPACE = "argocd"
 OWNER = "k8s-infrastructure"
+LEGACY_OWNER = "perfeng-environment"
 ACTIONS = ("validate", "bootstrap", "health")
 BOOTSTRAP = Path("clusters/local-kind/perfeng-local/addons/argocd")
-DORMANT_MESSAGE = (
-    "Live execution remains owned by perfeng-environment until the reviewed ownership cutover"
-)
 
 
 def load_yaml(path: Path) -> dict[str, Any]:
@@ -109,13 +107,57 @@ def kubectl(state_root: Path) -> list[str]:
     ]
 
 
+def namespace_command(kube: list[str]) -> list[str]:
+    """Build the read-only namespace ownership query."""
+    return [*kube, "get", "namespace", NAMESPACE, "--ignore-not-found", "-o", "json"]
+
+
+def validate_live_namespace(
+    output: str,
+    *,
+    allow_missing: bool = False,
+    allow_legacy: bool = False,
+) -> None:
+    """Require an owned namespace or the exact reviewed legacy handoff identity."""
+    if not output.strip():
+        if allow_missing:
+            return
+        raise ValueError("Argo CD namespace is missing")
+    value = json.loads(output)
+    if not isinstance(value, dict):
+        raise ValueError("Invalid Argo CD namespace response")
+    metadata = value.get("metadata")
+    if (
+        value.get("apiVersion") != "v1"
+        or value.get("kind") != "Namespace"
+        or not isinstance(metadata, dict)
+        or metadata.get("name") != NAMESPACE
+        or not isinstance(metadata.get("labels"), dict)
+    ):
+        raise ValueError("Invalid Argo CD namespace response")
+    labels = metadata["labels"]
+    owner = labels.get("app.kubernetes.io/managed-by")
+    if owner == OWNER:
+        if (
+            labels.get("app.kubernetes.io/name") != NAMESPACE
+            or labels.get("app.kubernetes.io/part-of") != "kubernetes-substrate"
+        ):
+            raise ValueError("Argo CD namespace has incomplete infrastructure ownership")
+        return
+    if allow_legacy and owner == LEGACY_OWNER:
+        if labels.get("perfeng.io/purpose") != "gitops-control-plane":
+            raise ValueError("Argo CD namespace has an invalid legacy ownership identity")
+        return
+    raise ValueError("Argo CD namespace has an unexpected owner")
+
+
 def commands(action: str, root: Path = ROOT, state_root: Path = ROOT) -> list[list[str]]:
-    """Build the future bootstrap or health command sequence for preview."""
+    """Build the bootstrap or health command sequence for offline preview."""
     if action not in {"bootstrap", "health"}:
         raise ValueError("Unknown Argo CD action")
     validate_configuration(root)
     kube = kubectl(state_root)
-    result = []
+    result = [namespace_command(kube)]
     if action == "bootstrap":
         result.append(
             [
@@ -127,13 +169,30 @@ def commands(action: str, root: Path = ROOT, state_root: Path = ROOT) -> list[li
                 str(root / BOOTSTRAP),
             ]
         )
+        result.append(namespace_command(kube))
     result.extend(argocd_status.rollout_commands(kube))
     return result
 
 
 def execute(action: str, root: Path = ROOT, state_root: Path = ROOT) -> None:
-    """Refuse live ownership until the separate cutover is accepted."""
-    raise ValueError(DORMANT_MESSAGE)
+    """Operate only an owned cluster and an approved namespace handoff."""
+    if action not in {"bootstrap", "health"}:
+        raise ValueError("Unknown Argo CD action")
+    state_root = local_kind.normalize_state_root(state_root)
+    validate_configuration(root)
+    local_kind.execute("health", state_root)
+    kube = kubectl(state_root)
+    current = local_kind.run(namespace_command(kube))
+    validate_live_namespace(
+        current,
+        allow_missing=action == "bootstrap",
+        allow_legacy=action == "bootstrap",
+    )
+    if action == "bootstrap":
+        local_kind.run(commands(action, root, state_root)[1])
+        validate_live_namespace(local_kind.run(namespace_command(kube)))
+    argocd_status.wait_for_argocd(kube)
+    print(f"Local Argo CD action completed: {action}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -149,9 +208,10 @@ def main(argv: list[str] | None = None) -> int:
         elif args.execute:
             execute(args.action, state_root=args.state_root)
         else:
-            for command in commands(args.action, state_root=args.state_root.resolve()):
+            state_root = local_kind.normalize_state_root(args.state_root)
+            for command in commands(args.action, state_root=state_root):
                 print(json.dumps(command))
-            print("Preview only. Live execution is disabled until the reviewed ownership cutover.")
+            print("Preview only. Add --execute to operate Argo CD on the selected substrate.")
     except (OSError, ValueError, TypeError, yaml.YAMLError) as error:
         print(f"Local Argo CD bootstrap error: {error}")
         return 1
