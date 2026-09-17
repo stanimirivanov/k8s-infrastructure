@@ -23,6 +23,7 @@ from scripts.local_kind import (
     execute,
     load_profile,
     main,
+    normalize_state_root,
     run,
     verify_context,
     verify_local_docker,
@@ -30,6 +31,12 @@ from scripts.local_kind import (
 
 
 class ClusterTests(unittest.TestCase):
+    def test_state_root_normalization_returns_the_canonical_ordinary_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            self.assertEqual(normalize_state_root(root), root.resolve(strict=True))
+
     def test_private_stdin_is_delivered_without_printing(self):
         captured = io.StringIO()
         with redirect_stdout(captured):

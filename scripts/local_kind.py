@@ -119,14 +119,14 @@ def normalize_state_root(root: Path) -> Path:
         resolved = absolute.resolve(strict=True)
     except OSError as error:
         raise ValueError("State root must be an existing ordinary directory") from error
-    if (
-        resolved != absolute
-        or not absolute.is_dir()
-        or absolute.is_symlink()
-        or absolute.is_junction()
+    if not resolved.is_dir():
+        raise ValueError("State root must be an existing ordinary directory")
+    if any(
+        candidate.is_symlink() or candidate.is_junction()
+        for candidate in (absolute, *absolute.parents)
     ):
         raise ValueError("Redirected local state is not allowed")
-    return absolute
+    return resolved
 
 
 def kubeconfig(root: Path) -> Path:
