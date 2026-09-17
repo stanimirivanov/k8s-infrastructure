@@ -8,19 +8,20 @@ capability qualification.
 - This repository will own reusable local and cloud Kubernetes substrates.
 - It will install and qualify Argo CD, but it will not own applications that
   Argo CD reconciles for consuming projects.
-- The repository is currently a foundation only: no existing cluster has been
-  transferred to it and no command here mutates infrastructure.
-- The first implementation will preserve the existing Perfeng local cluster
-  identity while importing its kind lifecycle with source history.
+- The existing Perfeng local-kind lifecycle has been imported with filtered
+  source history, but live execution is deliberately disabled.
+- No existing cluster has transferred ownership; `perfeng-environment` remains
+  the active owner until a reviewed cutover.
 - Run `make validate` before proposing a change.
 
 ## Status
 
-The repository contains its contributor harness and the initial
-[substrate capability boundary](docs/architecture/substrate-capability.md).
-Operational implementation has not yet been imported. Until an explicit
+The repository contains its contributor harness, the initial
+[substrate capability boundary](docs/architecture/substrate-capability.md) and
+the dormant [local-kind lifecycle](docs/local-kind.md). Until an explicit
 cutover is accepted, `perfeng-environment` remains the owner of the existing
-`perfeng-local` kind cluster and Argo CD installation.
+`perfeng-local` kind cluster and Argo CD installation. The imported CLI provides
+offline previews but rejects live execution before invoking external tools.
 
 ## Responsibility
 
@@ -43,7 +44,7 @@ reusable Perfeng workload packaging remains in `perfeng-k8s`.
 
 ```text
 clusters/
-  local-kind/
+  local-kind/perfeng-local/
   oci-oke/
 docs/
   architecture/
@@ -72,9 +73,8 @@ make validate
 ```
 
 The individual commands are documented in
-[CONTRIBUTING.md](CONTRIBUTING.md). Live infrastructure commands will be added
-only with their implementation and will require explicit execution and target
-confirmation.
+[CONTRIBUTING.md](CONTRIBUTING.md). The imported local-kind command remains
+dormant; see its guide for the exact preview and activation boundary.
 
 ## Project governance
 
