@@ -1,21 +1,21 @@
-# Dormant local Argo CD bootstrap
+# Local Argo CD bootstrap
 
-- Status: Imported, execution disabled
+- Status: Cutover-ready provider release
 - Profile: `local-kind/perfeng-local`
-- Active owner: `perfeng-environment`
+- Existing environment entry point: `perfeng-environment` until consumer cutover
 
 ## TL;DR
 
 - The official Argo CD `v3.5.2` bootstrap and controller-readiness logic now
   live here with their relevant Git history.
-- Validation and command previews are offline; `--execute` fails before Docker,
-  kind, kubectl or the network is accessed.
+- Validation and command previews are offline; live access requires explicit
+  `--execute` and the selected state root.
 - This repository owns only installation and controller readiness. Consumers
   continue to own Projects, Applications, namespaces and repository credentials.
-- `perfeng-environment` remains the active owner of the existing installation
-  until a separate cutover passes compatibility and recovery gates.
-- Use the checked-in preview commands for review, but continue using
-  `perfeng-environment` for live local operations.
+- `perfeng-environment` remains the supported entry point for the existing
+  installation until it pins and invokes this provider release.
+- Bootstrap accepts only a missing namespace, this repository's namespace, or
+  the exact reviewed legacy Perfeng ownership identity.
 
 ## Ownership boundary
 
@@ -34,10 +34,11 @@ Applications, repository credential Secrets, workload namespaces, release
 locks and product health. Those remain consumer composition. Installing Argo CD
 does not grant this repository authority over anything reconciled through it.
 
-The existing local installation has not changed owner. Until cutover,
-`perfeng-environment` remains the only supported tool for live bootstrap,
-health and recovery. The dormant code has no Task command or CI path that can
-contact a cluster.
+Merging this provider release does not contact or change the existing local
+installation. Until consumer cutover, `perfeng-environment` remains the
+supported operator entry point for bootstrap, health and recovery. This
+repository deliberately adds no Task command or live CI path during the staged
+handoff.
 
 ## Reviewed release and layout
 
@@ -58,7 +59,7 @@ Offline validation rejects:
 
 The reviewed non-HA installation contains six Deployments and the
 `argocd-application-controller` StatefulSet. Every planned readiness command
-has a 300-second Kubernetes rollout timeout. A failed future live check reports
+has a 300-second Kubernetes rollout timeout. A failed live check reports
 the exact controller, desired and ready replica counts, and bounded Pod phase,
 container readiness, restart count and waiting reason. Diagnostic text removes
 embedded URL credentials and GitHub-shaped tokens.
@@ -92,35 +93,42 @@ uv run --locked python -m scripts.argocd health `
   --state-root ..\perfeng-environment
 ```
 
-The future bootstrap sequence first applies the reviewed Kustomization using
-server-side apply and explicit conflict handling, then checks each controller.
-The health sequence contains only controller rollout checks. Neither sequence
-contains consumer reconciliation or credential creation.
+The bootstrap sequence verifies cluster health and the existing namespace
+identity, applies the reviewed Kustomization using server-side apply and
+explicit conflict handling, verifies the new infrastructure owner, then checks
+each controller. The health sequence verifies cluster health, requires the
+infrastructure-owned namespace and performs only controller rollout checks.
+Neither sequence contains consumer reconciliation or credential creation.
 
-## Deliberate execution refusal
+## Explicit execution
 
-All live forms currently fail:
+After reviewing the preview, execution requires the intended state root:
 
-```sh
-uv run --locked python -m scripts.argocd bootstrap --execute
-uv run --locked python -m scripts.argocd health --execute
+```powershell
+uv run --locked python -m scripts.argocd bootstrap --execute `
+  --state-root ..\perfeng-environment
+uv run --locked python -m scripts.argocd health --execute `
+  --state-root ..\perfeng-environment
 ```
 
-They exit nonzero with this ownership message:
+Bootstrap accepts three states:
 
-```text
-Live execution remains owned by perfeng-environment until the reviewed ownership cutover
-```
+- the namespace is absent and may be created;
+- it already has the complete `k8s-infrastructure` identity; or
+- it has the exact legacy `perfeng-environment` owner and
+  `perfeng.io/purpose: gitops-control-plane` label used by the reviewed handoff.
 
-The refusal occurs before configuration rendering, process execution or cluster
-access. Providing another state root does not bypass it.
+Any other existing namespace fails before apply. After apply, the namespace
+must report the complete infrastructure identity before controller readiness is
+checked. `health` never applies configuration and accepts only the new owner.
 
-## Activation gates
+## Consumer cutover gates
 
-Activation belongs to a separate change and requires all of the following:
+The provider is ready for immutable selection. Transferring the existing
+installation still requires a consumer change that proves all of the following:
 
-1. `perfeng-environment` consumes a reviewed infrastructure revision and stops
-   invoking its competing installer before this one is enabled.
+1. `perfeng-environment` pins the merged infrastructure revision and replaces
+   its installer invocation with this provider entry point.
 2. The existing cluster, context, kubeconfig path, Argo CD namespace and
    controller resource identities are preserved.
 3. Namespace ownership labels are migrated deliberately and verified without
@@ -135,9 +143,8 @@ Activation belongs to a separate change and requires all of the following:
 7. Rollback restores exactly one active installer without deleting the cluster,
    Argo CD custom resources, Secrets, persistent volumes or retained evidence.
 
-Task commands and live CI may be introduced only with that activation. Removing
-the old implementation follows successful cutover rather than occurring in the
-same import.
+Removing the old implementation follows successful live acceptance rather than
+occurring in the consumer-switch pull request.
 
 ## Troubleshooting
 
@@ -154,10 +161,11 @@ The checked-in namespace is intentionally exact. Do not relax it to adopt an
 arbitrary existing namespace. Existing-owner migration belongs to the cutover,
 where the live target and rollback can be verified.
 
-### `--execute` reports the ownership refusal
+### Bootstrap rejects the existing namespace owner
 
-This is the expected dormant state. Continue using the supported
-`perfeng-environment` workflow until the cutover is accepted.
+Inspect only the namespace name and labels. Bootstrap accepts the exact reviewed
+legacy owner for migration but refuses arbitrary namespaces. Do not relabel or
+delete the namespace manually as a workaround.
 
 ### Preview points at the wrong kubeconfig
 
@@ -165,11 +173,13 @@ Pass the intended absolute or workspace-relative `--state-root`. The preview
 always derives `.local/perfeng-local.kubeconfig` beneath it and uses context
 `kind-perfeng-local`; it never falls back to the ambient kubeconfig.
 
-### A live controller is unhealthy today
+### A live controller is unhealthy
 
-Diagnose it through the active `perfeng-environment` troubleshooting guide.
-This repository does not yet have authority to repair, replace or relabel the
-installation.
+The command prints bounded Deployment/StatefulSet and Pod readiness evidence
+while withholding command output that may contain credentials. Before consumer
+cutover, continue recovery through the active `perfeng-environment` workflow.
+After cutover, correct the reviewed provider configuration or dependency and
+retry; do not delete the namespace, Applications or Secrets.
 
 ## Provenance
 

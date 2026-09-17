@@ -14,7 +14,6 @@ import yaml
 from scripts.local_kind import (
     ACTIONS,
     CONTEXT,
-    DORMANT_MESSAGE,
     NAME,
     NODE_IMAGE,
     PROFILE,
@@ -102,6 +101,20 @@ class ClusterTests(unittest.TestCase):
         self.assertNotIn("private-", captured.getvalue())
         self.assertNotIn("Completed", captured.getvalue())
 
+    def test_command_timeout_terminates_the_process(self):
+        with (
+            patch("scripts.local_kind.subprocess.Popen") as popen,
+            patch("scripts.local_kind.time.monotonic", side_effect=[0.0, 601.0]),
+            redirect_stdout(io.StringIO()),
+            self.assertRaisesRegex(ValueError, "timed out after 600s"),
+        ):
+            process = popen.return_value.__enter__.return_value
+            process.communicate.return_value = (b"", b"")
+            run(["kubectl"])
+
+        process.kill.assert_called_once_with()
+        process.communicate.assert_called_once_with()
+
     def test_invalid_stdout_fails_without_false_completion(self):
         captured = io.StringIO()
         with redirect_stdout(captured), self.assertRaisesRegex(ValueError, "invalid UTF-8"):
@@ -178,6 +191,12 @@ class ClusterTests(unittest.TestCase):
         with patch("scripts.local_kind.run") as run:
             with self.assertRaises(ValueError):
                 execute("down")
+            run.assert_not_called()
+
+    def test_unknown_execution_action_fails_before_any_command(self):
+        with patch("scripts.local_kind.run") as run:
+            with self.assertRaisesRegex(ValueError, "Unknown executable"):
+                execute("ensure")
             run.assert_not_called()
 
     def test_up_never_recreates_existing_cluster(self):
@@ -304,13 +323,25 @@ class ClusterTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "compatibility identity"):
                 load_profile(path)
 
-    def test_live_cli_is_dormant_before_any_external_command(self):
-        captured = io.StringIO()
-        with patch("scripts.local_kind.run") as run, redirect_stdout(captured):
-            self.assertEqual(main(["health", "--execute"]), 1)
+    def test_live_cli_dispatches_the_selected_action_and_state_root(self):
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch("scripts.local_kind.execute") as execute,
+        ):
+            self.assertEqual(main(["health", "--execute", "--state-root", directory]), 0)
 
-        run.assert_not_called()
-        self.assertIn(DORMANT_MESSAGE, captured.getvalue())
+        execute.assert_called_once_with("health", Path(directory).resolve(), None)
+
+    def test_live_ensure_cli_uses_the_idempotent_entry_point(self):
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch("scripts.local_kind.ensure") as ensure,
+            patch("scripts.local_kind.execute") as execute,
+        ):
+            self.assertEqual(main(["ensure", "--execute", "--state-root", directory]), 0)
+
+        ensure.assert_called_once_with(Path(directory).resolve())
+        execute.assert_not_called()
 
     def test_preview_cli_is_offline(self):
         captured = io.StringIO()
@@ -320,7 +351,7 @@ class ClusterTests(unittest.TestCase):
         run.assert_not_called()
         preview = captured.getvalue().splitlines()
         self.assertIn(str(PROFILE), json.loads(preview[0]))
-        self.assertIn("Live execution is disabled", captured.getvalue())
+        self.assertIn("Add --execute", captured.getvalue())
 
     def test_preview_accepts_explicit_consumer_state_root(self):
         with tempfile.TemporaryDirectory() as directory:
