@@ -35,6 +35,21 @@ class GitOpsTests(unittest.TestCase):
     def test_repository_configuration_selects_an_explicit_release(self) -> None:
         self.assertEqual(gitops.validate_configuration(), "v3.5.2")
 
+    def test_project_sources_are_limited_to_child_application_repositories(self) -> None:
+        applications = [
+            {"spec": {"source": {"repoURL": gitops.REPOSITORY_URL}}},
+            {"spec": {"source": {"repoURL": gitops.DEPLOYMENT_REPOSITORY}}},
+        ]
+        project_spec = {"sourceRepos": [gitops.REPOSITORY_URL, gitops.DEPLOYMENT_REPOSITORY]}
+
+        gitops.validate_project_sources(project_spec, applications)
+
+        project_spec["sourceRepos"].append(
+            "https://github.com/stanimirivanov/k8s-infrastructure.git"
+        )
+        with self.assertRaisesRegex(ValueError, "AppProject source repositories"):
+            gitops.validate_project_sources(project_spec, applications)
+
     def test_control_plane_application_is_bound_to_the_deployment_lock(self) -> None:
         root = Path(__file__).resolve().parents[1]
         application = gitops.load_yaml(

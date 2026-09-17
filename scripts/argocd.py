@@ -241,6 +241,29 @@ def validate_seaweedfs_application(application: dict[str, Any]) -> None:
         raise ValueError("Invalid local SeaweedFS Application")
 
 
+def validate_project_sources(
+    project_spec: dict[str, Any], applications: list[dict[str, Any]]
+) -> None:
+    """Require least-privilege source access for the reviewed child Applications."""
+    expected: set[str] = set()
+    for application in applications:
+        spec = application.get("spec")
+        source = spec.get("source") if isinstance(spec, dict) else None
+        repository = source.get("repoURL") if isinstance(source, dict) else None
+        if not isinstance(repository, str):
+            raise ValueError("Invalid local Application source repository")
+        expected.add(repository)
+
+    configured = project_spec.get("sourceRepos")
+    if (
+        not isinstance(configured, list)
+        or not all(isinstance(repository, str) for repository in configured)
+        or len(configured) != len(set(configured))
+        or set(configured) != expected
+    ):
+        raise ValueError("Invalid local AppProject source repositories")
+
+
 def validate_configuration(root: Path = cluster.ROOT) -> str:
     """Validate the explicit Argo CD release and local objects without external access."""
     kustomization = load_yaml(root / "gitops/bootstrap/argocd/kustomization.yaml")
@@ -274,9 +297,11 @@ def validate_configuration(root: Path = cluster.ROOT) -> str:
     seaweedfs_application = load_yaml(root / "gitops/environments/local/seaweedfs-application.yaml")
     control_plane = load_yaml(root / "gitops/environments/local/control-plane-application.yaml")
     release = load_lock(root / "deployments/local-control-plane.json")
-    workspace = json.loads((root / "workspace.json").read_text(encoding="utf-8"))
-    repository_urls = sorted(item["url"] for item in workspace["repositories"])
     project_spec = project.get("spec", {})
+    validate_project_sources(
+        project_spec,
+        [sample_sut, postgres_application, seaweedfs_application, control_plane],
+    )
     if (
         root_kustomization.get("resources")
         != [
@@ -298,7 +323,6 @@ def validate_configuration(root: Path = cluster.ROOT) -> str:
             "destinations",
             "namespaceResourceWhitelist",
         }
-        or sorted(project_spec.get("sourceRepos", [])) != repository_urls
         or project_spec.get("destinations")
         != [
             {"server": "https://kubernetes.default.svc", "namespace": namespace}
