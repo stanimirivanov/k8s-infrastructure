@@ -10,6 +10,8 @@ capability qualification.
   Argo CD reconciles for consuming projects.
 - The existing Perfeng local-kind lifecycle has been imported with filtered
   source history, but live execution is deliberately disabled.
+- The Argo CD bootstrap and controller-readiness logic are also imported and
+  dormant; consumer Applications and repository credentials remain elsewhere.
 - No existing cluster has transferred ownership; `perfeng-environment` remains
   the active owner until a reviewed cutover.
 - Run `make validate` before proposing a change.
@@ -18,10 +20,12 @@ capability qualification.
 
 The repository contains its contributor harness, the initial
 [substrate capability boundary](docs/architecture/substrate-capability.md) and
-the dormant [local-kind lifecycle](docs/local-kind.md). Until an explicit
-cutover is accepted, `perfeng-environment` remains the owner of the existing
-`perfeng-local` kind cluster and Argo CD installation. The imported CLI provides
-offline previews but rejects live execution before invoking external tools.
+the dormant [local-kind lifecycle](docs/local-kind.md) and
+[Argo CD bootstrap](docs/local-argocd.md). Until an explicit cutover is
+accepted, `perfeng-environment` remains the owner of the existing
+`perfeng-local` kind cluster and Argo CD installation. Both imported CLIs
+provide offline previews but reject live execution before invoking external
+tools.
 
 ## Responsibility
 
@@ -74,7 +78,8 @@ make validate
 
 The individual commands are documented in
 [CONTRIBUTING.md](CONTRIBUTING.md). The imported local-kind command remains
-dormant; see its guide for the exact preview and activation boundary.
+dormant, as does the imported Argo CD bootstrap. See their guides for the exact
+preview and activation boundaries.
 
 ## Project governance
 
