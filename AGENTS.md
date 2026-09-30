@@ -18,6 +18,7 @@ Normative terms such as MUST, SHOULD and MAY have the meanings defined there.
    issue-timing, verification and external-side-effect rules.
 2. You MUST inspect the branch and working tree and preserve pre-existing work.
 3. You MUST read the applicable
+   [documentation map](docs/README.md),
    [engineering standards](docs/development/engineering-standards.md), accepted
    [ADRs](docs/decisions/README.md), provider guide and capability contract.
 4. You MUST use repository-local checks. You MUST NOT claim an unavailable or

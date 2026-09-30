@@ -14,7 +14,7 @@ capability qualification.
   repository.
 - No existing cluster has transferred ownership; `perfeng-environment` remains
   the active operator entry point until it selects this provider release.
-- Run `make validate` before proposing a change.
+- Run `make verify` while editing and `make validate` before handoff.
 
 ## Status
 
@@ -69,16 +69,18 @@ Prerequisites:
 - [uv](https://docs.astral.sh/uv/);
 - GNU Make for the convenience command surface.
 
-Install the locked development environment and validate the repository:
+Install the locked development environment and run the offline inner loop:
 
 ```sh
-uv sync --locked
-make validate
+make bootstrap
+make verify
 ```
 
-The individual checks are documented in
-[CONTRIBUTING.md](CONTRIBUTING.md). See the local-kind and Argo CD guides for
-their preview, execution and staged consumer-cutover boundaries.
+Run `make validate` before handoff when current vulnerability data is
+available. The [documentation map](docs/README.md) routes contributors to the
+[harness](docs/development/harness.md), policy and operating guides. See the
+local-kind and Argo CD guides for their preview, execution and staged
+consumer-cutover boundaries.
 
 ## Project governance
 
