@@ -28,6 +28,8 @@ Lowercase guidance does not silently create another normative level.
 | Contributor workflow, issue timing, escalation and completion | This document |
 | Concise contributor and agent entry point | [AGENTS.md](AGENTS.md) |
 | Infrastructure engineering standards | [docs/development/engineering-standards.md](docs/development/engineering-standards.md) |
+| Task-routed documentation and verification tiers | [Documentation map](docs/README.md) and [harness](docs/development/harness.md) |
+| Dependency admission and updates | [Dependency policy](docs/development/dependency-policy.md) |
 | Architecture decisions | [docs/decisions](docs/decisions/README.md) |
 | Substrate/consumer handoff | [docs/architecture/substrate-capability.md](docs/architecture/substrate-capability.md) |
 | Cross-repository milestones | [Perfeng roadmap](https://github.com/stanimirivanov/perfeng-environment/blob/main/docs/roadmap/milestones.md) |
@@ -184,19 +186,19 @@ registry, GitHub and other mutations MUST remain within scope and authority.
 
 ## Verification and constrained environments
 
-Run every repository-local check:
+Bootstrap the locked environment, then run the offline repository checks:
 
 ```sh
-uv run --locked ruff format --check .
-uv run --locked ruff check .
-uv run --locked ty check
-uv run --locked python -m unittest discover -s tests -v
-uv run --locked python -m scripts.check_docs
+make bootstrap
+make verify
 ```
 
-`make validate` wraps these checks. A provider or cluster implementation adds
-its own format, validate, security and plan checks to this list in the same pull
-request.
+Before handoff, run `make validate`, which adds the lock and vulnerability
+checks. `make verify` uses installed dependencies offline after bootstrap.
+`make supply-chain` may need current advisory data. A provider or cluster
+implementation adds its own format, validation, security, and plan checks to
+the appropriate Make target and CI job in the same pull request. The tiers and
+prerequisites are defined in the [harness](docs/development/harness.md).
 
 When a check cannot execute because of sandbox, network, credentials, missing
 tools/services, platform limits or another constraint, report it as **not run**,

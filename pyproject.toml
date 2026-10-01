@@ -10,6 +10,7 @@ dev = ["ruff>=0.16.4,<0.17", "ty>=0.0.1,<1", "types-PyYAML"]
 
 [tool.uv]
 package = false
+required-version = "==0.12.5"
 
 [tool.ruff]
 target-version = "py312"

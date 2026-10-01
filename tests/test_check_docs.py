@@ -12,10 +12,11 @@ class DocumentationLinkTests(TestCase):
             docs = root / "docs"
             docs.mkdir()
             (root / "README.md").write_text(
-                "[guide](docs/guide.md#usage) [site](https://example.com) [section](#local)\n",
+                "# Local\n[guide](docs/guide.md#usage) [site](https://example.com) "
+                "[section](#local)\n",
                 encoding="utf-8",
             )
-            (docs / "guide.md").write_text("# Guide\n", encoding="utf-8")
+            (docs / "guide.md").write_text("# Guide\n## Usage\n", encoding="utf-8")
 
             self.assertEqual(validate_links(root), [])
 
@@ -38,3 +39,27 @@ class DocumentationLinkTests(TestCase):
                 validate_links(root),
                 ["README.md: link escapes repository '../outside.md'"],
             )
+
+    def test_reference_link_checks_heading_and_ignores_fenced_examples(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "README.md").write_text(
+                "# Guide\n[details][target]\n\n[target]: <README.md#missing>\n"
+                "```md\n[example](missing.md)\n```\n",
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                validate_links(root),
+                ["README.md: missing heading anchor 'README.md#missing'"],
+            )
+
+    def test_duplicate_heading_anchor_is_valid(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "README.md").write_text(
+                "# Guide\n## Repeat\n## Repeat\n[second](#repeat-1)\n",
+                encoding="utf-8",
+            )
+
+            self.assertEqual(validate_links(root), [])
