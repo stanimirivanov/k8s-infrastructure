@@ -8,7 +8,7 @@
   after maintenance, license, security, and replacement review.
 - Keep repository verification offline after bootstrap; run vulnerability
   review separately because it needs current advisory data.
-- GitHub Action `uses:` references use semantic major versions; cluster images,
+- GitHub Actions may use reviewed release tags or commit pins; cluster images,
   source revisions, archives, and state identities keep exact immutable values.
 - Dependabot proposes GitHub Actions updates only. Python updates are manual
   and lockfile-aware until the hosted updater supports the pinned uv toolchain.
@@ -32,11 +32,11 @@ loop.
 
 ## Updates and immutable identities
 
-GitHub Actions use semantic majors such as `actions/checkout@v7`. This rule
-does not apply to the reviewed kind node-image digest, Argo CD release,
-provider archives, Terraform locks, Git source selections, or capability
-identities. Changes to those selections require their own compatibility and
-operational review.
+Workflow `uses:` entries may use reviewed release tags or commit SHAs; the
+repository policy checker does not enforce one reference style. The reviewed
+kind node-image digest, Argo CD release, provider archives, Terraform locks,
+Git source selections, and capability identities remain exact. Changes to
+those selections require their own compatibility and operational review.
 
 Dependabot updates GitHub Actions only. Python updates are a manual,
 lockfile-aware workflow until hosted uv support is reliable for the pinned

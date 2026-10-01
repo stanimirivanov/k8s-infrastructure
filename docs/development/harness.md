@@ -33,8 +33,8 @@ job runs `make supply-chain`.
 
 The repository policy checker reports the affected path and rule. It validates
 local Markdown destinations and anchors, required summaries, issue and pull
-request templates, ADR numbering and indexing, and semantic-major GitHub
-Action references. It does not resolve remote links or infer infrastructure
+request templates, and ADR numbering and indexing. It does not prescribe a
+GitHub Action reference style, resolve remote links, or infer infrastructure
 health. Regression tests cover accepted and rejected states.
 
 `make configuration-check` validates the exact checked-in local-kind profile

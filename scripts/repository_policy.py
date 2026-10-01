@@ -24,8 +24,6 @@ PR_HEADINGS = (
     "Verification",
     "Limitations and review",
 )
-ACTION = re.compile(r"^\s*(?:-\s*)?uses:\s*(.*?)\s*$")
-BLOCK_SCALAR = re.compile(r"^\s*(?:-\s*)?[^:#]+:\s*[|>][+-]?\d*\s*(?:#.*)?$")
 ADR_NAME = re.compile(r"^(\d{4})-[a-z0-9-]+\.md$")
 ADR_HEADING = re.compile(r"^# ADR[- ](\d{4}):\s+\S")
 METADATA = re.compile(r"^- ([A-Za-z][A-Za-z ]+):\s*(.*)$", re.MULTILINE)
@@ -125,55 +123,6 @@ def check_adrs(root: Path) -> list[str]:
     return errors
 
 
-def action_references(text: str) -> list[tuple[int, str]]:
-    """Read YAML uses lines, ignoring examples inside block scalar bodies."""
-    references: list[tuple[int, str]] = []
-    block_indent: int | None = None
-    for number, line in enumerate(text.splitlines(), 1):
-        stripped = line.lstrip(" ")
-        indent = len(line) - len(stripped)
-        if block_indent is not None:
-            if not stripped or indent > block_indent:
-                continue
-            block_indent = None
-        if BLOCK_SCALAR.match(line):
-            block_indent = indent
-            continue
-        match = ACTION.match(line)
-        if match is None:
-            continue
-        raw = match.group(1).strip()
-        if raw.startswith(("'", '"')):
-            quote = raw[0]
-            end = raw.find(quote, 1)
-            reference = raw[1:end] if end > 0 else raw
-        else:
-            reference = raw.split("#", 1)[0].strip()
-        references.append((number, reference))
-    return references
-
-
-def check_actions(root: Path) -> list[str]:
-    """Require semantic-major remote action references in workflows and composites."""
-    paths = [*root.glob(".github/workflows/*.yml"), *root.glob(".github/workflows/*.yaml")]
-    paths += [
-        *root.glob(".github/actions/**/action.yml"),
-        *root.glob(".github/actions/**/action.yaml"),
-    ]
-    errors: list[str] = []
-    for path in sorted(paths):
-        for line, reference in action_references(path.read_text(encoding="utf-8")):
-            if reference.startswith(("./", "docker://")):
-                continue
-            if re.fullmatch(r"[^\s@]+@v\d+", reference):
-                continue
-            errors.append(
-                f"{_relative(root, path)}:{line}: use a semantic-major action reference "
-                f"(owner/action@vN): {reference!r}"
-            )
-    return errors
-
-
 def check_repository(root: Path) -> list[str]:
     """Return deterministic, actionable diagnostics for repository policy drift."""
     root = root.resolve()
@@ -189,7 +138,6 @@ def check_repository(root: Path) -> list[str]:
     errors.extend(check_documentation(root))
     errors.extend(check_templates(root))
     errors.extend(check_adrs(root))
-    errors.extend(check_actions(root))
     return sorted(set(errors))
 
 

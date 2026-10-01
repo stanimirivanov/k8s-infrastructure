@@ -7,41 +7,17 @@ from unittest import TestCase
 from scripts.repository_policy import (
     ISSUE_HEADINGS,
     PR_HEADINGS,
-    check_actions,
     check_adrs,
     check_documentation,
+    check_repository,
     check_templates,
 )
 
 
 class RepositoryPolicyTests(TestCase):
-    def test_actions_accept_major_refs_and_ignore_block_scalar_examples(self) -> None:
-        with TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            workflow = root / ".github/workflows/validate.yml"
-            workflow.parent.mkdir(parents=True)
-            workflow.write_text(
-                "steps:\n  - uses: 'actions/checkout@v7'\n"
-                "  - run: |\n      uses: actions/example@main\n"
-                "  - uses: ./local-action\n",
-                encoding="utf-8",
-            )
-            self.assertEqual(check_actions(root), [])
-
-    def test_actions_reject_hash_branch_and_missing_ref_in_composites(self) -> None:
-        with TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            composite = root / ".github/actions/check/action.yml"
-            composite.parent.mkdir(parents=True)
-            composite.write_text(
-                "steps:\n  - uses: actions/checkout@a1b2c3\n"
-                "  - uses: actions/setup-python@main\n"
-                "  - uses: actions/cache\n",
-                encoding="utf-8",
-            )
-            errors = check_actions(root)
-            self.assertEqual(len(errors), 3)
-            self.assertTrue(all("semantic-major" in error for error in errors))
+    def test_current_repository_accepts_commit_pinned_actions(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        self.assertEqual(check_repository(root), [])
 
     def test_templates_reject_missing_repository_and_section_drift(self) -> None:
         with TemporaryDirectory() as temporary:
