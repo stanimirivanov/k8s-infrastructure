@@ -18,6 +18,11 @@ capability qualification.
 
 ## Status
 
+The opt-in [resource metrics capability](docs/resource-metrics.md) adds a
+verified-TLS Metrics Server chart and explicit node/serving-certificate
+operations. It does not deploy an Application or change the existing cluster.
+Consumer selection must pin its merged provider revision and real public CA.
+
 The repository contains its contributor harness, the initial
 [substrate capability boundary](docs/architecture/substrate-capability.md), the
 [local-kind lifecycle](docs/local-kind.md) and the
@@ -68,6 +73,7 @@ Prerequisites:
 - Python 3.12;
 - [uv](https://docs.astral.sh/uv/);
 - GNU Make for the convenience command surface.
+- Helm v4.1.4 for offline resource-metrics linting and rendering.
 
 Install the locked development environment and run the offline inner loop:
 

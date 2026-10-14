@@ -1,0 +1,7 @@
+# Synthetic offline rendering input, never deploy this CA or Secret selection.
+tls:
+  secretName: fixture-not-for-deployment
+  caBundle: QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB
+nodeSelector:
+  kubernetes.io/os: linux
+tolerations: []

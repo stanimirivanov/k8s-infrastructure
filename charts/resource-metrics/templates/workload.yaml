@@ -1,0 +1,98 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: metrics-server
+  namespace: {{ .Release.Namespace }}
+automountServiceAccountToken: true
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: metrics-server
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: metrics-server
+    app.kubernetes.io/managed-by: k8s-infrastructure
+spec:
+  replicas: 1
+  revisionHistoryLimit: 2
+  selector:
+    matchLabels: {app.kubernetes.io/name: metrics-server}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: metrics-server}
+    spec:
+      serviceAccountName: metrics-server
+      automountServiceAccountToken: true
+      nodeSelector:
+        {{- toYaml .Values.nodeSelector | nindent 8 }}
+      tolerations:
+        {{- toYaml .Values.tolerations | nindent 8 }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: metrics-server
+          image: registry.k8s.io/metrics-server/metrics-server:v0.9.0@sha256:d9862115e7c7881280d3d75ca26bda8ffc0fc213315979575bf23ce9826205c0
+          args:
+            - --secure-port=10250
+            - --tls-cert-file=/serving/tls.crt
+            - --tls-private-key-file=/serving/tls.key
+            - --cert-dir=/tmp
+            - --kubelet-certificate-authority=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+            - --kubelet-preferred-address-types=InternalIP,ExternalIP,Hostname
+            - --kubelet-use-node-status-port
+            - --metric-resolution=15s
+          ports: [{name: https, containerPort: 10250}]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          resources:
+            requests: {cpu: 100m, memory: 200Mi, ephemeral-storage: 16Mi}
+            limits: {cpu: 500m, memory: 512Mi, ephemeral-storage: 64Mi}
+          readinessProbe:
+            httpGet: {path: /readyz, port: https, scheme: HTTPS}
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /livez, port: https, scheme: HTTPS}
+            periodSeconds: 10
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+            - {name: serving, mountPath: /serving, readOnly: true}
+      volumes:
+        - name: tmp
+          emptyDir: {sizeLimit: 64Mi}
+        - name: serving
+          secret:
+            secretName: {{ required "tls.secretName is required" .Values.tls.secretName }}
+            defaultMode: 0440
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: metrics-server
+  namespace: {{ .Release.Namespace }}
+spec:
+  type: ClusterIP
+  selector: {app.kubernetes.io/name: metrics-server}
+  ports: [{name: https, port: 443, targetPort: https}]
+---
+apiVersion: apiregistration.k8s.io/v1
+kind: APIService
+metadata:
+  name: v1beta1.metrics.k8s.io
+  labels:
+    app.kubernetes.io/managed-by: k8s-infrastructure
+spec:
+  service: {name: metrics-server, namespace: {{ .Release.Namespace }}, port: 443}
+  group: metrics.k8s.io
+  version: v1beta1
+  groupPriorityMinimum: 100
+  versionPriority: 100
+  insecureSkipTLSVerify: false
+  caBundle: {{ required "tls.caBundle is required" .Values.tls.caBundle | quote }}

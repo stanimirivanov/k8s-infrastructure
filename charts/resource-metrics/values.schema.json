@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "type": "object", "additionalProperties": false,
+  "required": ["tls", "nodeSelector", "tolerations"],
+  "properties": {
+    "tls": {
+      "type": "object", "additionalProperties": false,
+      "required": ["secretName", "caBundle"],
+      "properties": {
+        "secretName": {"type": "string", "maxLength": 63, "pattern": "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$"},
+        "caBundle": {"type": "string", "minLength": 64, "maxLength": 16384, "pattern": "^[A-Za-z0-9+/]+={0,2}$"}
+      }
+    },
+    "nodeSelector": {"type": "object", "additionalProperties": {"type": "string"}},
+    "tolerations": {"type": "array", "maxItems": 8, "items": {"type": "object", "additionalProperties": false,
+      "required": ["key", "operator", "effect"], "properties": {
+        "key": {"type": "string"}, "operator": {"const": "Exists"}, "effect": {"const": "NoSchedule"}
+      }
+    }}
+  }
+}

@@ -13,6 +13,7 @@
 | ADR | Status | Decision |
 |:--|:--|:--|
 | [0001](0001-repository-boundary-and-tooling.md) | Accepted | Establish the repository boundary and initial tool choices |
+| [0002](0002-verified-resource-metrics.md) | Proposed | Provide verified-TLS resource metrics with explicit certificate operations |
 
 ## Numbering under concurrent work
 

@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "name": "metrics-server",
+  "version": "0.9.0",
+  "source": "https://github.com/kubernetes-sigs/metrics-server/releases/tag/v0.9.0",
+  "image": "registry.k8s.io/metrics-server/metrics-server:v0.9.0@sha256:d9862115e7c7881280d3d75ca26bda8ffc0fc213315979575bf23ce9826205c0",
+  "minimumKubernetesVersion": "1.34.0",
+  "chart": "charts/resource-metrics",
+  "license": "Apache-2.0"
+}
