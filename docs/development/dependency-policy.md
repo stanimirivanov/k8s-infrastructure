@@ -32,6 +32,15 @@ loop.
 
 ## Updates and immutable identities
 
+The verified resource-metrics capability uses maintained `cryptography` 50.x
+(Apache-2.0 OR BSD-3-Clause) for signature/SAN validation and in-memory certificate
+issuance. Its locked transitive libraries are CFFI (MIT-0) and pycparser (BSD-3-Clause).
+Private keys never enter subprocess arguments, logs or Git. The library boundary
+is isolated in `scripts/metrics_certificates.py`; no custom cryptographic primitives
+or shell parsing of OpenSSL output is introduced. Helm v4.1.4 is an explicit
+offline rendering prerequisite, installed by the reviewed CI setup action.
+
+
 Workflow `uses:` entries may use reviewed release tags or commit SHAs; the
 repository policy checker does not enforce one reference style. The reviewed
 kind node-image digest, Argo CD release, provider archives, Terraform locks,

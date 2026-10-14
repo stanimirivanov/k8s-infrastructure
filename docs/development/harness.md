@@ -13,6 +13,13 @@
 - Report unavailable checks as not run under
   [CONTRIBUTING.md](../../CONTRIBUTING.md#verification-and-constrained-environments).
 
+Resource-metrics packaging additionally requires Helm v4.1.4. CI installs that
+version on both supported operating systems. `make metrics-check` performs
+strict offline linting/rendering and security assertions; `make verify` includes
+it and the certificate/CSR/CLI regression tests. Rendering uses synthetic,
+non-deployable values, never live certificate material. The explicit certificate
+operations and real kubelet/aggregation TLS acceptance remain separate from CI.
+
 ## Verification tiers
 
 | Tier | Command | Evidence and prerequisites |

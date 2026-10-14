@@ -1,0 +1,6 @@
+tls:
+  secretName: ""
+  caBundle: ""
+nodeSelector:
+  kubernetes.io/os: linux
+tolerations: []

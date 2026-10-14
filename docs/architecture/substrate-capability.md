@@ -40,6 +40,8 @@ The infrastructure repository owns:
 - installation, version selection and readiness of Argo CD;
 - optional ingress, load-balancer and external-secret capabilities when a
   provider profile declares them;
+- an optional resource Metrics API package with explicit serving-TLS provisioning,
+  while consumers retain their Argo CD selection and benchmark eligibility;
 - provider IAM required to create and operate the substrate; and
 - provider-specific cost preflight, inventory evidence and recovery guidance.
 

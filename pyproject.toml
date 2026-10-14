@@ -3,7 +3,7 @@ name = "k8s-infrastructure"
 version = "0.1.0"
 description = "Reusable Kubernetes substrate provisioning and qualification"
 requires-python = ">=3.12"
-dependencies = ["PyYAML>=6.0.3,<7"]
+dependencies = ["PyYAML>=6.0.3,<7", "cryptography>=50.0.2,<51"]
 
 [dependency-groups]
 dev = ["ruff>=0.16.4,<0.17", "ty>=0.0.1,<1", "types-PyYAML"]

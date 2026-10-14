@@ -29,6 +29,10 @@ jobs:
         shell: pwsh
         run: choco install make --version=4.4.1 --no-progress --yes
       - run: uv sync --locked
+      - name: Install Helm for offline resource metrics rendering
+        uses: azure/setup-helm@v5
+        with:
+          version: v4.1.4
       - run: make doctor
       - run: make verify
 
