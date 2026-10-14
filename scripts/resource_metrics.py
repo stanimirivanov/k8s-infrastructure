@@ -87,9 +87,13 @@ def csr_nodes(requests: dict[str, Any], nodes: list[dict[str, Any]], now: dateti
         node = by_user[spec["username"]]
         try:
             metrics_certificates.review_request(request, node, now)
+        except metrics_certificates.CSRRefusal as error:
+            print(f"CSR {request['metadata']['name']}: REFUSED; {error}.")
+            continue
         except (ValueError, KeyError, TypeError, x509.ExtensionNotFound, UnsupportedAlgorithm):
             print(
-                f"CSR {request['metadata']['name']}: REFUSED; review signer, subject, freshness and SANs."
+                f"CSR {request['metadata']['name']}: REFUSED; malformed or unsupported CSR/node data. "
+                "Request payload and external error details withheld."
             )
             continue
         print(

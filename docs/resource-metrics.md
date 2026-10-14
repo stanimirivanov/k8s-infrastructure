@@ -112,6 +112,10 @@ uv run --locked python -m scripts.resource_metrics approve --state-root ../perfe
 ```
 
 Only authenticated `system:node:<name>` / `system:nodes` server-only requests are accepted. The CSR
+must request exactly `digital signature` and `server auth`, optionally with `key encipherment`.
+Both usage sets are supported for EC and RSA keys; client authentication and additional or
+duplicate usages are refused. These are the two Kubernetes `kubernetes.io/kubelet-serving`
+usage sets, not a TLS verification exception. The CSR
 signature/key, exact subject, DNS/IP SANs, denial state and one-hour freshness are checked against
 the current node; requests older than that node are refused. The node address/UID snapshot is
 rechecked before a resource-version/UID-fenced update to that one approval subresource. This does
@@ -163,8 +167,13 @@ benchmark runtime promotion and M04 completion remain separate gates.
   backup or temporary file prevents an unsafe second write. Do not delete it blindly.
 - Kubelet configz unavailable after restart: inspect/approve the reviewed serving CSR first; an
   unissued serving certificate may prevent the kubelet HTTPS server from answering.
-- CSR refused: inspect signer, node authentication, subject, SANs, timestamp and current node UID.
-  Do not use bulk `kubectl certificate approve` as a bypass.
+- CSR refused: approval errors and scoped inspection identify the failed policy check (signer,
+  username/groups, usages, timestamp/freshness, deletion/denial, public key/signature, subject or
+  SANs). Inspection ignores other signers and users outside the three reviewed nodes. Malformed payloads
+  receive a safe diagnostic without echoing their bytes or library error details. Correct the
+  reported cause and inspect again; do not rerun the node rollout merely to change CSR usages.
+  A request outside the one-hour review window still requires fresh evidence: do not change its
+  timestamp, extend the gate or bulk-approve it. Do not use `kubectl certificate approve` as a bypass.
 - APIService unavailable: inspect the selected namespace, Service endpoints, certificate SANs,
   CA bundle and Metrics Server logs. A missing registration is not zero resource usage.
 - Scrape x509 errors: verify issuance of cluster-CA-signed kubelet leaves; never disable TLS.
@@ -186,3 +195,5 @@ No rollback command is executed automatically and previously published certifica
 References: [Metrics Server requirements](https://github.com/kubernetes-sigs/metrics-server#requirements),
 [official release](https://github.com/kubernetes-sigs/metrics-server/releases/tag/v0.9.0), and
 [kubeadm serving-certificate procedure](https://kubernetes.io/docs/tasks/administer-cluster/kubeadm/kubeadm-certs/#kubelet-serving-certs).
+The [Kubernetes signer contract](https://kubernetes.io/docs/reference/access-authn-authz/certificate-signing-requests/#kubernetes-signers)
+defines the two permitted serving usage sets.
