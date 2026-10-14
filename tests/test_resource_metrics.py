@@ -14,7 +14,7 @@ from unittest.mock import patch
 import yaml
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.asymmetric import ec, rsa
 from cryptography.x509.oid import NameOID
 
 from scripts import kubelet_serving, metrics_certificates, metrics_chart, resource_metrics
@@ -39,14 +39,18 @@ def node() -> dict:
 
 
 def request(
-    *, dns: str = "perfeng-local-worker", address: str = "172.18.0.3", uri: bool = False
+    *,
+    dns: str = "perfeng-local-worker",
+    address: str = "172.18.0.3",
+    uri: bool = False,
+    key: ec.EllipticCurvePrivateKey | rsa.RSAPrivateKey | None = None,
 ) -> dict:
     import ipaddress
 
     names = [x509.DNSName(dns), x509.IPAddress(ipaddress.ip_address(address))]
     if uri:
         names.append(x509.UniformResourceIdentifier("spiffe://unapproved"))
-    key = ec.generate_private_key(ec.SECP256R1())
+    key = key or ec.generate_private_key(ec.SECP256R1())
     csr = (
         x509.CertificateSigningRequestBuilder()
         .subject_name(
@@ -73,13 +77,131 @@ def request(
             "signerName": "kubernetes.io/kubelet-serving",
             "username": "system:node:perfeng-local-worker",
             "groups": ["system:nodes", "system:authenticated"],
-            "usages": ["digital signature", "key encipherment", "server auth"],
+            "usages": ["digital signature", "server auth"],
             "request": base64.b64encode(csr.public_bytes(serialization.Encoding.PEM)).decode(),
         },
     }
 
 
 class CertificateTests(unittest.TestCase):
+    def test_both_supported_serving_usage_sets_work_for_ec_and_rsa_keys(self) -> None:
+        for key in (
+            ec.generate_private_key(ec.SECP256R1()),
+            rsa.generate_private_key(public_exponent=65537, key_size=2048),
+        ):
+            selected = request(key=key)
+            for usages in (
+                ["digital signature", "server auth"],
+                ["digital signature", "key encipherment", "server auth"],
+                ["server auth", "digital signature"],
+                ["server auth", "key encipherment", "digital signature"],
+            ):
+                with self.subTest(key=type(key).__name__, usages=usages):
+                    selected["spec"]["usages"] = usages
+                    metrics_certificates.review_request(selected, node(), NOW)
+
+    def test_unsupported_or_malformed_usages_never_reach_approval(self) -> None:
+        selected = request()
+        for usages in (
+            None,
+            "digital signature,server auth",
+            [],
+            [None, "server auth"],
+            ["server auth"],
+            ["digital signature"],
+            ["digital signature", "key encipherment"],
+            ["digital signature", "server auth", "client auth"],
+            ["digital signature", "server auth", "cert sign"],
+            ["digital signature", "server auth", "unexpected"],
+            ["digital signature", "server auth", "server auth"],
+        ):
+            selected["spec"]["usages"] = usages
+            with (
+                self.subTest(usages=usages),
+                patch("scripts.local_kind.run") as run,
+                self.assertRaisesRegex(ValueError, "usages"),
+            ):
+                kubelet_serving.approve(["kubectl"], selected, node(), NOW, lambda: None)
+            run.assert_not_called()
+
+    def test_inspection_reports_specific_refusal_without_request_payloads(self) -> None:
+        cases = []
+        for field, value, reason in (
+            ("groups", ["system:masters"], "groups"),
+            ("usages", ["client auth"], "usages"),
+            ("request", "untrusted-payload-not-for-output", "encoding"),
+        ):
+            selected = request()
+            selected["spec"][field] = value
+            cases.append((selected, reason))
+        for when, reason in (
+            (NOW - timedelta(hours=2), "one-hour"),
+            (NOW + timedelta(seconds=1), "future"),
+            (NOW - timedelta(days=2), "node incarnation"),
+        ):
+            selected = request()
+            selected["metadata"]["creationTimestamp"] = when.isoformat()
+            cases.append((selected, reason))
+        denied = request()
+        denied["status"] = {"conditions": [{"type": "Denied", "status": "True"}]}
+        cases.append((denied, "Denied"))
+        deleting = request()
+        deleting["metadata"]["deletionTimestamp"] = NOW.isoformat()
+        cases.append((deleting, "deleted"))
+        cases.extend([(request(dns="foreign-node"), "SANs"), (request(uri=True), "SANs")])
+        for selected, reason in cases:
+            with self.subTest(reason=reason):
+                with self.assertRaisesRegex(ValueError, reason):
+                    metrics_certificates.review_request(selected, node(), NOW)
+                with redirect_stdout(io.StringIO()) as output:
+                    resource_metrics.csr_nodes({"items": [selected]}, [node()], NOW)
+                self.assertIn("REFUSED", output.getvalue())
+                self.assertIn(reason, output.getvalue())
+                self.assertNotIn(selected["spec"]["request"], output.getvalue())
+
+    def test_unrelated_requests_are_not_inspected_but_cannot_be_approved(self) -> None:
+        for field, value, reason in (
+            ("signerName", "wrong-signer", "signer"),
+            ("username", "system:node:other", "username"),
+        ):
+            selected = request()
+            selected["spec"][field] = value
+            with self.subTest(field=field), patch("scripts.local_kind.run") as run:
+                with self.assertRaisesRegex(ValueError, reason):
+                    kubelet_serving.approve(["kubectl"], selected, node(), NOW, lambda: None)
+                with redirect_stdout(io.StringIO()) as output:
+                    resource_metrics.csr_nodes({"items": [selected]}, [node()], NOW)
+                self.assertEqual(output.getvalue(), "")
+                run.assert_not_called()
+
+    def test_unexpected_parser_details_are_not_printed_during_inspection(self) -> None:
+        selected = request()
+        with (
+            patch(
+                "scripts.metrics_certificates.review_request",
+                side_effect=ValueError("untrusted-library-error-not-for-output"),
+            ),
+            redirect_stdout(io.StringIO()) as output,
+        ):
+            resource_metrics.csr_nodes({"items": [selected]}, [node()], NOW)
+        self.assertIn("malformed or unsupported CSR/node data", output.getvalue())
+        self.assertNotIn("untrusted-library-error-not-for-output", output.getvalue())
+        self.assertNotIn(selected["spec"]["request"], output.getvalue())
+
+    def test_usage_acceptance_does_not_extend_the_timestamp_review_window(self) -> None:
+        selected = request()
+        for stamp, reason in (
+            (None, "timestamp"),
+            ("invalid", "timestamp"),
+            (NOW.replace(tzinfo=None).isoformat(), "timezone"),
+            ((NOW - timedelta(hours=1, microseconds=1)).isoformat(), "one-hour"),
+        ):
+            selected["metadata"]["creationTimestamp"] = stamp
+            with self.subTest(stamp=stamp), self.assertRaisesRegex(ValueError, reason):
+                metrics_certificates.review_request(selected, node(), NOW)
+        selected["metadata"]["creationTimestamp"] = (NOW - timedelta(hours=1)).isoformat()
+        metrics_certificates.review_request(selected, node(), NOW)
+
     def test_serving_keys_stay_in_secret_and_public_handoff_is_reusable(self) -> None:
         secret = metrics_certificates.serving_secret("monitoring", NOW)
         values = metrics_certificates.public_values(secret, "monitoring", NOW)

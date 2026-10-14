@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from cryptography import x509
+from cryptography.exceptions import UnsupportedAlgorithm
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
@@ -15,6 +16,10 @@ from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 OWNER = "k8s-infrastructure"
 SECRET = "substrate-resource-metrics-tls"
 CA_ANNOTATION = "k8s-infrastructure.io/serving-ca"
+
+
+class CSRRefusal(ValueError):
+    """A repository-owned refusal message safe to display without request payloads."""
 
 
 def decode(value: str) -> bytes:
@@ -30,47 +35,94 @@ def decode(value: str) -> bytes:
 def review_request(request: dict[str, Any], node: dict[str, Any], now: datetime) -> None:
     """Require an authenticated, fresh server-only CSR for the current node's addresses.
 
-    This validates public request bytes only. It never approves a CSR or establishes
-    ownership of the live node; the caller must recheck node UID before an API write.
+    Both Kubernetes serving-usage sets are accepted: digital signature/server auth,
+    with or without key encipherment. Other authority remains forbidden. This
+    validates public request bytes only and raises CSRRefusal for policy failures.
+    It never approves a CSR or establishes ownership of the live node; the caller
+    must recheck node UID before an API write.
     """
     name = node["metadata"]["name"]
     spec = request["spec"]
-    created = datetime.fromisoformat(
-        request["metadata"]["creationTimestamp"].replace("Z", "+00:00")
-    )
-    node_created = datetime.fromisoformat(
-        node["metadata"]["creationTimestamp"].replace("Z", "+00:00")
-    )
+    if spec.get("signerName") != "kubernetes.io/kubelet-serving":
+        raise CSRRefusal("CSR signer must be kubernetes.io/kubelet-serving")
+    if spec.get("username") != f"system:node:{name}":
+        raise CSRRefusal("CSR username does not match the selected node")
+    groups = spec.get("groups")
     if (
-        spec.get("signerName") != "kubernetes.io/kubelet-serving"
-        or spec.get("username") != f"system:node:{name}"
-        or set(spec.get("groups", [])) != {"system:nodes", "system:authenticated"}
-        or set(spec.get("usages", [])) != {"digital signature", "key encipherment", "server auth"}
-        or created.tzinfo is None
-        or node_created.tzinfo is None
-        or created < node_created
-        or not timedelta() <= now - created <= timedelta(hours=1)
-        or request["metadata"].get("deletionTimestamp") is not None
-        or any(c.get("type") == "Denied" for c in request.get("status", {}).get("conditions", []))
+        not isinstance(groups, list)
+        or not all(isinstance(group, str) for group in groups)
+        or set(groups) != {"system:nodes", "system:authenticated"}
     ):
-        raise ValueError("CSR identity, freshness or server-only authority differs")
-    csr = x509.load_pem_x509_csr(decode(spec["request"]))
+        raise CSRRefusal("CSR groups must be exactly system:nodes and system:authenticated")
+    usages = spec.get("usages")
+    if (
+        not isinstance(usages, list)
+        or not all(isinstance(usage, str) for usage in usages)
+        or len(usages) != len(set(usages))
+        or set(usages)
+        not in (
+            {"digital signature", "server auth"},
+            {"digital signature", "key encipherment", "server auth"},
+        )
+    ):
+        raise CSRRefusal(
+            "CSR usages must be digital signature and server auth, optionally key encipherment; "
+            "no other or duplicate usages are allowed"
+        )
+    try:
+        created_text = request["metadata"]["creationTimestamp"]
+        node_created_text = node["metadata"]["creationTimestamp"]
+        if not isinstance(created_text, str) or not isinstance(node_created_text, str):
+            raise ValueError()
+        created = datetime.fromisoformat(created_text.replace("Z", "+00:00"))
+        node_created = datetime.fromisoformat(node_created_text.replace("Z", "+00:00"))
+    except (KeyError, TypeError, ValueError):
+        raise CSRRefusal("CSR or node creation timestamp is missing or invalid") from None
+    if created.tzinfo is None or node_created.tzinfo is None:
+        raise CSRRefusal("CSR and node creation timestamps must include a timezone")
+    if created < node_created:
+        raise CSRRefusal("CSR predates the current node incarnation")
+    if created > now:
+        raise CSRRefusal("CSR creation timestamp is in the future")
+    if now - created > timedelta(hours=1):
+        raise CSRRefusal("CSR exceeds the one-hour review window; inspect a fresh request")
+    if request["metadata"].get("deletionTimestamp") is not None:
+        raise CSRRefusal("CSR is being deleted")
+    if any(c.get("type") == "Denied" for c in request.get("status", {}).get("conditions", [])):
+        raise CSRRefusal("CSR has a Denied condition")
+    try:
+        csr = x509.load_pem_x509_csr(decode(spec["request"]))
+        key = csr.public_key()
+    except (KeyError, TypeError, ValueError, UnsupportedAlgorithm):
+        raise CSRRefusal(
+            "CSR request encoding or public-key algorithm is invalid or unsupported"
+        ) from None
     subject = x509.Name(
         [
             x509.NameAttribute(NameOID.ORGANIZATION_NAME, "system:nodes"),
             x509.NameAttribute(NameOID.COMMON_NAME, f"system:node:{name}"),
         ]
     )
-    key = csr.public_key()
     strong = (isinstance(key, rsa.RSAPublicKey) and 2048 <= key.key_size <= 8192) or (
         isinstance(key, ec.EllipticCurvePublicKey)
         and isinstance(key.curve, (ec.SECP256R1, ec.SECP384R1, ec.SECP521R1))
     )
-    if not strong or csr.subject != subject or not csr.is_signature_valid:
-        raise ValueError("CSR subject, signature or public key differs")
+    if not strong:
+        raise CSRRefusal("CSR public key must be RSA 2048-8192 or EC P-256/P-384/P-521")
+    if csr.subject != subject:
+        raise CSRRefusal("CSR subject does not match the selected node")
+    try:
+        valid_signature = csr.is_signature_valid
+    except (ValueError, UnsupportedAlgorithm):
+        raise CSRRefusal("CSR signature algorithm is invalid or unsupported") from None
+    if not valid_signature:
+        raise CSRRefusal("CSR signature is invalid")
     if len(csr.extensions) != 1:
-        raise ValueError("CSR must request only node address SANs")
-    sans = csr.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+        raise CSRRefusal("CSR must request only node address SANs")
+    try:
+        sans = csr.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+    except x509.ExtensionNotFound:
+        raise CSRRefusal("CSR must contain node address SANs") from None
     addresses = node["status"]["addresses"]
     dns = {
         a["address"] for a in addresses if a["type"] in {"Hostname", "InternalDNS", "ExternalDNS"}
@@ -90,7 +142,9 @@ def review_request(request: dict[str, Any], node: dict[str, Any], now: datetime)
         or not set(requested_dns) <= dns
         or set(requested_ips) != ips
     ):
-        raise ValueError("CSR SANs differ from the current node addresses")
+        raise CSRRefusal(
+            "CSR SANs differ from the current node addresses or include forbidden names"
+        )
 
 
 def serving_secret(namespace: str, now: datetime) -> dict[str, Any]:
