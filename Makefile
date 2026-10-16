@@ -1,6 +1,6 @@
 UV_RUN := uv run --locked --offline
 
-.PHONY: help bootstrap doctor fmt fmt-check docs docs-check check test configuration-check metrics-check verify supply-chain validate
+.PHONY: help bootstrap doctor fmt fmt-check docs docs-check check test configuration-check metrics-check pr-event-check verify supply-chain validate
 
 help:
 	@echo k8s-infrastructure engineering command surface
@@ -13,6 +13,7 @@ help:
 	@echo "  make test       Run the unit-test suite"
 	@echo "  make configuration-check  Validate reviewed local infrastructure selections"
 	@echo "  make metrics-check  Strictly lint/render the verified-TLS resource metrics chart"
+	@echo "  make pr-event-check  Validate issue linkage in the GitHub PR event"
 	@echo "  make verify     Run all offline repository-local checks"
 	@echo "  make supply-chain  Check the lock and known vulnerabilities"
 	@echo "  make validate   Run complete non-live acceptance"
@@ -49,6 +50,9 @@ configuration-check:
 
 metrics-check:
 	$(UV_RUN) python -m scripts.metrics_chart
+
+pr-event-check:
+	$(UV_RUN) python -m scripts.repository_policy --pr-event
 
 verify: check test configuration-check metrics-check
 

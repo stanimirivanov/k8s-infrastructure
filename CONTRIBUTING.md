@@ -221,10 +221,17 @@ rewrite them.
 
 ## Pull request description
 
-A pull request MUST state the linked issue and milestone; outcome and
-exclusions; assumptions and unresolved questions; state, compatibility,
-security and cost effects; verification including checks not run; rollout,
-recovery and rollback; external authorization; and known limitations.
+A human-authored pull request title MUST begin with `[#N]`, its source branch
+MUST be `feature/issue-N` or `fix/issue-N`, and its body MUST begin with
+`Closes #N` on the first line. The same issue number MUST appear in all three
+places. CI checks these fields from the pull-request event. Dependabot's
+automated dependency pull requests are exempt from this issue-linked format.
+
+A human-authored pull request MUST state the linked issue and milestone;
+outcome and exclusions; assumptions and unresolved questions; state,
+compatibility, security and cost effects; verification including checks not
+run; rollout, recovery and rollback; external authorization; and known
+limitations.
 
 ## Review checklist
 

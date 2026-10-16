@@ -27,6 +27,7 @@ operations and real kubelet/aggregation TLS acceptance remain separate from CI.
 | Setup | `make bootstrap` | Resolve `uv.lock`; network may be needed. |
 | Toolchain | `make doctor` | Print Git, uv, Python, and Make versions. |
 | Inner loop | `make verify` | Formatting, repository policy, lint, types, unit tests, and local configuration checks. Uses installed dependencies offline. |
+| PR metadata | `make pr-event-check` | Read the GitHub pull-request event and verify human issue linkage; CI-only, no API calls. |
 | Supply chain | `make supply-chain` | Lock consistency and known vulnerability audit; current advisory data may need network access. |
 | Non-live acceptance | `make validate` | Aggregate inner loop and supply-chain checks. |
 | Live operations | See [local kind](../local-kind.md) and [Argo CD](../local-argocd.md) | Explicit `--execute`, selected state root, target checks, and separate authorization. |
@@ -43,6 +44,12 @@ local Markdown destinations and anchors, required summaries, issue and pull
 request templates, and ADR numbering and indexing. It does not prescribe a
 GitHub Action reference style, resolve remote links, or infer infrastructure
 health. Regression tests cover accepted and rejected states.
+
+On human-authored pull requests, CI also checks the event title, first body
+line, and source branch for one matching issue number. It reads the local event
+payload without a GitHub API call. Dependabot dependency-update pull requests
+are exempt because their generated branches and titles do not follow the
+issue-linked contributor workflow.
 
 `make configuration-check` validates the exact checked-in local-kind profile
 and pinned Argo CD selection. It reads only repository-owned configuration and

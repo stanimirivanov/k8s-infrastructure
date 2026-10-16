@@ -1,3 +1,7 @@
+Closes #<issue-number>
+
+<!-- PR title: [#<issue-number>] Concise outcome -->
+
 ## Linked work
 
 - Issue:
