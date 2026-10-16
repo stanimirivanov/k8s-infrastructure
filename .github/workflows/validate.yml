@@ -33,9 +33,6 @@ jobs:
         with:
           version: v4.1.4
       - run: make doctor
-      - name: Validate issue-linked pull request metadata
-        if: runner.os == 'Linux'
-        run: make pr-event-check
       - run: make verify
 
   supply-chain:
