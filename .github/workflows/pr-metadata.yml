@@ -1,0 +1,24 @@
+name: Pull request metadata policy
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: read
+
+jobs:
+  issue-linked-pr-metadata:
+    name: Issue-linked pull request metadata
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the trusted base revision
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version-file: .python-version
+      - name: Validate pull request event
+        run: python -m scripts.repository_policy --pr-event
