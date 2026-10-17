@@ -18,6 +18,7 @@
 | Changing the substrate/consumer handoff | [Capability contract](architecture/substrate-capability.md) and [ADR index](decisions/README.md) |
 | Local kind operations | [Local-kind guide](local-kind.md) |
 | Argo CD installation | [Local Argo CD guide](local-argocd.md) |
+| Argo Workflows installation | [Local Argo Workflows guide](local-argo-workflows.md), [ADR 0003](decisions/0003-install-namespaced-argo-workflows.md) |
 | Resource Metrics API or kubelet serving certificates | [Verified resource metrics](resource-metrics.md), [ADR-0002](decisions/0002-verified-resource-metrics.md) |
 | Reviewing imported history | [Local-kind](migrations/local-kind-history-import.md) and [Argo CD](migrations/argocd-history-import.md) migration records |
 

@@ -10,6 +10,8 @@ capability qualification.
   Argo CD reconciles for consuming projects.
 - The imported local-kind and Argo CD lifecycles are cutover-ready, preserve
   the existing Perfeng identities and require explicit live execution.
+- A pinned, namespace-scoped Argo Workflows add-on is available for an explicit
+  local-kind release pilot; it does not install consumer workflows.
 - Consumer Applications and repository credentials remain outside this
   repository.
 - No existing cluster has transferred ownership; `perfeng-environment` remains
@@ -26,7 +28,8 @@ Consumer selection must pin its merged provider revision and real public CA.
 The repository contains its contributor harness, the initial
 [substrate capability boundary](docs/architecture/substrate-capability.md), the
 [local-kind lifecycle](docs/local-kind.md) and the
-[Argo CD bootstrap](docs/local-argocd.md). Their CLIs provide offline previews
+[Argo CD bootstrap](docs/local-argocd.md), plus the
+[Argo Workflows add-on](docs/local-argo-workflows.md). Their CLIs provide offline previews
 and explicit live execution with target, ownership and timeout checks. Until
 the consumer cutover is accepted, `perfeng-environment` remains the supported
 operator entry point for the existing `perfeng-local` cluster and Argo CD

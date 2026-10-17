@@ -14,6 +14,7 @@
 |:--|:--|:--|
 | [0001](0001-repository-boundary-and-tooling.md) | Accepted | Establish the repository boundary and initial tool choices |
 | [0002](0002-verified-resource-metrics.md) | Proposed | Provide verified-TLS resource metrics with explicit certificate operations |
+| [0003](0003-install-namespaced-argo-workflows.md) | Proposed | Install a pinned namespaced Argo Workflows substrate for finite releases |
 
 ## Numbering under concurrent work
 

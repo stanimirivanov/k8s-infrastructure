@@ -38,6 +38,8 @@ The infrastructure repository owns:
 - dynamic storage capability qualification;
 - DNS and outbound-connectivity qualification;
 - installation, version selection and readiness of Argo CD;
+- optional namespace-scoped Argo Workflows installation and controller readiness,
+  without consumer release templates or product execution authority;
 - optional ingress, load-balancer and external-secret capabilities when a
   provider profile declares them;
 - an optional resource Metrics API package with explicit serving-TLS provisioning,
@@ -76,7 +78,7 @@ available to its consumer and to operators:
 | Storage | Default or named dynamic `ReadWriteOnce` StorageClass and retention behavior |
 | Network | Cluster DNS result and outbound-network expectation |
 | GitOps | Argo CD version, namespace and controller readiness |
-| Optional capabilities | Ingress, load balancer, external secrets and other explicitly qualified features |
+| Optional capabilities | Argo Workflows version, namespace and controller readiness when installed; ingress, load balancer, external secrets and other explicitly qualified features |
 
 The handoff must not contain credentials, kubeconfig bytes, Terraform state,
 provider account secrets, Kubernetes Secret data or sensitive billing details.
