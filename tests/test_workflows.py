@@ -21,8 +21,10 @@ class WorkflowsSubstrateTests(unittest.TestCase):
         self.assertEqual(selection["version"], "v4.1.5")
         self.assertEqual(len(selection["sha256"]), 64)
         workflows.validate_namespace()
-        with tempfile.TemporaryDirectory() as temporary:
-            plan = workflows.commands("bootstrap", state_root=Path(temporary))
+        with patch(
+            "scripts.workflows.local_kind.kubeconfig", return_value=Path("selected-kubeconfig")
+        ):
+            plan = workflows.commands("bootstrap", state_root=Path("selected-state"))
         self.assertEqual(
             plan[0][-6:], ["get", "namespace", "argo-workflows", "--ignore-not-found", "-o", "json"]
         )
@@ -30,6 +32,7 @@ class WorkflowsSubstrateTests(unittest.TestCase):
         self.assertEqual(plan[-2][-2:], ["deployment/workflow-controller", "--timeout=300s"])
         self.assertEqual(plan[-1][-2:], ["deployment/argo-server", "--timeout=300s"])
         self.assertTrue(all("kind-perfeng-local" in command for command in plan))
+        self.assertTrue(all("selected-kubeconfig" in command for command in plan))
 
     def test_floating_or_foreign_release_is_rejected(self) -> None:
         for version, url in (
@@ -72,9 +75,12 @@ class WorkflowsSubstrateTests(unittest.TestCase):
 
     def test_first_install_refuses_preexisting_workflow_crds(self) -> None:
         with (
-            tempfile.TemporaryDirectory() as temporary,
             patch(
-                "scripts.workflows.local_kind.normalize_state_root", return_value=Path(temporary)
+                "scripts.workflows.local_kind.normalize_state_root",
+                return_value=Path("selected-state"),
+            ),
+            patch(
+                "scripts.workflows.local_kind.kubeconfig", return_value=Path("selected-kubeconfig")
             ),
             patch("scripts.workflows.local_kind.execute"),
             patch(
@@ -98,9 +104,12 @@ class WorkflowsSubstrateTests(unittest.TestCase):
         foreign = json.loads(self.owned_namespace())
         foreign["metadata"]["labels"]["app.kubernetes.io/managed-by"] = "foreign"
         with (
-            tempfile.TemporaryDirectory() as temporary,
             patch(
-                "scripts.workflows.local_kind.normalize_state_root", return_value=Path(temporary)
+                "scripts.workflows.local_kind.normalize_state_root",
+                return_value=Path("selected-state"),
+            ),
+            patch(
+                "scripts.workflows.local_kind.kubeconfig", return_value=Path("selected-kubeconfig")
             ),
             patch("scripts.workflows.local_kind.execute"),
             patch("scripts.workflows.local_kind.run", return_value=json.dumps(foreign)) as run,
@@ -113,9 +122,12 @@ class WorkflowsSubstrateTests(unittest.TestCase):
 
     def test_bootstrap_applies_only_verified_bytes_and_waits_for_controllers(self) -> None:
         with (
-            tempfile.TemporaryDirectory() as temporary,
             patch(
-                "scripts.workflows.local_kind.normalize_state_root", return_value=Path(temporary)
+                "scripts.workflows.local_kind.normalize_state_root",
+                return_value=Path("selected-state"),
+            ),
+            patch(
+                "scripts.workflows.local_kind.kubeconfig", return_value=Path("selected-kubeconfig")
             ),
             patch("scripts.workflows.local_kind.execute"),
             patch(
@@ -149,9 +161,12 @@ class WorkflowsSubstrateTests(unittest.TestCase):
 
     def test_health_is_read_only_and_requires_owned_namespace(self) -> None:
         with (
-            tempfile.TemporaryDirectory() as temporary,
             patch(
-                "scripts.workflows.local_kind.normalize_state_root", return_value=Path(temporary)
+                "scripts.workflows.local_kind.normalize_state_root",
+                return_value=Path("selected-state"),
+            ),
+            patch(
+                "scripts.workflows.local_kind.kubeconfig", return_value=Path("selected-kubeconfig")
             ),
             patch("scripts.workflows.local_kind.execute"),
             patch(
