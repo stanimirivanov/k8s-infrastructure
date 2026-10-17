@@ -31,6 +31,7 @@ operations and real kubelet/aggregation TLS acceptance remain separate from CI.
 | Supply chain | `make supply-chain` | Lock consistency and known vulnerability audit; current advisory data may need network access. |
 | Non-live acceptance | `make validate` | Aggregate inner loop and supply-chain checks. |
 | Live operations | See [local kind](../local-kind.md) and [Argo CD](../local-argocd.md) | Explicit `--execute`, selected state root, target checks, and separate authorization. |
+| Argo Workflows release asset | `make workflows-asset-check` | Network-only verification of the official manifest digest, resource inventory and namespace-scoped RBAC; no cluster access. |
 
 `make docs` remains an alias for `make docs-check` so existing contributor
 commands continue to work. The validation job calls the Make targets rather
