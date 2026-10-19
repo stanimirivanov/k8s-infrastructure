@@ -14,8 +14,11 @@ capability qualification.
   local-kind release pilot; it does not install consumer workflows.
 - Consumer Applications and repository credentials remain outside this
   repository.
-- No existing cluster has transferred ownership; `perfeng-environment` remains
-  the active operator entry point until it selects this provider release.
+- Perfeng records its provider cutover as accepted and remains the operator entry
+  point through its immutable provider selection. Workspace changes do not update it.
+- A project-neutral [isolated consumer profile](docs/isolated-local-consumers.md)
+  adds explicit identities for FleetIQ and future projects, with separate
+  qualification for networking, controllers and storage.
 - Run `make verify` while editing and `make validate` before handoff.
 
 ## Status
@@ -30,10 +33,11 @@ The repository contains its contributor harness, the initial
 [local-kind lifecycle](docs/local-kind.md) and the
 [Argo CD bootstrap](docs/local-argocd.md), plus the
 [Argo Workflows add-on](docs/local-argo-workflows.md). Their CLIs provide offline previews
-and explicit live execution with target, ownership and timeout checks. Until
-the consumer cutover is accepted, `perfeng-environment` remains the supported
-operator entry point for the existing `perfeng-local` cluster and Argo CD
-installation.
+and explicit live execution with target, ownership and timeout checks.
+`perfeng-environment` records the cutover as accepted on 2026-09-17 and selects
+provider `5970bffa1f3d200e73d5a55e0cd4ef34ed9ef3b7`. It remains the supported
+operator entry point for its existing cluster and Argo CD installation; a new
+provider merge never changes that selection automatically.
 
 ## Responsibility
 

@@ -2,7 +2,7 @@
 
 - Status: Cutover-ready provider release
 - Profile: `local-kind/perfeng-local`
-- Existing environment entry point: `perfeng-environment` until consumer cutover
+- Existing environment entry point: `perfeng-environment` through its immutable selection
 
 ## TL;DR
 
@@ -12,8 +12,8 @@
   `--execute` and the selected state root.
 - This repository owns only installation and controller readiness. Consumers
   continue to own Projects, Applications, namespaces and repository credentials.
-- `perfeng-environment` remains the supported entry point for the existing
-  installation until it pins and invokes this provider release.
+- Perfeng records the cutover as accepted and remains the supported operator
+  entry point through its immutable provider selection; this merge does not update it.
 - Bootstrap accepts only a missing namespace, this repository's namespace, or
   the exact reviewed legacy Perfeng ownership identity.
 

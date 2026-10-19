@@ -1,0 +1,129 @@
+# Isolated local consumer clusters
+
+- Status: Base capability; live acceptance must be reported separately
+- Profile: `local-kind/isolated-local`
+
+## TL;DR
+
+- Use this profile for FleetIQ and future projects; the existing Perfeng path is
+  unchanged and `perfeng` remains a reserved consumer ID.
+- Supply consumer ID, local Docker context and a private state root explicitly.
+- Preview is offline. Every live action requires `--execute`; removal additionally
+  requires the exact target name and permanently destroys cluster-local data.
+- Base readiness does not qualify NetworkPolicy, ingress/TLS, controllers,
+  persistent storage, recovery or physical-host performance isolation.
+- Run `make verify` and `make validate`; authorize a concrete disposable target
+  separately before claiming live qualification.
+
+## Selection and ownership
+
+The provider serves multiple projects. This first neutral profile uses separate
+clusters because Perfeng's generator/SUT workers are reserved. A consumer `fleetiq`
+gets cluster `fleetiq-local`, context `kind-fleetiq-local` and three files under
+the selected state root: `.local/fleetiq-local.kubeconfig`,
+`.local/fleetiq-local.kind.yaml` and `.local/fleetiq-local.owner.json`.
+
+The owner record binds profile identity, creation nonce, selected Docker
+context/endpoint, exact node IDs and observed cluster incarnation. A matching
+name or kubeconfig alone never grants adoption. Ordinary health and handoff
+observe only; ensure reuses only a complete healthy identity or creates a fully
+absent target. It never repairs a partial or foreign target implicitly.
+
+State roots must be operator-private ordinary directories. Linked paths and
+junctions are refused. Files use mode 0600 and the state directory mode 0700;
+on Windows the operator must also provide an appropriately restricted inherited
+ACL. No global kubeconfig or credential store is changed. Do not commit owner
+records or kubeconfig bytes, and do not copy another consumer's credentials.
+
+## Profile and resource envelope
+
+The checked-in profile pins kind `v0.31.0`, Kubernetes `v1.35.0` by node-image
+digest, Linux/amd64 nodes, loopback API access and dynamic API port selection.
+One control plane and one worker carry `k8s-infrastructure.io/consumer` and
+`k8s-infrastructure.io/role` labels. No workload namespace, host mount or
+application host port is provisioned.
+
+Creation requires a Linux Docker engine with at least four CPUs and 12 GiB RAM.
+After kind bootstrap, the owned control plane is limited to one CPU/2 GiB,
+the worker to two CPUs/4 GiB, and each to 2048 PIDs with no container swap.
+These limits are inspected before success. Existing or unrelated containers are
+never updated. Initial kind bootstrap precedes these limits and can transiently
+use more resources; coordinate an idle host window before execution.
+
+Engine minimums do not prove free host capacity. Separate clusters share the
+engine, kernel, storage and host. They do not isolate Perfeng benchmark timing.
+The handoff reports Kubernetes allocatable and Docker container budgets
+separately; a consumer must not treat host-derived allocatable as a safe workload
+quota. Consumer workload budgets and placement need their own acceptance.
+
+## Offline preview
+
+Create an operator-private state directory outside Git first, then select it:
+
+```sh
+uv run --locked python -m scripts.consumer_kind up \
+  --profile isolated-local --consumer fleetiq \
+  --docker-context default --state-root ../consumer-state
+```
+
+Use the exact local socket context configured on your host; `default` is an
+example selection. Preview reads checked-in configuration and validates paths,
+but starts no process, reads no kubeconfig/owner record and creates no state.
+It returns the kind configuration, resource envelope and requested operation.
+Other preview actions are `ensure`, `health`, `handoff` and `down`.
+
+## Explicit execution and handoff
+
+After reviewing the exact target and obtaining execution authorization, repeat
+the selected command with `--execute`. SSH/TCP Docker endpoints are rejected;
+ambient Docker/Kubernetes redirections cannot override the explicit selection.
+External commands inherit the existing bounded private-output adapter.
+
+`health --execute` and `handoff --execute` require the original owner record,
+endpoint, node IDs, kubeconfig and cluster incarnation to agree. They verify
+node version/placement/readiness/pressure, container limits and CoreDNS rollout.
+Creation allows up to 90 seconds for the complete node checks to converge after
+Ready: bootstrap taints can disappear later than the Ready condition. The final
+checks are unchanged; ordinary health/handoff never mask a failed observation
+by waiting for recovery.
+They report public identity/capacity, provider Git revision/dirty flag and
+explicitly unqualified capabilities. Dirty or unmerged source observations
+must not be promoted as a reviewed provider release.
+When executing a verified Git archive, no provider `.git` directory exists;
+source identity is marked `caller-required` rather than discovering a parent
+repository or failing after cluster creation. The consumer must bind its
+independently verified immutable selection to that observation.
+
+For a disposable target, authorize `down --execute` with
+`--confirm-delete fleetiq-local` only after inspecting its preview. Removal
+verifies identity, deletes only its recorded node container IDs and anonymous volumes, proves no named node
+containers remain and removes only its three state files. Other consumer state
+is retained. This is not the cleanup path for retained application data.
+
+## Failure and recovery
+
+- Existing cluster or state: stop and select its original owner/state root.
+  Creation will neither replace it nor regenerate access credentials.
+- Wrong endpoint, node IDs, incarnation or configuration: stop; investigate the
+  mismatch without relabeling, resetting the record or copying credentials.
+- Failed creation: partial resources and state remain for bounded inspection.
+  Health/ensure cannot promote them into a healthy identity. Confirmed removal
+  works only when node IDs and incarnation were already positively observed;
+  earlier failures require a separately reviewed recovery of the partial target.
+- Interrupted deletion: state remains `deleting`. An exact retry verifies the
+  endpoint, resumes only recorded immutable IDs that remain, and refuses
+  replacement containers. Already absent IDs are not removed again.
+- Unavailable API: starting removal cannot bypass incarnation verification. An
+  already committed `deleting` journal can finish its verified immutable IDs
+  without a functioning API; otherwise recover the owned control plane first.
+- Resource/pressure failure: stop before consumer installation. Do not raise
+  limits, consume reserved Perfeng capacity or replace a retained cluster as a repair.
+
+## Capability progression
+
+This I01 base uses kind's default networking and establishes no policy enforcement
+claim. I03 must introduce and qualify an explicit policy-capable profile before
+network isolation or trusted ingress can be consumed. It must not replace the
+CNI of an existing retained target implicitly. I02 qualifies delegated controller
+capabilities; I04 qualifies storage/database interfaces. Consumers then qualify
+their own installation and product behavior. See [ADR 0004](decisions/0004-isolated-local-consumer-profiles.md).
