@@ -44,11 +44,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--consumer", required=True)
     parser.add_argument("--docker-context", required=True)
     parser.add_argument("--state-root", type=Path, required=True)
+    parser.add_argument("--https-port", type=int)
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--confirm-delete")
     args = parser.parse_args(argv)
     try:
-        target = Target(args.consumer, args.docker_context, args.state_root, args.profile)
+        target = Target(
+            args.consumer, args.docker_context, args.state_root, args.profile, args.https_port
+        )
         if not args.execute:
             result = preview(args.action, target)
         elif args.action == "down":

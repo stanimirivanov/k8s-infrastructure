@@ -82,6 +82,10 @@ def create(target: Target) -> dict[str, Any]:
     runtime.tools(target)
     if target.name in runtime.clusters(target):
         raise ValueError("Named consumer cluster already exists; refusing adoption")
+    if target.profile == "isolated-network-local":
+        from .network_runtime import listener_available
+
+        listener_available(target)
     record = state.reserve(target, endpoint)
     try:
         runtime.command(
@@ -97,7 +101,9 @@ def create(target: Target) -> dict[str, Any]:
                 "--kubeconfig",
                 str(target.path("kubeconfig")),
                 "--wait",
-                "300s",
+                # Custom-CNI nodes cannot be Ready until the next bootstrap
+                # phase. The original Ready gate runs after Cilium installation.
+                "0s" if target.profile == "isolated-network-local" else "300s",
                 "--retain",
             ],
         )
@@ -128,17 +134,24 @@ def create(target: Target) -> dict[str, Any]:
                 ],
             )
         runtime.verify_nodes(runtime.node_identity(target), profile=target.profile)
-        runtime.kubectl(
-            target, ["wait", "--for=condition=Ready", "nodes", "--all", "--timeout=300s"]
-        )
-        result = observe(target, wait=True)
-        record["phase"] = "ready"
-        state.save(target, record)
-        return result
+        if target.profile == "isolated-network-local":
+            from .network_runtime import install
+
+            install(target)
+        return finish_creation(target, record)
     except Exception:
         record["phase"] = "partial"
         state.save(target, record)
         raise
+
+
+def finish_creation(target: Target, record: dict[str, Any]) -> dict[str, Any]:
+    """Mark ready only after CNI bootstrap and the original base readiness checks."""
+    runtime.kubectl(target, ["wait", "--for=condition=Ready", "nodes", "--all", "--timeout=300s"])
+    result = observe(target, wait=True)
+    record["phase"] = "ready"
+    state.save(target, record)
+    return result
 
 
 def health(target: Target) -> dict[str, Any]:

@@ -1,0 +1,38 @@
+# API address and consumer node selector are supplied from the verified target.
+kubeProxyReplacement: true
+k8sServicePort: 6443
+ipam:
+  mode: kubernetes
+cgroup:
+  autoMount:
+    enabled: false
+  hostRoot: /sys/fs/cgroup
+operator:
+  replicas: 1
+  skipCRDCreation: true
+  resources:
+    requests: {cpu: 50m, memory: 128Mi}
+    limits: {cpu: 500m, memory: 384Mi}
+resources:
+  requests: {cpu: 100m, memory: 256Mi}
+  limits: {cpu: 1000m, memory: 768Mi}
+envoy:
+  enabled: true
+  resources:
+    requests: {cpu: 50m, memory: 64Mi}
+    limits: {cpu: 500m, memory: 256Mi}
+gatewayAPI:
+  enabled: true
+  gatewayClass:
+    create: "true"
+  hostNetwork:
+    enabled: true
+    nodes:
+      matchLabels:
+        k8s-infrastructure.io/role: worker
+hubble:
+  enabled: false
+  relay:
+    enabled: false
+  ui:
+    enabled: false

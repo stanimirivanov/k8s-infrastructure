@@ -1,6 +1,6 @@
 UV_RUN := uv run --locked --offline
 
-.PHONY: help bootstrap doctor fmt fmt-check docs docs-check check test configuration-check workflows-asset-check delegated-argo-asset-check metrics-check pr-event-check verify supply-chain validate
+.PHONY: help bootstrap doctor fmt fmt-check docs docs-check check test configuration-check workflows-asset-check delegated-argo-asset-check network-asset-check metrics-check pr-event-check verify supply-chain validate
 
 help:
 	@echo k8s-infrastructure engineering command surface
@@ -14,6 +14,7 @@ help:
 	@echo "  make configuration-check  Validate reviewed local infrastructure selections"
 	@echo "  make workflows-asset-check  Verify official Argo Workflows bytes and namespace RBAC"
 	@echo "  make delegated-argo-asset-check  Verify isolated consumer Argo asset bytes"
+	@echo "  make network-asset-check  Verify pinned Cilium/Gateway assets and actual Helm render"
 	@echo "  make metrics-check  Strictly lint/render the verified-TLS resource metrics chart"
 	@echo "  make pr-event-check  Validate issue linkage in the GitHub PR event"
 	@echo "  make verify     Run all offline repository-local checks"
@@ -50,11 +51,14 @@ test:
 configuration-check:
 	$(UV_RUN) python -m scripts.configuration_check
 
-workflows-asset-check: delegated-argo-asset-check
+workflows-asset-check: delegated-argo-asset-check network-asset-check
 	$(UV_RUN) python -m scripts.workflows asset-check
 
 delegated-argo-asset-check:
 	$(UV_RUN) python -m scripts.delegated_argo asset-check
+
+network-asset-check:
+	$(UV_RUN) python -m scripts.network asset-check
 
 metrics-check:
 	$(UV_RUN) python -m scripts.metrics_chart

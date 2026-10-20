@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import copy
 import json
-from typing import Any
 
 import yaml
 
 from .delegated_argo_config import LABEL, Delegation, labels, selection
 from .delegated_argo_policy import admission, binding, delegated_roles, resource, stamp
+from .kubernetes import reference as reference
 
 
-def render(delegation: Delegation, assets: dict[str, list[dict]]) -> tuple[list[dict], list[dict]]:
+def render(
+    delegation: Delegation, assets: dict[str, list[dict]], *, networking: bool = False
+) -> tuple[list[dict], list[dict]]:
     """Never install the cluster-wide CD manifest; extract only its three CRDs."""
     shared = [
         copy.deepcopy(item)
@@ -52,7 +54,7 @@ def render(delegation: Delegation, assets: dict[str, list[dict]]) -> tuple[list[
     documents += controllers(
         assets["workflows"], delegation.controllers, delegation, workflows=True
     )
-    documents += delegated_roles(delegation)
+    documents += delegated_roles(delegation, networking=networking)
     documents += admission(
         delegation,
         next(item for item in shared if item["metadata"]["name"] == "workflows.argoproj.io"),
@@ -175,7 +177,3 @@ def controllers(
         )
         documents[-1]["metadata"]["labels"] = {"argocd.argoproj.io/secret-type": "cluster"}
     return documents
-
-
-def reference(item: dict[str, Any]) -> tuple[str, str, str | None]:
-    return item["kind"], item["metadata"]["name"], item["metadata"].get("namespace")

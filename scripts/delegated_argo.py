@@ -22,6 +22,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--consumer")
     parser.add_argument("--docker-context")
     parser.add_argument("--state-root", type=Path)
+    parser.add_argument("--https-port", type=int)
     parser.add_argument("--delegation", type=Path)
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--confirm-remove")
@@ -50,7 +51,9 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError(
                 "Explicit profile, consumer, Docker context, state root and delegation required"
             )
-        target = Target(args.consumer, args.docker_context, args.state_root, args.profile)
+        target = Target(
+            args.consumer, args.docker_context, args.state_root, args.profile, args.https_port
+        )
         delegation = load_delegation(args.delegation, target)
         if not args.execute:
             result = {

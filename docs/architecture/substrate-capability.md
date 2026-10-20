@@ -75,6 +75,10 @@ The [delegated Argo capability](../delegated-argo.md) separates provider-owned
 shared APIs/controllers from consumer-owned namespaces, desired state and templates.
 Controller readiness, native authorization/execution, sign-in and durable evidence
 are distinct claims and must be reported separately.
+The [network profile](../networking-and-ingress.md) adds pinned policy enforcement
+and Gateway APIs only on fresh targets. Consumers retain policies/routes/TLS
+ownership. Controller health, actual traffic/TLS evidence and OS/browser trust
+are separate claims; a loopback local listener does not qualify non-local ingress.
 
 Every supported substrate must make the following non-secret information
 available to its consumer and to operators:

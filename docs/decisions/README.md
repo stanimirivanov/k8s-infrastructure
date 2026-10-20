@@ -17,6 +17,7 @@
 | [0003](0003-install-namespaced-argo-workflows.md) | Proposed | Install a pinned namespaced Argo Workflows substrate for finite releases |
 | [0004](0004-isolated-local-consumer-profiles.md) | Proposed | Add project-neutral isolated local consumer identities while preserving Perfeng |
 | [0005](0005-delegated-consumer-argo.md) | Proposed | Delegate isolated Argo controllers, shared APIs and constrained release authority |
+| [0006](0006-isolated-network-and-gateway.md) | Proposed | Bootstrap fresh policy-enforcing networking and consumer-owned trusted Gateway routes |
 
 ## Numbering under concurrent work
 
