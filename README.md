@@ -20,6 +20,8 @@ capability qualification.
   adds explicit identities for FleetIQ and future projects, with separate
   qualification for networking, controllers and storage.
 - Run `make verify` while editing and `make validate` before handoff.
+- [Delegated Argo](docs/delegated-argo.md) adds opt-in isolated controllers and
+  constrained release permissions, with native qualification separate from rollout.
 
 ## Status
 

@@ -66,6 +66,8 @@ def run(
     """Run one external command with bounded, private output handling."""
     if timeout <= 0:
         raise ValueError("Command timeout must be positive")
+    from .process_tree import terminate
+
     environment = {
         key: value
         for key, value in os.environ.items()
@@ -93,12 +95,13 @@ def run(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         env={**environment, "KIND_EXPERIMENTAL_PROVIDER": "docker"},
+        start_new_session=os.name != "nt",
+        creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0,
     ) as process:
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                process.kill()
-                process.communicate()
+                terminate(process)
                 raise ValueError(f"{label} timed out after {timeout}s; inspect the local target")
             try:
                 stdout, _ = process.communicate(

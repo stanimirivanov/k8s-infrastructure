@@ -31,12 +31,14 @@ def nodes(target):
             "name": f"/{target.name}-{role}",
             "cluster": target.name,
             "role": role,
-            "image": load_profile()["nodeImage"],
+            "image": load_profile(name=target.profile)["nodeImage"],
             "memory": budget["memoryBytes"],
             "cpu": budget["cpus"] * 10**9,
             "pids": 2048,
         }
-        for (role, budget), char in zip(load_profile()["nodes"].items(), "ab", strict=True)
+        for (role, budget), char in zip(
+            load_profile(name=target.profile)["nodes"].items(), "ab", strict=True
+        )
     }
 
 
@@ -197,6 +199,27 @@ class ConsumerTests(unittest.TestCase):
             file.write_text(yaml.safe_dump(changed), encoding="utf-8")
             with self.subTest(key=key), self.assertRaises(ValueError):
                 load_profile(file)
+
+    def test_argo_profile_is_explicit_and_cannot_adopt_the_base_owner_record(self):
+        larger = Target("fleetiq", "local-engine", self.root, "isolated-argo-local")
+        base = load_profile()
+        argo = load_profile(name=larger.profile)
+        self.assertEqual(base["nodes"]["control-plane"], {"cpus": 1, "memoryBytes": 2 * 1024**3})
+        self.assertEqual(argo["nodes"]["control-plane"], {"cpus": 2, "memoryBytes": 4 * 1024**3})
+        self.assertEqual(base["nodes"]["worker"], argo["nodes"]["worker"])
+        runtime.verify_nodes(nodes(larger), profile=larger.profile)
+        with self.assertRaises(ValueError):
+            runtime.verify_nodes(nodes(self.target), profile=larger.profile)
+        with self.assertRaises(ValueError):
+            runtime.verify_nodes(nodes(larger))
+        self.assertNotEqual(
+            identity(self.target)["profileDigest"], identity(larger)["profileDigest"]
+        )
+        state.reserve(self.target, ENDPOINT)
+        with self.assertRaisesRegex(ValueError, "profile/context mismatch"):
+            state.load(larger)
+        with self.assertRaises(ValueError):
+            Target("fleetiq", "local-engine", self.root, "arbitrary-unbounded")
 
     def test_all_previews_are_offline_and_do_not_read_or_create_private_state(self):
         for action in ("up", "ensure", "health", "handoff", "down"):

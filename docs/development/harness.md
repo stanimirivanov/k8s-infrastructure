@@ -32,6 +32,7 @@ operations and real kubelet/aggregation TLS acceptance remain separate from CI.
 | Non-live acceptance | `make validate` | Aggregate inner loop and supply-chain checks. |
 | Live operations | See [local kind](../local-kind.md) and [Argo CD](../local-argocd.md) | Explicit `--execute`, selected state root, target checks, and separate authorization. |
 | Argo Workflows release asset | `make workflows-asset-check` | Network-only verification of the official manifest digest, resource inventory and namespace-scoped RBAC; no cluster access. |
+| Isolated consumer Argo assets | `make delegated-argo-asset-check` | Network-only verification of selected CD/Workflows bytes; also included in the existing asset job. |
 
 `make docs` remains an alias for `make docs-check` so existing contributor
 commands continue to work. The validation job calls the Make targets rather
@@ -45,6 +46,8 @@ local Markdown destinations and anchors, required summaries, issue and pull
 request templates, and ADR numbering and indexing. It does not prescribe a
 GitHub Action reference style, resolve remote links, or infer infrastructure
 health. Regression tests cover accepted and rejected states.
+The setup-uv action intentionally retains its reviewed commit hash as the owner's
+explicit exception to the general major-version action preference.
 
 On human-authored pull requests, the separate metadata workflow checks the
 event title, first body line, and source branch for one matching issue number.

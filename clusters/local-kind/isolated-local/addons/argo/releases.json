@@ -1,0 +1,17 @@
+{
+  "argocd": {
+    "version": "v3.5.2",
+    "url": "https://raw.githubusercontent.com/argoproj/argo-cd/v3.5.2/manifests/namespace-install.yaml",
+    "sha256": "df24f12dc3e08f1f36618e6d38b4f91ddd3b282e8e614606b8fccfbdf18b3ddf"
+  },
+  "argocd-apis": {
+    "version": "v3.5.2",
+    "url": "https://raw.githubusercontent.com/argoproj/argo-cd/v3.5.2/manifests/install.yaml",
+    "sha256": "9a87f2b3e14c278f12501eb0ef5c3955b27cf05370ca425381c6a908cf85a5c5"
+  },
+  "workflows": {
+    "version": "v4.1.5",
+    "url": "https://github.com/argoproj/argo-workflows/releases/download/v4.1.5/namespace-install.yaml",
+    "sha256": "02427502f17e98de5fdfb8028523978e86f5481070645d84f991b6d31388bd51"
+  }
+}

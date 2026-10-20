@@ -50,6 +50,15 @@ These limits are inspected before success. Existing or unrelated containers are
 never updated. Initial kind bootstrap precedes these limits and can transiently
 use more resources; coordinate an idle host window before execution.
 
+Select `--profile isolated-argo-local` explicitly for the delegated Argo capability:
+its control plane uses two CPUs/4 GiB and its worker two CPUs/4 GiB (4 CPUs/8 GiB
+total). Native I02 testing found that the smaller base control plane failed
+liveness during Argo OpenAPI schema discovery. Both profiles keep the same engine
+minimum, node-image pin, PID and swap restrictions. The profile name and budget
+digest are part of the ownership record: switching profiles refuses existing
+state rather than resizing/adopting it. Recreate only an explicitly authorized
+disposable target; an existing consumer needs a separately reviewed migration.
+
 Engine minimums do not prove free host capacity. Separate clusters share the
 engine, kernel, storage and host. They do not isolate Perfeng benchmark timing.
 The handoff reports Kubernetes allocatable and Docker container budgets
@@ -124,6 +133,6 @@ is retained. This is not the cleanup path for retained application data.
 This I01 base uses kind's default networking and establishes no policy enforcement
 claim. I03 must introduce and qualify an explicit policy-capable profile before
 network isolation or trusted ingress can be consumed. It must not replace the
-CNI of an existing retained target implicitly. I02 qualifies delegated controller
-capabilities; I04 qualifies storage/database interfaces. Consumers then qualify
+CNI of an existing retained target implicitly. The [I02 delegated Argo capability](delegated-argo.md)
+adds separately qualified controllers/release authority; I04 qualifies storage/database interfaces. Consumers then qualify
 their own installation and product behavior. See [ADR 0004](decisions/0004-isolated-local-consumer-profiles.md).

@@ -67,7 +67,7 @@ def engine(target: Target) -> str:
 
 
 def prerequisites(target: Target, *, creating: bool = False) -> str:
-    profile = load_profile()
+    profile = load_profile(name=target.profile)
     version = command(target, ["kind", "version"]).split()
     if len(version) < 2 or version[1] != profile["kindVersion"]:
         raise ValueError("Consumer profile requires reviewed kind version")
@@ -131,7 +131,7 @@ def inspect_node(target: Target, reference: str, name: str) -> dict[str, Any]:
         node.get("cluster") != target.name
         or node.get("role") != expected[name]
         or node.get("name") != f"/{name}"
-        or node.get("image") != load_profile()["nodeImage"]
+        or node.get("image") != load_profile(name=target.profile)["nodeImage"]
         or not re.fullmatch(r"[a-f0-9]{64}", node.get("id", ""))
     ):
         raise ValueError("Foreign node container identity")
@@ -184,9 +184,9 @@ def tools(target: Target) -> dict[str, Any]:
     }
 
 
-def verify_nodes(nodes: dict[str, dict[str, Any]]) -> None:
+def verify_nodes(nodes: dict[str, dict[str, Any]], *, profile: str = "isolated-local") -> None:
     for node in nodes.values():
-        budget = load_profile()["nodes"][node["role"]]
+        budget = load_profile(name=profile)["nodes"][node["role"]]
         if (
             node["memory"] != budget["memoryBytes"]
             or node["cpu"] != budget["cpus"] * 10**9

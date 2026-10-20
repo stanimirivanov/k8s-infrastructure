@@ -112,6 +112,7 @@ class ClusterTests(unittest.TestCase):
         with (
             patch("scripts.local_kind.subprocess.Popen") as popen,
             patch("scripts.local_kind.time.monotonic", side_effect=[0.0, 601.0]),
+            patch("scripts.process_tree.terminate") as terminate,
             redirect_stdout(io.StringIO()),
             self.assertRaisesRegex(ValueError, "timed out after 600s"),
         ):
@@ -119,8 +120,7 @@ class ClusterTests(unittest.TestCase):
             process.communicate.return_value = (b"", b"")
             run(["kubectl"])
 
-        process.kill.assert_called_once_with()
-        process.communicate.assert_called_once_with()
+        terminate.assert_called_once_with(process)
 
     def test_invalid_stdout_fails_without_false_completion(self):
         captured = io.StringIO()
