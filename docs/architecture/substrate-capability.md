@@ -79,6 +79,12 @@ The [network profile](../networking-and-ingress.md) adds pinned policy enforceme
 and Gateway APIs only on fresh targets. Consumers retain policies/routes/TLS
 ownership. Controller health, actual traffic/TLS evidence and OS/browser trust
 are separate claims; a loopback local listener does not qualify non-local ingress.
+The [database/storage capability](../database-and-storage.md) separates provider
+operators/shared APIs and retained storage from consumer database, credentials and
+backup/restore ownership. Local Retain semantics, request accounting, actual
+filesystem capacity, off-cluster recovery and workload identity are separate
+claims. Opt-in database namespace authority requires native admission and quota
+checks; unselected Argo delegations keep their original permissions.
 
 Every supported substrate must make the following non-secret information
 available to its consumer and to operators:

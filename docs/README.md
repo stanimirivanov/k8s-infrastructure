@@ -21,6 +21,7 @@
 | Argo CD installation | [Local Argo CD guide](local-argocd.md) |
 | Delegated Argo for isolated consumers | [Delegated Argo guide](delegated-argo.md), [ADR 0005](decisions/0005-delegated-consumer-argo.md) |
 | Policy-enforcing CNI and trusted local HTTPS | [Networking/ingress guide](networking-and-ingress.md), [ADR 0006](decisions/0006-isolated-network-and-gateway.md) |
+| Database operators, retained local storage and recovery boundaries | [Database/storage guide](database-and-storage.md), [ADR 0007](decisions/0007-local-database-and-retained-storage.md) |
 | Argo Workflows installation | [Local Argo Workflows guide](local-argo-workflows.md), [ADR 0003](decisions/0003-install-namespaced-argo-workflows.md) |
 | Resource Metrics API or kubelet serving certificates | [Verified resource metrics](resource-metrics.md), [ADR-0002](decisions/0002-verified-resource-metrics.md) |
 | Reviewing imported history | [Local-kind](migrations/local-kind-history-import.md) and [Argo CD](migrations/argocd-history-import.md) migration records |

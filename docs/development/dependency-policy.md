@@ -55,6 +55,20 @@ safe.
 
 ## Supply-chain response
 
+The database capability selects CloudNativePG 1.30.1, Barman Cloud Plugin 0.15.1
+and cert-manager 1.21.2 (Apache-2.0 projects), with official manifests SHA-256
+pinned and OCI images pinned by digest. The supported plugin requires cert-manager;
+it is an explicit provider prerequisite, not an unreviewed install hook.
+PostgreSQL 18.4 under the [PostgreSQL License](https://www.postgresql.org/about/licence/)
+is the neutral persistence fixture, not an implicit consumer database upgrade.
+The plugin sidecar includes [Barman (GPL-3.0-or-later)](https://github.com/EnterpriseDB/barman);
+its license is distinct from the Apache-2.0 plugin wrapper. Runtime-image redistribution
+must preserve the applicable upstream component notices and source obligations.
+This introduces no Python library or custom database/backup implementation.
+Kind's existing local provisioner is checked against the versioned kind source;
+its configuration is not silently adopted or modified. Exact sources and images
+live in the [database inventory](../../clusters/local-kind/isolated-network-local/database/releases.json).
+
 The isolated network capability uses Cilium 1.20.3 and standard Gateway API
 1.6.3 (Apache-2.0), with the official chart and each API manifest SHA-256 pinned.
 The Cilium chart retains upstream image digests and is rendered with existing

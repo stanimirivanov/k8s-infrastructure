@@ -5,6 +5,11 @@
 
 ## TL;DR
 
+- Database authority is a separate `databaseNamespaces` opt-in. See the
+  [database guide](database-and-storage.md#explicit-database-namespace-delegation)
+  for prerequisite operators, namespace quotas/admission and immutable delegation
+  transitions; omitting the field preserves existing permissions.
+
 - Select an owned I01 target and public reviewed delegation explicitly.
 - Consumers bootstrap/own their namespaces; infrastructure only installs
   isolated controllers/shared APIs and binds reviewed permissions.
