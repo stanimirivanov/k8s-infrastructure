@@ -61,6 +61,7 @@ def run(
     *,
     input_data: bytes | None = None,
     timeout: int = COMMAND_TIMEOUT,
+    docker_context: str | None = None,
 ) -> str:
     """Run one external command with bounded, private output handling."""
     if timeout <= 0:
@@ -70,6 +71,15 @@ def run(
         for key, value in os.environ.items()
         if key not in {"KUBECONFIG", "KUBERNETES_MASTER"} and not key.startswith("HELM_KUBE")
     }
+    if docker_context is not None:
+        # New isolated profiles pin kind's Docker child commands to the reviewed
+        # named context; legacy Perfeng invocation retains its existing behavior.
+        for key in ("DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH"):
+            environment.pop(key, None)
+        for key in list(environment):
+            if key.startswith("KIND_EXPERIMENTAL_"):
+                environment.pop(key)
+        environment["DOCKER_CONTEXT"] = docker_context
     # Only show the executable, never arguments/output that may contain credentials.
     label = Path(command[0]).stem
     print(f"Starting {label} command...", flush=True)

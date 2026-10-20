@@ -56,8 +56,8 @@ job in branch protection to make this a merge gate. Dependabot
 dependency-update pull requests are exempt because their generated branches
 and titles do not follow the issue-linked contributor workflow.
 
-`make configuration-check` validates the exact checked-in local-kind profile
-and pinned Argo CD selection. It reads only repository-owned configuration and
+`make configuration-check` validates the exact checked-in Perfeng compatibility
+profile, isolated consumer profile/budgets and pinned Argo CD selection. It reads only repository-owned configuration and
 never invokes Docker, kind, kubectl, or a cluster.
 Unit tests exercise identity, refusal, timeout, failure, and recovery behavior
 with process boundaries replaced. A successful offline run is not evidence of

@@ -2,7 +2,7 @@
 
 - Status: Cutover-ready provider release
 - Profile: `perfeng-local`
-- Existing environment entry point: `perfeng-environment` until consumer cutover
+- Existing environment entry point: `perfeng-environment` through its immutable selection
 
 ## TL;DR
 
@@ -10,8 +10,8 @@
 - Commands remain offline previews unless `--execute` is supplied.
 - Live execution verifies the exact cluster, Docker endpoint, kubeconfig and
   node identity and bounds each external command to 600 seconds.
-- `perfeng-environment` remains the supported entry point for the existing
-  `perfeng-local` cluster until it pins and invokes this provider release.
+- `perfeng-environment` records its cutover as accepted and remains the supported
+  entry point through its selected provider revision.
 - The profile preserves the cluster name, context, Kubernetes image, node
   topology and kubeconfig filename needed for a later cutover.
 - Do not invoke this release against the existing environment independently of
@@ -19,11 +19,12 @@
 
 ## Current ownership boundary
 
-This provider release establishes executable substrate behavior, but merging it
-does not mutate or adopt an existing cluster. The existing cluster, dedicated
-kubeconfig, Argo CD installation and persistent workloads remain operated
-through `perfeng-environment` until that repository selects this revision and
-changes its command surface.
+Perfeng records its ownership cutover as accepted on 2026-09-17 and selects
+provider `5970bffa1f3d200e73d5a55e0cd4ef34ed9ef3b7`. Its cluster, dedicated
+kubeconfig, Argo CD and persistent workloads remain operated through that
+immutable consumer selection. A later provider merge neither changes the
+selection nor adopts/recreates existing resources. This status is based on the
+consumer's recorded selection, not a new live inspection or cutover execution.
 
 There is deliberately no Task entry in this repository during the staged
 handoff. The default state root is this checkout, so it cannot adopt the
@@ -112,11 +113,11 @@ Live commands reject redirected state, remote Docker endpoints, the wrong kind
 version, incomplete or foreign identities, unhealthy nodes and timeouts. A
 failed creation is retained for inspection and is never automatically deleted.
 
-## Consumer cutover gates
+## Recorded consumer cutover and future promotions
 
-The provider implementation is ready for immutable selection. Transferring the
-existing environment still requires a separate consumer issue and pull request
-that proves all of the following:
+The consumer records its initial cutover as accepted. Preserve that record;
+do not repeat it. Future provider selection changes require a separate consumer
+issue and pull request preserving these original compatibility gates:
 
 1. `perfeng-environment` consumes this implementation from an immutable merged
    infrastructure revision and changes its operator commands in the same
@@ -157,9 +158,9 @@ handoff are part of the consumer cutover review.
 
 ### Existing cluster needs diagnosis
 
-Before the consumer cutover, use the current `perfeng-environment`
-troubleshooting guide. After cutover, run this provider's `health` action first,
-then diagnose consumer workloads through their owning environment.
+Use the supported `perfeng-environment` entry point and its immutable provider
+selection. Diagnose consumer workloads through their owning environment;
+do not execute this checkout's mutable branch against retained state.
 
 ### An external command times out
 

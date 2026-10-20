@@ -15,6 +15,7 @@
 | [0001](0001-repository-boundary-and-tooling.md) | Accepted | Establish the repository boundary and initial tool choices |
 | [0002](0002-verified-resource-metrics.md) | Proposed | Provide verified-TLS resource metrics with explicit certificate operations |
 | [0003](0003-install-namespaced-argo-workflows.md) | Proposed | Install a pinned namespaced Argo Workflows substrate for finite releases |
+| [0004](0004-isolated-local-consumer-profiles.md) | Proposed | Add project-neutral isolated local consumer identities while preserving Perfeng |
 
 ## Numbering under concurrent work
 

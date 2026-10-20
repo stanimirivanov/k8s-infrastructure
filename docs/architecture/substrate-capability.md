@@ -66,6 +66,12 @@ If a capability is missing or stale, it must fail with an actionable diagnosis.
 
 ## Handoff information
 
+The [isolated local consumer profile](../isolated-local-consumers.md) adds an
+explicit project-neutral target alongside the retained Perfeng compatibility
+profile. Sharing this provider does not imply sharing Perfeng benchmark workers.
+Its local observation report preserves this v0 handoff; it is not a generic
+cross-provider schema or proof of capabilities listed as unqualified.
+
 Every supported substrate must make the following non-secret information
 available to its consumer and to operators:
 

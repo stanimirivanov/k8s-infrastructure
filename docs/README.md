@@ -17,6 +17,7 @@
 | Changing infrastructure code or target safety | [Engineering standards](development/engineering-standards.md) |
 | Changing the substrate/consumer handoff | [Capability contract](architecture/substrate-capability.md) and [ADR index](decisions/README.md) |
 | Local kind operations | [Local-kind guide](local-kind.md) |
+| FleetIQ or another isolated local consumer | [Isolated consumer guide](isolated-local-consumers.md), [ADR 0004](decisions/0004-isolated-local-consumer-profiles.md) |
 | Argo CD installation | [Local Argo CD guide](local-argocd.md) |
 | Argo Workflows installation | [Local Argo Workflows guide](local-argo-workflows.md), [ADR 0003](decisions/0003-install-namespaced-argo-workflows.md) |
 | Resource Metrics API or kubelet serving certificates | [Verified resource metrics](resource-metrics.md), [ADR-0002](decisions/0002-verified-resource-metrics.md) |
