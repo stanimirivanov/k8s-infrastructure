@@ -95,6 +95,12 @@ def inventory(
 
 
 def apply(target: Target, delegation: Delegation) -> dict[str, Any]:
+    if delegation.database_namespaces:
+        from .database_policy import health as scope_health
+        from .database_runtime import health as database_health
+
+        database_health(target)
+        scope_health(target, delegation.database_namespaces)
     if target.profile not in {"isolated-argo-local", "isolated-network-local"}:
         raise ValueError(
             "Delegated Argo requires the explicit isolated-argo-local profile; no implicit resizing or adoption"
@@ -192,6 +198,12 @@ def verify_admission(target: Target, documents: list[dict]) -> None:
 
 
 def health(target: Target, delegation: Delegation) -> dict[str, Any]:
+    if delegation.database_namespaces:
+        from .database_policy import health as scope_health
+        from .database_runtime import health as database_health
+
+        database_health(target)
+        scope_health(target, delegation.database_namespaces)
     consumer_lifecycle.health(target)
     namespaces_delegated(target, delegation)
     shared, documents = render(

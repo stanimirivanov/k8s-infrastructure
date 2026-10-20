@@ -29,8 +29,13 @@ class Delegation:
     consumer: str
     workload_namespaces: tuple[str, ...]
     approved_templates: tuple[str, ...]
+    database_namespaces: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        if len(set(self.database_namespaces)) != len(self.database_namespaces) or not set(
+            self.database_namespaces
+        ) <= set(self.workload_namespaces):
+            raise ValueError("Database namespaces must be distinct opted-in workload namespaces")
         for values in (self.workload_namespaces, self.approved_templates):
             if not 1 <= len(values) <= 16 or len(set(values)) != len(values):
                 raise ValueError("Delegation requires one to sixteen distinct names per boundary")
@@ -58,6 +63,8 @@ class Delegation:
     @property
     def digest(self) -> str:
         value = [self.consumer, self.workload_namespaces, self.approved_templates]
+        if self.database_namespaces:
+            value.append(self.database_namespaces)
         return hashlib.sha256(json.dumps(value, separators=(",", ":")).encode()).hexdigest()
 
 
@@ -65,19 +72,33 @@ def load_delegation(path: Path, target: Target) -> Delegation:
     value = json.loads(read_bounded(path))
     if (
         not isinstance(value, dict)
-        or set(value) != {"consumer", "workloadNamespaces", "approvedTemplates"}
+        or set(value)
+        not in (
+            {"consumer", "workloadNamespaces", "approvedTemplates"},
+            {"consumer", "workloadNamespaces", "approvedTemplates", "databaseNamespaces"},
+        )
         or value["consumer"] != target.consumer
         or any(
             not isinstance(value[key], list)
             or not all(isinstance(name, str) for name in value[key])
             for key in ("workloadNamespaces", "approvedTemplates")
         )
+        or (
+            "databaseNamespaces" in value
+            and (
+                not isinstance(value["databaseNamespaces"], list)
+                or not all(isinstance(name, str) for name in value["databaseNamespaces"])
+            )
+        )
     ):
         raise ValueError(
             "Delegation must select the exact consumer and public namespace/template lists"
         )
     return Delegation(
-        target.consumer, tuple(value["workloadNamespaces"]), tuple(value["approvedTemplates"])
+        target.consumer,
+        tuple(value["workloadNamespaces"]),
+        tuple(value["approvedTemplates"]),
+        tuple(value.get("databaseNamespaces", ())),
     )
 
 

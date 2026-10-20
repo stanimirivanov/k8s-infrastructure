@@ -1,0 +1,36 @@
+{
+  "assets": {
+    "cnpg": {
+      "version": "1.30.1",
+      "url": "https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/v1.30.1/releases/cnpg-1.30.1.yaml",
+      "sha256": "37237f145d8138256ea25ae830f87759255665ff08f8d552fdd8224a5ec032fb"
+    },
+    "barman": {
+      "version": "0.15.1",
+      "url": "https://github.com/cloudnative-pg/plugin-barman-cloud/releases/download/v0.15.1/manifest.yaml",
+      "sha256": "8f377ff4a7d0d3f74fc64b0f7ac4f449fc38ca9e83a40107cca2f9315a9bd920"
+    },
+    "cert-manager": {
+      "version": "1.21.2",
+      "url": "https://github.com/cert-manager/cert-manager/releases/download/v1.21.2/cert-manager.yaml",
+      "sha256": "e03b668ec8675214af6b0a671699d088f2601fa3878e0dbe1b41d3feafd1879f"
+    },
+    "kind-storage": {
+      "version": "0.31.0",
+      "url": "https://raw.githubusercontent.com/kubernetes-sigs/kind/v0.31.0/pkg/build/nodeimage/const_storage.go",
+      "sha256": "6b6c4ff9b43c288a3c46617aebf2d658991c7dffd6f507c251c003d57d9402c6"
+    }
+  },
+  "images": {
+    "cnpg": "ghcr.io/cloudnative-pg/cloudnative-pg:1.30.1@sha256:923c267ec29636db3bee20f993d0ec4973fa22998e1adad37da79e4d32b5bc07",
+    "barman": "ghcr.io/cloudnative-pg/plugin-barman-cloud:v0.15.1@sha256:c75acad19a36e8176cfe2885761ff1b836c6ef977d7257e298c99a28b5c302ef",
+    "sidecar": "ghcr.io/cloudnative-pg/plugin-barman-cloud-sidecar:v0.15.1@sha256:2287a793a804db751edd0d07d44cd549e357677e98a800eb12e2cf7c0d53f9b0",
+    "cert-manager": "quay.io/jetstack/cert-manager-controller:v1.21.2@sha256:70f532fd9cfde0b09d55687200942399d89838bc2d5d5b45152eb799a15912b8",
+    "cert-manager-cainjector": "quay.io/jetstack/cert-manager-cainjector:v1.21.2@sha256:c85268c64f2e0e76684bf5fe8906caff34b82523561c6affe0fae3546bd87562",
+    "cert-manager-webhook": "quay.io/jetstack/cert-manager-webhook:v1.21.2@sha256:a60e2dac46dbb8a7f3df95c54ce941012f54c2fe022f0ee55aaa1ab40ed957ae",
+    "acme-solver": "quay.io/jetstack/cert-manager-acmesolver:v1.21.2@sha256:699b40d622211ab7accad8a21b04c5fbaa1841ef7a12621e8de492dbe27b2503",
+    "postgres": "ghcr.io/cloudnative-pg/postgresql:18.4-system-trixie@sha256:42708a75345b7a48fdd9257b071830783a97fd228529196b6313187a7198e185",
+    "kind-provisioner": "docker.io/kindest/local-path-provisioner:v20251212-v0.29.0-alpha-105-g20ccfc88@sha256:732f0c85c983ea1d9208d764033c73cbbef1520ebeb3b0cf234e1f98330565df",
+    "kind-helper": "docker.io/kindest/local-path-helper:v20251211-v0.29.0-alpha-100-g82a92c5d@sha256:f673e4b006aec2b6d794505759997b60631d9c19431c79e180ed6c44321010a9"
+  }
+}

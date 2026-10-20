@@ -2,7 +2,15 @@
 
 from __future__ import annotations
 
-from . import argocd, consumer_profile, delegated_argo_config, local_kind, network_assets, workflows
+from . import (
+    argocd,
+    consumer_profile,
+    database_assets,
+    delegated_argo_config,
+    local_kind,
+    network_assets,
+    workflows,
+)
 
 
 def main() -> int:
@@ -12,6 +20,7 @@ def main() -> int:
         consumer_profile.load_profile(name=name)
     network_assets.selection()
     network_assets.values_configuration()
+    database_assets.selection()
     version = argocd.validate_configuration()
     workflow_release = workflows.load_selection()
     delegated = delegated_argo_config.selection()

@@ -34,6 +34,7 @@ operations and real kubelet/aggregation TLS acceptance remain separate from CI.
 | Argo Workflows release asset | `make workflows-asset-check` | Network-only verification of the official manifest digest, resource inventory and namespace-scoped RBAC; no cluster access. |
 | Isolated consumer Argo assets | `make delegated-argo-asset-check` | Network-only verification of selected CD/Workflows bytes; also included in the existing asset job. |
 | Isolated network assets | `make network-asset-check` | Network-only integrity checks for Cilium/Gateway CRDs, real Helm v4.1.4 rendering, image/authority/resource checks; included in the existing asset job. |
+| Database capability assets | `make database-asset-check` | Verify official CNPG/Barman/cert-manager and kind storage bytes, actual resource inventory, immutable images and controller bounds; included in the existing asset job. |
 
 `make docs` remains an alias for `make docs-check` so existing contributor
 commands continue to work. The validation job calls the Make targets rather
@@ -71,6 +72,11 @@ Networking tests include real loopback SSL trust/hostname verification, without
 a cluster or host trust-store change. Kubernetes exec failures cannot count as
 policy denial. Actual packet enforcement and Gateway/TLS evidence require the
 separately authorized [native network qualification](../networking-and-ingress.md).
+Database tests cover explicit namespace opt-in, legacy delegation compatibility,
+foreign-resource refusal, immutable assets, native denial positive controls and
+UID-guarded destructive fixture operations. They do not simulate proof of real
+storage or SQL persistence; those need the separately authorized
+[database qualification](../database-and-storage.md#native-qualification-and-disposal).
 
 ## Extending the harness
 

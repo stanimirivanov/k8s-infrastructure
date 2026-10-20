@@ -111,9 +111,27 @@ def delegated_roles(delegation: Delegation, *, networking: bool = False) -> list
             ]
         )
     for namespace in delegation.workload_namespaces:
+        database_rules = (
+            [
+                rule(
+                    "postgresql.cnpg.io",
+                    ["clusters", "backups", "scheduledbackups"],
+                    ["get", "list", "watch", "create", "update", "patch", "delete"],
+                ),
+                rule(
+                    "barmancloud.cnpg.io",
+                    ["objectstores"],
+                    ["get", "list", "watch", "create", "update", "patch", "delete"],
+                ),
+            ]
+            if namespace in delegation.database_namespaces
+            else []
+        )
         documents.extend(
             [
-                resource("Role", "delegated-argocd", namespace, rules=workload_rules),
+                resource(
+                    "Role", "delegated-argocd", namespace, rules=[*workload_rules, *database_rules]
+                ),
                 binding(
                     "delegated-argocd",
                     namespace,

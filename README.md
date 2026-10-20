@@ -25,6 +25,11 @@ capability qualification.
 
 ## Status
 
+The opt-in [database/storage capability](docs/database-and-storage.md) adds pinned
+CloudNativePG, Barman Cloud Plugin and cert-manager, explicit database namespace
+authority and a non-default local Retain class. Native persistence/retention
+qualification is separate from consumer backup/restore acceptance.
+
 The opt-in [network profile](docs/networking-and-ingress.md) supplies Cilium and
 Gateway APIs on fresh isolated targets, with explicit loopback HTTPS selection
 and separate native traffic/TLS qualification. It does not migrate existing CNIs
