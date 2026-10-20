@@ -71,6 +71,10 @@ explicit project-neutral target alongside the retained Perfeng compatibility
 profile. Sharing this provider does not imply sharing Perfeng benchmark workers.
 Its local observation report preserves this v0 handoff; it is not a generic
 cross-provider schema or proof of capabilities listed as unqualified.
+The [delegated Argo capability](../delegated-argo.md) separates provider-owned
+shared APIs/controllers from consumer-owned namespaces, desired state and templates.
+Controller readiness, native authorization/execution, sign-in and durable evidence
+are distinct claims and must be reported separately.
 
 Every supported substrate must make the following non-secret information
 available to its consumer and to operators:

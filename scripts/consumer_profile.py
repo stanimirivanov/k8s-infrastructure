@@ -14,20 +14,27 @@ import yaml
 from .local_kind import NODE_IMAGE, ROOT, normalize_state_root
 
 PROFILE = ROOT / "clusters/local-kind/isolated-local/profile.yaml"
+PROFILES = ("isolated-local", "isolated-argo-local")
 LABEL = "k8s-infrastructure.io/consumer"
 
 
-def load_profile(path: Path = PROFILE) -> dict[str, Any]:
+def load_profile(path: Path | None = None, *, name: str = "isolated-local") -> dict[str, Any]:
     """Accept only the reviewed budget/topology; external arbitrary profiles are unsupported."""
-    value = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if name not in PROFILES:
+        raise ValueError("Unknown reviewed isolated consumer profile")
+    selected = path or ROOT / "clusters/local-kind" / name / "profile.yaml"
+    value = yaml.safe_load(selected.read_text(encoding="utf-8"))
     expected = {
         "version": 1,
-        "profile": "isolated-local",
+        "profile": name,
         "kindVersion": "v0.31.0",
         "nodeImage": NODE_IMAGE,
         "minimumEngine": {"cpus": 4, "memoryBytes": 12 * 1024**3},
         "nodes": {
-            "control-plane": {"cpus": 1, "memoryBytes": 2 * 1024**3},
+            "control-plane": {
+                "cpus": 2 if name == "isolated-argo-local" else 1,
+                "memoryBytes": (4 if name == "isolated-argo-local" else 2) * 1024**3,
+            },
             "worker": {"cpus": 2, "memoryBytes": 4 * 1024**3},
         },
     }
@@ -49,8 +56,11 @@ class Target:
     consumer: str
     docker_context: str
     state_root: Path
+    profile: str = "isolated-local"
 
     def __post_init__(self) -> None:
+        if self.profile not in PROFILES:
+            raise ValueError("Unknown reviewed isolated consumer profile")
         if not re.fullmatch(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*", self.consumer):
             raise ValueError("Consumer must be a lowercase slug")
         if len(self.consumer) > 32 or self.consumer in {"perfeng", "perfeng-local"}:
@@ -85,7 +95,7 @@ class Target:
 
 def configuration(target: Target) -> dict[str, Any]:
     """No host mounts, workload namespaces, fixed host ports or Perfeng placement labels."""
-    profile = load_profile()
+    profile = load_profile(name=target.profile)
     return {
         "kind": "Cluster",
         "apiVersion": "kind.x-k8s.io/v1alpha4",
@@ -104,13 +114,15 @@ def configuration(target: Target) -> dict[str, Any]:
 
 def identity(target: Target) -> dict[str, str]:
     """Bind semantics canonically, independently of platform checkout line endings."""
-    encoded = json.dumps(load_profile(), sort_keys=True, separators=(",", ":")).encode()
+    encoded = json.dumps(
+        load_profile(name=target.profile), sort_keys=True, separators=(",", ":")
+    ).encode()
     return {
         "format": "isolated-local-owner.v1",
         "consumer": target.consumer,
         "name": target.name,
         "context": target.context,
         "dockerContext": target.docker_context,
-        "profile": "isolated-local",
+        "profile": target.profile,
         "profileDigest": f"sha256:{hashlib.sha256(encoded).hexdigest()}",
     }

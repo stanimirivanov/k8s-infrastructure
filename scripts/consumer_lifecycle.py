@@ -26,7 +26,7 @@ def owned(target: Target, *, require_ready: bool = True) -> dict[str, Any]:
     if not record["incarnation"] or runtime.incarnation(target) != record["incarnation"]:
         raise ValueError("Cluster incarnation changed or remains unobserved")
     if require_ready:
-        runtime.verify_nodes(nodes)
+        runtime.verify_nodes(nodes, profile=target.profile)
     return record
 
 
@@ -43,7 +43,7 @@ def observe(target: Target, *, wait: bool = False) -> dict[str, Any]:
         **source_identity(target),
         "toolVersions": runtime.tools(target),
         "nodeAllocatable": nodes,
-        "containerBudgets": load_profile()["nodes"],
+        "containerBudgets": load_profile(name=target.profile)["nodes"],
         "baseReadiness": "observed",
         "capabilitiesNotQualified": [
             "shared-host performance isolation",
@@ -108,7 +108,7 @@ def create(target: Target) -> dict[str, Any]:
         record["phase"] = "provisioned"
         state.save(target, record)
         for node in nodes.values():
-            budget = load_profile()["nodes"][node["role"]]
+            budget = load_profile(name=target.profile)["nodes"][node["role"]]
             runtime.command(
                 target,
                 [
@@ -127,7 +127,7 @@ def create(target: Target) -> dict[str, Any]:
                     node["id"],
                 ],
             )
-        runtime.verify_nodes(runtime.node_identity(target))
+        runtime.verify_nodes(runtime.node_identity(target), profile=target.profile)
         runtime.kubectl(
             target, ["wait", "--for=condition=Ready", "nodes", "--all", "--timeout=300s"]
         )

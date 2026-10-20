@@ -16,6 +16,7 @@
 | [0002](0002-verified-resource-metrics.md) | Proposed | Provide verified-TLS resource metrics with explicit certificate operations |
 | [0003](0003-install-namespaced-argo-workflows.md) | Proposed | Install a pinned namespaced Argo Workflows substrate for finite releases |
 | [0004](0004-isolated-local-consumer-profiles.md) | Proposed | Add project-neutral isolated local consumer identities while preserving Perfeng |
+| [0005](0005-delegated-consumer-argo.md) | Proposed | Delegate isolated Argo controllers, shared APIs and constrained release authority |
 
 ## Numbering under concurrent work
 
