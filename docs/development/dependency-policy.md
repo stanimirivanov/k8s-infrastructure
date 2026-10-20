@@ -55,6 +55,17 @@ safe.
 
 ## Supply-chain response
 
+The isolated network capability uses Cilium 1.20.3 and standard Gateway API
+1.6.3 (Apache-2.0), with the official chart and each API manifest SHA-256 pinned.
+The Cilium chart retains upstream image digests and is rendered with existing
+Helm v4.1.4; schema-writing operator permissions are removed. No Cilium CLI or
+additional Python dependency is introduced. Neutral live probes use go-httpbin
+2.26.0 (MIT) and curl 8.23.0 (curl license), selected from maintained upstream
+releases and pinned by OCI digest. They receive no product credentials. Their
+boundary is [network fixtures](../../scripts/network_fixtures.py), not production
+application packaging. Public source and exact selections are in the
+[release inventory](../../clusters/local-kind/isolated-network-local/releases.json).
+
 `make supply-chain` checks lock consistency and audits known Python
 vulnerabilities. Findings are assessed for affected version, reachability,
 available fix, and operational exposure. Exceptions require an owner, scope,

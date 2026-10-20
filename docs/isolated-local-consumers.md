@@ -67,6 +67,11 @@ quota. Consumer workload budgets and placement need their own acceptance.
 
 ## Offline preview
 
+For policy-enforcing networking and HTTPS, select the separately qualified
+[`isolated-network-local` profile](networking-and-ingress.md) with an explicit
+`--https-port`. It disables the default CNI/kube-proxy only on a fresh target;
+it cannot migrate/adopt an existing profile or retained Perfeng cluster.
+
 Create an operator-private state directory outside Git first, then select it:
 
 ```sh

@@ -25,6 +25,11 @@ capability qualification.
 
 ## Status
 
+The opt-in [network profile](docs/networking-and-ingress.md) supplies Cilium and
+Gateway APIs on fresh isolated targets, with explicit loopback HTTPS selection
+and separate native traffic/TLS qualification. It does not migrate existing CNIs
+or install consumer routing, certificates or host trust.
+
 The opt-in [resource metrics capability](docs/resource-metrics.md) adds a
 verified-TLS Metrics Server chart and explicit node/serving-certificate
 operations. It does not deploy an Application or change the existing cluster.

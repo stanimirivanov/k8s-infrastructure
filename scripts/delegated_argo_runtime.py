@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import time
 from typing import Any
@@ -11,54 +10,9 @@ from . import consumer_lifecycle, consumer_runtime
 from .consumer_profile import Target
 from .delegated_argo_config import LABEL, Delegation, download_assets, selection
 from .delegated_argo_render import reference, render
+from .kubernetes import contains, fingerprint, kube
 
 FIELD_MANAGER = "k8s-infrastructure-delegated-argo"
-
-
-def kube(
-    target: Target,
-    args: list[str],
-    documents: list[dict] | None = None,
-    *,
-    request_timeout: int = 30,
-) -> str:
-    command = [
-        "kubectl",
-        "--kubeconfig",
-        str(target.path("kubeconfig")),
-        "--context",
-        target.context,
-        f"--request-timeout={request_timeout}s",
-        *args,
-    ]
-    return consumer_runtime.command(
-        target,
-        command,
-        input_data=json.dumps({"apiVersion": "v1", "kind": "List", "items": documents}).encode()
-        if documents is not None
-        else None,
-    )
-
-
-def fingerprint(item: dict) -> str:
-    """Bind the desired shared API schema; account for Kubernetes CRD defaults."""
-    value = (
-        dict(item.get("spec", {}))
-        if item["kind"] == "CustomResourceDefinition"
-        else {
-            key: item.get(key)
-            for key in ("value", "globalDefault", "description", "preemptionPolicy")
-        }
-    )
-    if item["kind"] == "CustomResourceDefinition":
-        value.setdefault("preserveUnknownFields", False)
-        value.setdefault("conversion", {"strategy": "None"})
-    else:
-        value["globalDefault"] = value["globalDefault"] or False
-        value["preemptionPolicy"] = value["preemptionPolicy"] or "PreemptLowerPriority"
-    return hashlib.sha256(
-        json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
 
 
 def read_resources(target: Target, documents: list[dict]) -> dict[tuple, dict]:
@@ -141,14 +95,16 @@ def inventory(
 
 
 def apply(target: Target, delegation: Delegation) -> dict[str, Any]:
-    if target.profile != "isolated-argo-local":
+    if target.profile not in {"isolated-argo-local", "isolated-network-local"}:
         raise ValueError(
             "Delegated Argo requires the explicit isolated-argo-local profile; no implicit resizing or adoption"
         )
     print("Verifying consumer target and namespace delegation...", flush=True)
     consumer_lifecycle.health(target)
     namespaces_delegated(target, delegation)
-    shared, documents = render(delegation, download_assets())
+    shared, documents = render(
+        delegation, download_assets(), networking=target.profile == "isolated-network-local"
+    )
     found = inventory(target, shared, documents, complete=False)
     missing = [item for item in shared if reference(item) not in found]
     print(
@@ -238,25 +194,10 @@ def verify_admission(target: Target, documents: list[dict]) -> None:
 def health(target: Target, delegation: Delegation) -> dict[str, Any]:
     consumer_lifecycle.health(target)
     namespaces_delegated(target, delegation)
-    shared, documents = render(delegation, download_assets())
+    shared, documents = render(
+        delegation, download_assets(), networking=target.profile == "isolated-network-local"
+    )
     return observe(target, delegation, shared, documents)
-
-
-def contains(expected: Any, actual: Any) -> bool:
-    """Allow API omission of empty arrays/defaults, never extra entries or changed values."""
-    if isinstance(expected, dict):
-        return isinstance(actual, dict) and all(
-            (key in actual and contains(value, actual[key]))
-            or (key not in actual and isinstance(value, list) and not value)
-            for key, value in expected.items()
-        )
-    if isinstance(expected, list):
-        return (
-            isinstance(actual, list)
-            and len(expected) == len(actual)
-            and all(contains(a, b) for a, b in zip(expected, actual, strict=True))
-        )
-    return expected == actual
 
 
 def verify_security(expected: dict, actual: dict) -> None:
@@ -375,7 +316,9 @@ def remove(target: Target, delegation: Delegation, confirmation: str | None) -> 
         raise ValueError("Instance removal requires exact --confirm-remove <cluster>/argo")
     consumer_lifecycle.owned(target)
     namespaces_delegated(target, delegation)
-    shared, documents = render(delegation, download_assets())
+    shared, documents = render(
+        delegation, download_assets(), networking=target.profile == "isolated-network-local"
+    )
     found = inventory(target, shared, documents, complete=False)
     workflows = json.loads(
         kube(target, ["-n", delegation.managed, "get", "workflows", "-o", "json"])

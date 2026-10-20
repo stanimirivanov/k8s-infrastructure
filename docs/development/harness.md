@@ -33,6 +33,7 @@ operations and real kubelet/aggregation TLS acceptance remain separate from CI.
 | Live operations | See [local kind](../local-kind.md) and [Argo CD](../local-argocd.md) | Explicit `--execute`, selected state root, target checks, and separate authorization. |
 | Argo Workflows release asset | `make workflows-asset-check` | Network-only verification of the official manifest digest, resource inventory and namespace-scoped RBAC; no cluster access. |
 | Isolated consumer Argo assets | `make delegated-argo-asset-check` | Network-only verification of selected CD/Workflows bytes; also included in the existing asset job. |
+| Isolated network assets | `make network-asset-check` | Network-only integrity checks for Cilium/Gateway CRDs, real Helm v4.1.4 rendering, image/authority/resource checks; included in the existing asset job. |
 
 `make docs` remains an alias for `make docs-check` so existing contributor
 commands continue to work. The validation job calls the Make targets rather
@@ -65,6 +66,11 @@ never invokes Docker, kind, kubectl, or a cluster.
 Unit tests exercise identity, refusal, timeout, failure, and recovery behavior
 with process boundaries replaced. A successful offline run is not evidence of
 a successful live cutover.
+
+Networking tests include real loopback SSL trust/hostname verification, without
+a cluster or host trust-store change. Kubernetes exec failures cannot count as
+policy denial. Actual packet enforcement and Gateway/TLS evidence require the
+separately authorized [native network qualification](../networking-and-ingress.md).
 
 ## Extending the harness
 

@@ -19,7 +19,8 @@ NODE_FORMAT = (
     '"cluster":{{json (index .Config.Labels "io.x-k8s.kind.cluster")}},'
     '"role":{{json (index .Config.Labels "io.x-k8s.kind.role")}},'
     '"memory":{{json .HostConfig.Memory}},"cpu":{{json .HostConfig.NanoCpus}},'
-    '"pids":{{json .HostConfig.PidsLimit}},"image":{{json .Config.Image}}}'
+    '"pids":{{json .HostConfig.PidsLimit}},"image":{{json .Config.Image}},'
+    '"ports":{{json .HostConfig.PortBindings}}}'
 )
 
 
@@ -135,7 +136,27 @@ def inspect_node(target: Target, reference: str, name: str) -> dict[str, Any]:
         or not re.fullmatch(r"[a-f0-9]{64}", node.get("id", ""))
     ):
         raise ValueError("Foreign node container identity")
+    if target.profile == "isolated-network-local":
+        verify_listener(target, node)
     return node
+
+
+def verify_listener(target: Target, node: dict) -> None:
+    """New network profiles publish only loopback API and the reviewed HTTPS port."""
+    ports = node.get("ports", {})
+    if node["role"] == "worker":
+        expected = {"8443/tcp": [{"HostIp": "127.0.0.1", "HostPort": str(target.https_port)}]}
+        if ports != expected:
+            raise ValueError("Worker listener differs from the reviewed loopback HTTPS mapping")
+    else:
+        bindings = ports.get("6443/tcp", [])
+        if (
+            set(ports) != {"6443/tcp"}
+            or len(bindings) != 1
+            or bindings[0].get("HostIp") != "127.0.0.1"
+            or not bindings[0].get("HostPort", "").isdecimal()
+        ):
+            raise ValueError("Network profile API listener is not exclusively loopback")
 
 
 def verify_context(target: Target) -> None:

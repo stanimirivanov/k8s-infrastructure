@@ -64,4 +64,8 @@ jobs:
         with:
           version: "0.12.5"
       - run: uv sync --locked
+      - name: Install Helm for pinned networking render
+        uses: azure/setup-helm@v5
+        with:
+          version: v4.1.4
       - run: make workflows-asset-check

@@ -141,6 +141,12 @@ usable login or SSO trust is created here. Perfeng settings/access are unchanged
 
 ## Native disposable qualification
 
+The [network-capable profile](networking-and-ingress.md) is also accepted with
+its explicit `--https-port` on every command. Its application grants additionally
+cover namespaced Gateways, HTTPRoutes and CiliumNetworkPolicies. Existing profiles
+keep their prior grants; combined Argo/network/application capacity needs its
+own qualification. Networking does not automatically expose the Argo servers.
+
 Authorize exact cluster/context/state, neutral namespaces, controllers/APIs,
 admission, workflow fixture/restart, removal and disposal. Coordinate an idle host
 window: initial bootstrap is uncapped, and clusters share host/engine resources.

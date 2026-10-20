@@ -38,7 +38,7 @@ def binding(name: str, namespace: str, role: str, account: str, account_ns: str)
     )
 
 
-def delegated_roles(delegation: Delegation) -> list[dict[str, Any]]:
+def delegated_roles(delegation: Delegation, *, networking: bool = False) -> list[dict[str, Any]]:
     """Release identities cannot author templates, execute Pods, or read Secrets."""
     ns = delegation.managed
     documents = []
@@ -95,6 +95,21 @@ def delegated_roles(delegation: Delegation) -> list[dict[str, Any]]:
             ["get", "list", "watch", "create", "update", "patch", "delete"],
         ),
     ]
+    if networking:
+        workload_rules.extend(
+            [
+                rule(
+                    "gateway.networking.k8s.io",
+                    ["gateways", "httproutes"],
+                    ["get", "list", "watch", "create", "update", "patch", "delete"],
+                ),
+                rule(
+                    "cilium.io",
+                    ["ciliumnetworkpolicies"],
+                    ["get", "list", "watch", "create", "update", "patch", "delete"],
+                ),
+            ]
+        )
     for namespace in delegation.workload_namespaces:
         documents.extend(
             [

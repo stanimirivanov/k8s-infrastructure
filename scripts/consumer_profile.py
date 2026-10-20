@@ -14,7 +14,7 @@ import yaml
 from .local_kind import NODE_IMAGE, ROOT, normalize_state_root
 
 PROFILE = ROOT / "clusters/local-kind/isolated-local/profile.yaml"
-PROFILES = ("isolated-local", "isolated-argo-local")
+PROFILES = ("isolated-local", "isolated-argo-local", "isolated-network-local")
 LABEL = "k8s-infrastructure.io/consumer"
 
 
@@ -32,8 +32,8 @@ def load_profile(path: Path | None = None, *, name: str = "isolated-local") -> d
         "minimumEngine": {"cpus": 4, "memoryBytes": 12 * 1024**3},
         "nodes": {
             "control-plane": {
-                "cpus": 2 if name == "isolated-argo-local" else 1,
-                "memoryBytes": (4 if name == "isolated-argo-local" else 2) * 1024**3,
+                "cpus": 1 if name == "isolated-local" else 2,
+                "memoryBytes": (2 if name == "isolated-local" else 4) * 1024**3,
             },
             "worker": {"cpus": 2, "memoryBytes": 4 * 1024**3},
         },
@@ -57,10 +57,16 @@ class Target:
     docker_context: str
     state_root: Path
     profile: str = "isolated-local"
+    https_port: int | None = None
 
     def __post_init__(self) -> None:
         if self.profile not in PROFILES:
             raise ValueError("Unknown reviewed isolated consumer profile")
+        if self.profile == "isolated-network-local":
+            if type(self.https_port) is not int or not 1024 <= self.https_port <= 65535:
+                raise ValueError("Networking profile requires explicit HTTPS host port 1024-65535")
+        elif self.https_port is not None:
+            raise ValueError("Existing profiles do not accept an HTTPS listener or CNI change")
         if not re.fullmatch(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*", self.consumer):
             raise ValueError("Consumer must be a lowercase slug")
         if len(self.consumer) > 32 or self.consumer in {"perfeng", "perfeng-local"}:
@@ -94,9 +100,9 @@ class Target:
 
 
 def configuration(target: Target) -> dict[str, Any]:
-    """No host mounts, workload namespaces, fixed host ports or Perfeng placement labels."""
+    """No host mounts or Perfeng placement; only the network profile maps explicit loopback HTTPS."""
     profile = load_profile(name=target.profile)
-    return {
+    result: dict[str, Any] = {
         "kind": "Cluster",
         "apiVersion": "kind.x-k8s.io/v1alpha4",
         "name": target.name,
@@ -110,6 +116,21 @@ def configuration(target: Target) -> dict[str, Any]:
             for role in profile["nodes"]
         ],
     }
+    if target.profile == "isolated-network-local":
+        result["networking"] = {
+            **result["networking"],
+            "disableDefaultCNI": True,
+            "kubeProxyMode": "none",
+        }
+        result["nodes"][1]["extraPortMappings"] = [
+            {
+                "containerPort": 8443,
+                "hostPort": target.https_port,
+                "listenAddress": "127.0.0.1",
+                "protocol": "TCP",
+            }
+        ]
+    return result
 
 
 def identity(target: Target) -> dict[str, str]:
@@ -117,7 +138,7 @@ def identity(target: Target) -> dict[str, str]:
     encoded = json.dumps(
         load_profile(name=target.profile), sort_keys=True, separators=(",", ":")
     ).encode()
-    return {
+    result = {
         "format": "isolated-local-owner.v1",
         "consumer": target.consumer,
         "name": target.name,
@@ -126,3 +147,6 @@ def identity(target: Target) -> dict[str, str]:
         "profile": target.profile,
         "profileDigest": f"sha256:{hashlib.sha256(encoded).hexdigest()}",
     }
+    if target.profile == "isolated-network-local":
+        result["httpsPort"] = str(target.https_port)
+    return result
