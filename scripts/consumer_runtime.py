@@ -19,7 +19,7 @@ NODE_FORMAT = (
     '{"id":{{json .Id}},"name":{{json .Name}},'
     '"cluster":{{json (index .Config.Labels "io.x-k8s.kind.cluster")}},'
     '"role":{{json (index .Config.Labels "io.x-k8s.kind.role")}},'
-    '"memory":{{json .HostConfig.Memory}},"cpu":{{json .HostConfig.NanoCpus}},'
+    '"memory":{{json .HostConfig.Memory}},"swap":{{json .HostConfig.MemorySwap}},"cpu":{{json .HostConfig.NanoCpus}},'
     '"pids":{{json .HostConfig.PidsLimit}},"image":{{json .Config.Image}},'
     '"ports":{{json .HostConfig.PortBindings}}}'
 )

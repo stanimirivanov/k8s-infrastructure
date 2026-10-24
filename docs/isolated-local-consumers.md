@@ -104,7 +104,8 @@ uv run --locked python -m scripts.consumer_kind up \
 
 Existing state with `isolated-network-local` must refuse this selection. Do not
 edit its owner record, remove backups or recreate the target. The explicit
-retained transition is a separate, not-yet-implemented capability. Any execute,
+retained transition is a [separate explicit capability](retained-profile-transition.md)
+with live qualification pending. Any execute,
 cleanup, engine resize or qualification needs exact-target authorization.
 
 ## Offline preview

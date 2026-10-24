@@ -91,7 +91,13 @@ class Target:
         return self.state_root / ".local"
 
     def path(self, suffix: str) -> Path:
-        if suffix not in {"kubeconfig", "owner.json", "kind.yaml"}:
+        if suffix not in {
+            "kubeconfig",
+            "owner.json",
+            "kind.yaml",
+            "transition.json",
+            "transition.lock",
+        }:
             raise ValueError("Unknown consumer state path")
         path = self.directory / f"{self.name}.{suffix}"
         for candidate in (path, path.parent):

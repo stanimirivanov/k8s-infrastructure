@@ -27,6 +27,9 @@ def read_bounded(path: Path, maximum: int = 65536) -> str:
 
 def reserve(target: Target, endpoint: str) -> dict[str, Any]:
     """Exclusive files establish a claim before kind can create the unique target."""
+    from .profile_transition_state import reject_pending
+
+    reject_pending(target)
     paths = [target.path(suffix) for suffix in ("owner.json", "kind.yaml", "kubeconfig")]
     if any(path.exists() for path in paths):
         raise ValueError("Consumer state exists; refusing replacement or implicit adoption")
@@ -53,6 +56,9 @@ def reserve(target: Target, endpoint: str) -> dict[str, Any]:
 
 def load(target: Target) -> dict[str, Any]:
     """A matching name/kubeconfig without this exact ownership record is never adopted."""
+    from .profile_transition_state import reject_pending
+
+    reject_pending(target)
     record = json.loads(read_bounded(target.path("owner.json"), 16384))
     expected = identity(target)
     if (

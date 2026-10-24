@@ -11,8 +11,9 @@
   no engine resize, node change, state rewrite or Stage B activation is authorized.
 - Resolve host eligibility, implement an explicit transition and qualify it on a
   disposable target before requesting retained-target execution approval.
-- Fresh full-profile lifecycle is implemented; retained migration and live
-  full-installation qualification remain pending.
+- Fresh full-profile lifecycle and explicit retained transition tooling are
+  implemented. [Use the transition procedure](../retained-profile-transition.md);
+  live disposable/full-installation qualification and retained execution remain pending.
 - D06 remains incomplete until provider handoff and the consumer's persistent
   installation acceptance pass. This document is a plan, not a live runbook.
 
@@ -161,7 +162,7 @@ and restore remain the separate D07 boundary.
 | PR-sized slice | Scope and verification before merge/use | Dependency |
 |:--|:--|:--|
 | Full-profile lifecycle (implemented; unqualified) | Implement the versioned profile across fresh creation, identity, health, rendering and handoff; retain existing profiles; test exact accounting and rejection; run `make validate` | Approved design; live use still blocked on Gate 1 |
-| Retained transition capability | Implement the bounded journaled protocol, private versioned backups, preflight and explicit recovery; test ownership drift, races, stale paths and every interruption boundary, including real Linux shell fixtures; run `make validate` | Full-profile lifecycle (implemented; unqualified) |
+| Retained transition capability (implemented; unqualified) | Implement the bounded journaled protocol, private versioned backups, preflight and explicit recovery; test ownership drift, races, stale paths and every interruption boundary, including real Linux shell fixtures; run `make validate` | Full-profile lifecycle (implemented; unqualified) |
 | Qualification and operational procedure | Exercise the reviewed disposable transition and complete capacity envelope under separately authorized live scopes; document evidence requirements and tested recovery; run `make validate`; keep unproven gates pending | Both provider slices and eligible host; consumer full-stack accounting may progress in parallel |
 | D06 consumer handoff | In fleetiq-deploy, pin qualified merged provider, refresh render/quotas and release evidence, prepare exact retained transition and Stage B requests, then record separately authorized results; pass affected deployment checks | Qualified provider and resolved host/identity prerequisites |
 
