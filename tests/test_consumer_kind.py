@@ -64,7 +64,17 @@ def ready(target):
                         ],
                     ],
                     "nodeInfo": {"kubeletVersion": "v1.35.0"},
-                    "allocatable": {"cpu": "2", "memory": "1500Mi", "pods": "110"},
+                    "capacity": {"cpu": "4", "memory": "16Gi"},
+                    "allocatable": {
+                        "cpu": f"{load_profile(name=target.profile)['nodes'][name.removeprefix(f'{target.name}-')]['cpus'] * 1000 - 250}m",
+                        "memory": str(
+                            load_profile(name=target.profile)["nodes"][
+                                name.removeprefix(f"{target.name}-")
+                            ]["memoryBytes"]
+                            - 612 * 1024**2
+                        ),
+                        "pods": "110",
+                    },
                 },
             }
             for name in nodes(target)
@@ -94,7 +104,7 @@ class ConsumerTests(unittest.TestCase):
         def kubectl(_target, args):
             return json.dumps(ready(self.target)) if args[:2] == ["get", "nodes"] else ""
 
-        mocks = {}
+        mocks = {"capacity": stack.enter_context(patch("scripts.consumer_capacity.configure"))}
         selections: dict[str, dict[str, Any]] = {
             "prerequisites": {"return_value": ENDPOINT},
             "clusters": {"return_value": [self.target.name] if existing else []},
@@ -284,11 +294,27 @@ class ConsumerTests(unittest.TestCase):
         else:
             self.target.directory.unlink()
 
+    def test_capacity_setup_runs_after_caps_and_failure_retains_partial_identity(self):
+        mocks = self.mock_runtime(existing=False)
+
+        def refuse(_target):
+            updates = [c for c in mocks["command"].call_args_list if "update" in c.args[1]]
+            self.assertEqual(len(updates), 2)
+            self.assertEqual(state.load(self.target)["phase"], "provisioned")
+            raise ValueError("capacity reconciliation failed")
+
+        mocks["capacity"].side_effect = refuse
+        with self.assertRaisesRegex(ValueError, "capacity reconciliation failed"):
+            lifecycle.create(self.target)
+        self.assertEqual(state.load(self.target)["phase"], "partial")
+        self.assertEqual(state.load(self.target)["incarnation"], UID)
+
     def test_creation_records_identity_and_bounds_only_its_owned_node_ids(self):
         mocks = self.mock_runtime(existing=False)
         observed = lifecycle.create(self.target)
         record = state.load(self.target)
         self.assertEqual(record["phase"], "ready")
+        mocks["capacity"].assert_called_once_with(self.target)
         self.assertEqual(observed["incarnation"], UID)
         self.assertEqual(observed["baseReadiness"], "observed")
         self.assertIn("network policy", observed["capabilitiesNotQualified"])

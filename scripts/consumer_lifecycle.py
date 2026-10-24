@@ -134,6 +134,9 @@ def create(target: Target) -> dict[str, Any]:
                 ],
             )
         runtime.verify_nodes(runtime.node_identity(target), profile=target.profile)
+        from .consumer_capacity import configure
+
+        configure(target)
         if target.profile == "isolated-network-local":
             from .network_runtime import install
 

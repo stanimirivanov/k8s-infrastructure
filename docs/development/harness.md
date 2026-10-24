@@ -87,3 +87,14 @@ CI at the appropriate tier. Keep live plan, apply, and destroy operations
 distinct, target-verified, and outside `make verify` and `make validate`.
 Recurring review findings should become a focused checker or clearer guidance
 when a deterministic local check can catch them early.
+
+## Capped-node capacity regression controls
+
+The existing unit gate verifies exact scheduler envelopes, host-sized legacy
+rejection, two-node preflight, config/UID races and partial-restart refusal.
+Linux CI additionally executes real shell fixtures for atomic replacement,
+original-byte backup, stale-file/symlink rejection and private permissions.
+Windows runs the same pure/runtime tests but cannot execute a Linux node shell;
+its platform-specific fixture skips do not claim live qualification. The tested
+[sizing proposal](../capacity/fleetiq-full-installation.yaml) is never selectable.
+Live scheduler/pressure and retained repair require a separately approved target.
