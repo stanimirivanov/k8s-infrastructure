@@ -6,7 +6,13 @@ from typing import Any
 
 from . import consumer_runtime as runtime
 from . import consumer_state as state
-from .consumer_profile import NETWORK_PROFILES, Target, identity, load_profile
+from .consumer_profile import (
+    NETWORK_PROFILES,
+    TRANSITION_TEST_PROFILE,
+    Target,
+    identity,
+    load_profile,
+)
 from .local_kind import ROOT
 
 
@@ -45,6 +51,11 @@ def observe(target: Target, *, wait: bool = False) -> dict[str, Any]:
         "nodeAllocatable": nodes,
         "containerBudgets": load_profile(name=target.profile)["nodes"],
         "baseReadiness": "observed",
+        **(
+            {"testOnly": True, "qualificationScope": "disposable memory-transition protocol only"}
+            if target.profile == TRANSITION_TEST_PROFILE
+            else {}
+        ),
         "capabilitiesNotQualified": [
             "shared-host performance isolation",
             "network policy",
@@ -55,7 +66,7 @@ def observe(target: Target, *, wait: bool = False) -> dict[str, Any]:
             "consumer workload acceptance",
             *(
                 ["full-installation capacity and performance"]
-                if target.profile == "isolated-network-full-local"
+                if target.profile in {"isolated-network-full-local", TRANSITION_TEST_PROFILE}
                 else []
             ),
         ],

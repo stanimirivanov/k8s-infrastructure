@@ -9,7 +9,7 @@ from pathlib import Path
 import yaml
 
 from . import consumer_lifecycle as lifecycle
-from .consumer_profile import PROFILES, Target, configuration, load_profile
+from .consumer_profile import PROFILES, TRANSITION_TEST_PROFILE, Target, configuration, load_profile
 from .node_capacity import POLICY, envelope
 
 
@@ -40,6 +40,11 @@ def preview(action: str, target: Target) -> dict:
             "down": "Permanently delete only the confirmed owned cluster and its dedicated state files",
         }[action],
         "execution": "not-performed",
+        **(
+            {"testOnly": True, "qualificationScope": "disposable memory-transition protocol only"}
+            if target.profile == TRANSITION_TEST_PROFILE
+            else {}
+        ),
         **(
             {"fullInstallationQualification": "pending; separate live acceptance required"}
             if target.profile == "isolated-network-full-local"

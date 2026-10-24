@@ -90,7 +90,7 @@ def reject_pending(target: Target) -> None:
     ):
         raise ValueError("Retained profile transition is unfinished; explicit recovery required")
     from .consumer_profile import identity
-    from .profile_transition_model import PREDECESSOR, paired
+    from .profile_transition_model import PREDECESSOR, request_successor
 
     predecessor = Target(
         target.consumer, target.docker_context, target.state_root, PREDECESSOR, target.https_port
@@ -102,7 +102,7 @@ def reject_pending(target: Target) -> None:
             "Completed transition journal is malformed; inspect private state"
         ) from None
     before = json.loads(journal["predecessorOwner"])
-    expected = {**before, **identity(paired(predecessor))}
+    expected = {**before, **identity(request_successor(predecessor, journal["request"]))}
     current = json.loads(read(target.path("owner.json")))
     # Normal deletion changes phase only. It must not invalidate retained history.
     current["phase"] = expected["phase"]

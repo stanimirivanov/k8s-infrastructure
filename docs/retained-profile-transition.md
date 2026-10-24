@@ -1,7 +1,8 @@
 # Retained network-profile transition
 
 - Status: Implementation available; live disposable qualification pending
-- Supported pair: `isolated-network-local` → `isolated-network-full-local`
+- Default pair: `isolated-network-local` → `isolated-network-full-local`
+- Disposable test successor: `isolated-network-transition-test-local`; explicit selection required
 
 ## TL;DR
 
@@ -9,12 +10,55 @@
   private-file access, node enlargement and restart scope are approved.
 - Use `scripts.consumer_transition`; changing `--profile` or editing owner state
   is not a migration. This command never resizes/restarts Docker or replaces nodes.
-- The engine must already meet eight CPUs/24Gi. Reconcile other clusters' capacity
+- The full-profile engine must already meet eight CPUs/24Gi. Reconcile other clusters' capacity
   effects separately; this command does not grant engine-change authority.
 - Preserve the private journal and both original/versioned backups on failure.
   Review the recorded phase before explicitly using `recover`.
 - This tooling is not live qualification or Stage B/D06 acceptance. Follow the
   [full-installation transition plan](migrations/fleetiq-full-installation-transition.md).
+
+## Minimal disposable testing
+
+For protocol testing on a four-CPU engine, explicitly select
+`--successor-profile isolated-network-transition-test-local`. The consumer must
+start with `qual-`; a normal consumer, including `fleetiq`, is refused. There is
+no automatic fallback from the full profile. The approved full profile and its
+8-CPU/24Gi engine requirement remain unchanged.
+
+| Budget | Predecessor (each node) | Test successor (each node) |
+|:--|--:|--:|
+| Docker cap | 2 CPUs / 4Gi | 2 CPUs / 5Gi |
+| Pod envelope | 1750m / 3484Mi | 1750m / 4508Mi |
+| Minimum engine | 4 CPUs / 12Gi | 4 CPUs / 14Gi |
+
+The final test node caps total 10Gi; the engine minimum includes another 4Gi.
+Creation/bootstrap remains temporarily uncapped. Check actual available host and
+guest memory, free backing storage and other project demand before requesting
+live approval. A configured 14Gi engine is not a reservation or proof of free
+memory. The full-design 24Gi available-host-memory/30Gi disk admission ledger is
+not rewritten by this separate test; a bounded disposable test needs its own
+reviewed demand and disk plan. Current free space alone does not authorize it.
+
+Example **offline** transition preview with a prepared private state directory:
+
+```sh
+uv run --locked python -m scripts.consumer_transition preview \
+  --consumer qual-small --docker-context default \
+  --state-root ../qual-small-state --https-port 18445 \
+  --successor-profile isolated-network-transition-test-local
+```
+
+The disposable predecessor is still created using `--profile isolated-network-local`.
+Use the test-successor flag consistently for inspect, apply and recover. Its
+exact digest must appear in the request; changing to the full successor during
+recovery is refused. Both profiles use the same node image and CNI assets; all
+journal, backup, identity, readiness and recovery checks remain enabled.
+
+Results identify memory-transition protocol scope. They can prove memory growth
+on both original nodes and guarded recovery, but not CPU growth, unexercised
+engine rebasing, full-stack performance or Stage B/D06 acceptance. See
+[ADR 0010](decisions/0010-disposable-transition-test-profile.md). Do not use the
+test profile as a replacement installation target or promotion artifact.
 
 ## Preconditions and inputs
 
@@ -105,7 +149,7 @@ container's `/var/lib/kubelet/config.yaml` SHA-256 from an explicitly authorized
 bounded inspection. Do not export its contents. Both capacities use Kubernetes
 CPU/memory quantity strings; old capacity is evidence, not a guessed host size.
 
-The request permits only the reviewed profile pair and binds both digests,
+The request permits only the default pair or explicit disposable test successor and binds both digests,
 source, distinct IDs/UIDs and config hashes. Any changed request requires a new
 review; `recover` requires the identical request saved in the journal.
 
@@ -167,7 +211,7 @@ verify allocatable, Ready/pressure and foundation readiness before advancing.
 Each execution issues at most one restart per unverified node. A later explicit
 recovery may repeat a restart whose completion was not durably recorded.
 
-Finalization proves both full envelopes and foundation readiness, journals the
+Finalization proves both selected successor envelopes and foundation readiness, journals the
 commit boundary, atomically replaces only the owner record, then marks completion.
 The original nonce, endpoint, container IDs, incarnation, kind/access bytes and
 predecessor owner evidence survive. Full-stack acceptance remains pending.

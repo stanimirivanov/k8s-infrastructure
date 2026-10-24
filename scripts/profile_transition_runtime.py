@@ -11,7 +11,7 @@ from . import consumer_runtime as runtime
 from . import consumer_state as owner
 from . import profile_transition_private as private
 from . import profile_transition_state as store
-from .consumer_profile import Target, identity, load_profile
+from .consumer_profile import TRANSITION_TEST_PROFILE, Target, identity, load_profile
 from .node_capacity import verify_allocatable
 from .profile_transition_model import (
     FORMAT,
@@ -20,14 +20,14 @@ from .profile_transition_model import (
     digest,
     encoded,
     machine,
-    paired,
+    request_successor,
     validate_request,
 )
 
 
 def successor_owner(target: Target, journal: dict) -> bytes:
     previous = json.loads(journal["predecessorOwner"])
-    return encoded({**previous, **identity(paired(target))})
+    return encoded({**previous, **identity(request_successor(target, journal["request"]))})
 
 
 def foundation(target: Target) -> tuple[list, bool]:
@@ -95,7 +95,7 @@ def foundation(target: Target) -> tuple[list, bool]:
 
 def bind(target: Target, request: dict, journal: dict | None = None) -> tuple[bytes, dict, dict]:
     """Observe exact reviewed identities without passing unfinished state to ensure."""
-    successor = paired(target)
+    successor = request_successor(target, request)
     runtime.prerequisites(successor, creating=True)
     source = lifecycle.source_identity(target)
     if (
@@ -190,7 +190,9 @@ def preflight(target: Target, request: dict) -> dict:
         observed, config = capacity.read_configuration(target, node["containerId"])
         if observed != node["oldConfigSha256"]:
             raise ValueError("Predecessor config hash differs from reviewed request")
-        desired = desired_configuration(config, node, role)
+        desired = desired_configuration(
+            config, node, role, successor_profile=request_successor(target, request).profile
+        )
         private.execute(
             target, node["containerId"], private.PREFLIGHT, request["operationId"], observed
         )
@@ -237,7 +239,9 @@ def guarded(target: Target, journal: dict) -> dict:
     for role, stage in journal["stages"].items():
         actual = containers[f"{target.name}-{role}"]
         before = load_profile(name=target.profile)["nodes"][role]
-        after = load_profile(name=paired(target).profile)["nodes"][role]
+        after = load_profile(name=request_successor(target, journal["request"]).profile)["nodes"][
+            role
+        ]
         permitted = (
             [before]
             if stage == "pending"
@@ -281,7 +285,7 @@ def guarded(target: Target, journal: dict) -> dict:
 
 def wait_node(target: Target, journal: dict, role: str) -> None:
     deadline = time.monotonic() + 120
-    budget = load_profile(name=paired(target).profile)["nodes"][role]
+    budget = load_profile(name=request_successor(target, journal["request"]).profile)["nodes"][role]
     while True:
         _, _, nodes = bind(target, journal["request"], journal)
         node = nodes[role]
@@ -324,7 +328,12 @@ def advance(target: Target, journal: dict, *, recovery: bool) -> None:
         original = private.backup_configuration(
             target, node["containerId"], operation, node["oldConfigSha256"]
         )
-        desired = desired_configuration(original, node, role)
+        desired = desired_configuration(
+            original,
+            node,
+            role,
+            successor_profile=request_successor(target, journal["request"]).profile,
+        )
         if digest(encoded(desired)) != journal["desiredHashes"][role]:
             raise ValueError("Recorded desired policy changed")
         if journal["stages"][role] == "pending":
@@ -334,7 +343,9 @@ def advance(target: Target, journal: dict, *, recovery: bool) -> None:
             store.save(target, journal)
         if journal["stages"][role] == "cap-intent":
             containers = guarded(target, journal)
-            budget = load_profile(name=paired(target).profile)["nodes"][role]
+            budget = load_profile(name=request_successor(target, journal["request"]).profile)[
+                "nodes"
+            ][role]
             if not check_caps(containers[f"{target.name}-{role}"], budget):
                 runtime.command(
                     target,
@@ -386,7 +397,7 @@ def advance(target: Target, journal: dict, *, recovery: bool) -> None:
 
 
 def finalize(target: Target, journal: dict, *, recovery: bool) -> dict:
-    successor = paired(target)
+    successor = request_successor(target, journal["request"])
     guarded(target, journal)
     runtime.verify_nodes(runtime.node_identity(target), profile=successor.profile)
     runtime.read_readiness(successor, wait=True)
@@ -416,6 +427,13 @@ def finalize(target: Target, journal: dict, *, recovery: bool) -> dict:
         "originalRepairBackupsRetained": True,
         "kindAndKubeconfigBytesPreserved": True,
         "liveFullInstallationQualification": "pending",
+        **(
+            {
+                "qualificationScope": "disposable memory-transition protocol only; CPU growth and full installation unqualified"
+            }
+            if successor.profile == TRANSITION_TEST_PROFILE
+            else {}
+        ),
     }
 
 
