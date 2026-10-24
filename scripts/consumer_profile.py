@@ -14,8 +14,13 @@ import yaml
 from .local_kind import NODE_IMAGE, ROOT, normalize_state_root
 
 PROFILE = ROOT / "clusters/local-kind/isolated-local/profile.yaml"
-# Both profiles require the same pinned CNI and exclusive loopback listener.
-NETWORK_PROFILES = ("isolated-network-local", "isolated-network-full-local")
+# Network profiles share pinned CNI assets and an exclusive loopback listener.
+TRANSITION_TEST_PROFILE = "isolated-network-transition-test-local"
+NETWORK_PROFILES = (
+    "isolated-network-local",
+    "isolated-network-full-local",
+    TRANSITION_TEST_PROFILE,
+)
 PROFILES = ("isolated-local", "isolated-argo-local", *NETWORK_PROFILES)
 LABEL = "k8s-infrastructure.io/consumer"
 
@@ -26,20 +31,32 @@ def load_profile(path: Path | None = None, *, name: str = "isolated-local") -> d
         raise ValueError("Unknown reviewed isolated consumer profile")
     selected = path or ROOT / "clusters/local-kind" / name / "profile.yaml"
     value = yaml.safe_load(selected.read_text(encoding="utf-8"))
-    full = name == "isolated-network-full-local"
+    minimum = {"cpus": 4, "memoryBytes": 12 * 1024**3}
+    nodes = {
+        "control-plane": {
+            "cpus": 1 if name == "isolated-local" else 2,
+            "memoryBytes": (2 if name == "isolated-local" else 4) * 1024**3,
+        },
+        "worker": {"cpus": 2, "memoryBytes": 4 * 1024**3},
+    }
+    if name == "isolated-network-full-local":
+        minimum = {"cpus": 8, "memoryBytes": 24 * 1024**3}
+        nodes = {
+            "control-plane": {"cpus": 4, "memoryBytes": 6 * 1024**3},
+            "worker": {"cpus": 4, "memoryBytes": 14 * 1024**3},
+        }
+    elif name == TRANSITION_TEST_PROFILE:
+        minimum = {"cpus": 4, "memoryBytes": 14 * 1024**3}
+        nodes = {
+            role: {"cpus": 2, "memoryBytes": 5 * 1024**3} for role in ("control-plane", "worker")
+        }
     expected = {
         "version": 1,
         "profile": name,
         "kindVersion": "v0.31.0",
         "nodeImage": NODE_IMAGE,
-        "minimumEngine": {"cpus": 8 if full else 4, "memoryBytes": (24 if full else 12) * 1024**3},
-        "nodes": {
-            "control-plane": {
-                "cpus": 4 if full else 1 if name == "isolated-local" else 2,
-                "memoryBytes": (6 if full else 2 if name == "isolated-local" else 4) * 1024**3,
-            },
-            "worker": {"cpus": 4 if full else 2, "memoryBytes": (14 if full else 4) * 1024**3},
-        },
+        "minimumEngine": minimum,
+        "nodes": nodes,
     }
     try:
         matches = json.dumps(value, sort_keys=True, allow_nan=False) == json.dumps(
@@ -65,6 +82,8 @@ class Target:
     def __post_init__(self) -> None:
         if self.profile not in PROFILES:
             raise ValueError("Unknown reviewed isolated consumer profile")
+        if self.profile == TRANSITION_TEST_PROFILE and not self.consumer.startswith("qual-"):
+            raise ValueError("Transition test profile requires a disposable qual- consumer")
         if self.profile in NETWORK_PROFILES:
             if type(self.https_port) is not int or not 1024 <= self.https_port <= 65535:
                 raise ValueError("Networking profile requires explicit HTTPS host port 1024-65535")

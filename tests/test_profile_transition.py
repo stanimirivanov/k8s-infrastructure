@@ -38,13 +38,17 @@ BASE = {
 }
 
 
-class TransitionTests(unittest.TestCase):
+class TransitionFixture(unittest.TestCase):
+    CONSUMER = "neutral"
+    SUCCESSOR_PROFILE = model.SUCCESSOR
+    CURRENT_MACHINE = NEW_MACHINE
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name).resolve()
-        self.target = Target("neutral", "local-engine", self.root, model.PREDECESSOR, 18443)
-        self.successor = model.paired(self.target)
+        self.target = Target(self.CONSUMER, "local-engine", self.root, model.PREDECESSOR, 18443)
+        self.successor = model.paired(self.target, successor_profile=self.SUCCESSOR_PROFILE)
         self.configs = {}
         self.containers: dict[str, dict[str, Any]] = {}
         self.statuses: dict[str, dict[str, Any]] = {}
@@ -71,14 +75,14 @@ class TransitionTests(unittest.TestCase):
                     "name": name,
                     "uid": uid,
                     "labels": {
-                        LABEL: "neutral",
+                        LABEL: self.target.consumer,
                         "k8s-infrastructure.io/role": role,
                         "kubernetes.io/os": "linux",
                         "kubernetes.io/arch": "amd64",
                     },
                 },
                 "status": {
-                    "capacity": NEW_MACHINE,
+                    "capacity": self.CURRENT_MACHINE,
                     "nodeInfo": {"kubeletVersion": "v1.35.0"},
                     "allocatable": {"cpu": "5750m", "memory": "19Gi", "pods": "110"},
                     "conditions": [
@@ -97,7 +101,7 @@ class TransitionTests(unittest.TestCase):
                 "uid": uid,
                 "oldConfigSha256": model.digest(self.configs[node_id]),
                 "oldMachineCapacity": copy.deepcopy(OLD_MACHINE),
-                "newMachineCapacity": copy.deepcopy(NEW_MACHINE),
+                "newMachineCapacity": copy.deepcopy(self.CURRENT_MACHINE),
             }
         self.request: dict[str, Any] = {
             "format": model.FORMAT,
@@ -169,13 +173,13 @@ class TransitionTests(unittest.TestCase):
         )
         self.events.append(("cap" if "update" in args else "restart", role))
         if "update" in args:
-            budget = load_profile(name=model.SUCCESSOR)["nodes"][role]
+            budget = load_profile(name=self.successor.profile)["nodes"][role]
             self.containers[f"{self.target.name}-{role}"].update(
                 cpu=budget["cpus"] * 10**9, memory=budget["memoryBytes"], swap=budget["memoryBytes"]
             )
             self.interrupt(f"cap-{role}")
         elif args[-3:] == ["systemctl", "restart", "kubelet"]:
-            expected = envelope(load_profile(name=model.SUCCESSOR)["nodes"][role])
+            expected = envelope(load_profile(name=self.successor.profile)["nodes"][role])
             self.statuses[role]["status"]["allocatable"].update(
                 cpu=f"{expected['cpuMillicores']}m", memory=str(expected["memoryBytes"])
             )
@@ -217,6 +221,8 @@ class TransitionTests(unittest.TestCase):
     def run_transition(self, action="apply"):
         return transition.execute(self.target, self.request, action)
 
+
+class TransitionTests(TransitionFixture):
     def test_success_preserves_identity_access_original_policy_and_backups(self):
         result = self.run_transition()
         self.assertEqual(result["profile"], model.SUCCESSOR)
@@ -248,7 +254,8 @@ class TransitionTests(unittest.TestCase):
             self.assertEqual(new["privateMarker"], BASE["privateMarker"])
             self.assertEqual(old["systemReserved"]["cpu"], "2000m")
             verify_allocatable(
-                self.statuses[role]["status"], load_profile(name=model.SUCCESSOR)["nodes"][role]
+                self.statuses[role]["status"],
+                load_profile(name=self.successor.profile)["nodes"][role],
             )
 
     def test_partial_native_boundaries_require_explicit_recovery(self):

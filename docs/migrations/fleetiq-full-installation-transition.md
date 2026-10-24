@@ -36,6 +36,11 @@ substitute a matching cluster name for identity.
 transition contract. Its implementation and exact live execution require further
 review; design approval does not grant either operation implicitly.
 
+The [minimal disposable profile](../retained-profile-transition.md#minimal-disposable-testing)
+can exercise the transition/recovery protocol on a four-CPU engine. Its evidence
+must remain separate from full-profile qualification; it does not satisfy the
+host/engine or Stage B gates below.
+
 ## Gate 1: Eligible host and engine
 
 | Requirement | Required evidence before execution |

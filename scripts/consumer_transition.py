@@ -8,14 +8,15 @@ from pathlib import Path
 
 import yaml
 
-from .consumer_profile import Target
-from .profile_transition_model import PREDECESSOR, preview
+from .consumer_profile import Target, identity
+from .profile_transition_model import PREDECESSOR, SUCCESSOR, SUCCESSORS, paired, preview
 from .profile_transition_state import read
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("preview", "inspect", "apply", "recover"))
+    parser.add_argument("--successor-profile", choices=SUCCESSORS, default=SUCCESSOR)
     parser.add_argument("--consumer", required=True)
     parser.add_argument("--docker-context", required=True)
     parser.add_argument("--state-root", type=Path, required=True)
@@ -29,7 +30,7 @@ def main(argv: list[str] | None = None) -> int:
             args.consumer, args.docker_context, args.state_root, PREDECESSOR, args.https_port
         )
         if not args.execute:
-            result = preview(target)
+            result = preview(target, successor_profile=args.successor_profile)
         else:
             if args.action == "preview" or args.request is None:
                 raise ValueError(
@@ -41,7 +42,14 @@ def main(argv: list[str] | None = None) -> int:
                 )
             from .profile_transition_runtime import execute
 
-            result = execute(target, json.loads(read(args.request, 16384)), args.action)
+            request = json.loads(read(args.request, 16384))
+            expected = paired(target, successor_profile=args.successor_profile)
+            if (
+                not isinstance(request, dict)
+                or request.get("successorDigest") != identity(expected)["profileDigest"]
+            ):
+                raise ValueError("CLI successor does not match the reviewed request")
+            result = execute(target, request, args.action)
         print(json.dumps(result, indent=2))
         return 0
     except (OSError, ValueError, TypeError, KeyError, yaml.YAMLError):
