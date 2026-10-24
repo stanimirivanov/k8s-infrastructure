@@ -477,21 +477,63 @@ class CapacityShellTests(unittest.TestCase):
         self.assertEqual(file.read_bytes(), original)
         self.assertEqual(backup.read_text(), "retained backup")
 
-    def test_symlink_config_and_stale_temporary_file_are_not_adopted(self):
-        root, file, original, digest, script = self.fixture()
-        outside = root / "outside"
-        outside.write_bytes(original)
-        file.unlink()
-        file.symlink_to(outside)
-        self.assertNotEqual(self.execute(script, digest).returncode, 0)
-        self.assertEqual(outside.read_bytes(), original)
-        file.unlink()
-        file.write_bytes(original)
-        temporary = root / "config.allocatable-next"
-        temporary.write_text("partial prior write")
-        self.assertNotEqual(self.execute(script, digest).returncode, 0)
-        self.assertEqual(file.read_bytes(), original)
-        self.assertEqual(temporary.read_text(), "partial prior write")
+    def test_read_and_write_refuse_symlink_config_without_side_effects(self):
+        for operation in (capacity.READ, capacity.WRITE):
+            with self.subTest(operation=operation.splitlines()[1]):
+                root, file, original, digest, _ = self.fixture()
+                outside = root / "outside"
+                outside.write_bytes(original)
+                file.unlink()
+                file.symlink_to(outside)
+                script = operation.replace("/var/lib/kubelet", str(root))
+                result = self.execute(script, digest)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, b"")
+                self.assertTrue(file.is_symlink())
+                self.assertEqual(outside.read_bytes(), original)
+                self.assertFalse((root / "config.before-allocatable.yaml").exists())
+                self.assertFalse((root / "config.allocatable-next").exists())
+
+    def test_read_and_write_refuse_symlink_parent_without_side_effects(self):
+        for operation in (capacity.READ, capacity.WRITE):
+            with self.subTest(operation=operation.splitlines()[1]):
+                root, file, original, digest, _ = self.fixture()
+                directory = root / "linked-kubelet"
+                directory.symlink_to(root, target_is_directory=True)
+                script = operation.replace("/var/lib/kubelet", str(directory))
+                result = self.execute(script, digest)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, b"")
+                self.assertTrue(directory.is_symlink())
+                self.assertEqual(file.read_bytes(), original)
+                self.assertFalse((root / "config.before-allocatable.yaml").exists())
+                self.assertFalse((root / "config.allocatable-next").exists())
+
+    def test_backup_and_temporary_paths_are_never_adopted(self):
+        for name in ("config.before-allocatable.yaml", "config.allocatable-next"):
+            for kind in ("regular", "symlink", "dangling-symlink"):
+                with self.subTest(path=name, kind=kind):
+                    root, file, original, digest, script = self.fixture()
+                    retained = root / name
+                    outside = root / "outside"
+                    if kind == "regular":
+                        retained.write_bytes(b"partial prior write")
+                    else:
+                        if kind == "symlink":
+                            outside.write_bytes(b"external bytes")
+                        retained.symlink_to(outside)
+                    self.assertNotEqual(self.execute(script, digest).returncode, 0)
+                    self.assertEqual(file.read_bytes(), original)
+                    if kind == "regular":
+                        self.assertEqual(retained.read_bytes(), b"partial prior write")
+                    else:
+                        self.assertTrue(retained.is_symlink())
+                        if kind == "symlink":
+                            self.assertEqual(outside.read_bytes(), b"external bytes")
+                        else:
+                            self.assertFalse(outside.exists())
+                    if name == "config.allocatable-next":
+                        self.assertFalse((root / "config.before-allocatable.yaml").exists())
 
 
 class FullInstallationProposalTests(unittest.TestCase):

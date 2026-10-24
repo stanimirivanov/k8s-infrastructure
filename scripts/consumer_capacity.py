@@ -28,9 +28,12 @@ from .node_capacity import (
 # Fixed provider-owned paths; never interpolate target names or configuration into
 # shell text. The only positional input is a validated SHA-256, checked again
 # immediately before replacement. Backups stay inside the original owned node.
+# Keep each precondition standalone: errexit ignores non-final failures in && lists.
 READ = """set -eu
 p=/var/lib/kubelet/config.yaml
-test ! -L /var/lib/kubelet && test ! -L "$p" && test -f "$p"
+test ! -L /var/lib/kubelet
+test ! -L "$p"
+test -f "$p"
 test "$(stat -c %s "$p")" -le 65536
 sha256sum "$p"
 base64 --wrap=0 "$p"
@@ -41,10 +44,14 @@ b=/var/lib/kubelet/config.before-allocatable.yaml
 n=/var/lib/kubelet/config.allocatable-next
 umask 077
 set -C
-test ! -L /var/lib/kubelet && test ! -L "$p" && test -f "$p"
+test ! -L /var/lib/kubelet
+test ! -L "$p"
+test -f "$p"
 test "$(sha256sum "$p" | cut -d ' ' -f 1)" = "$1"
-test ! -e "$b" && test ! -L "$b"
-test ! -e "$n" && test ! -L "$n"
+test ! -e "$b"
+test ! -L "$b"
+test ! -e "$n"
+test ! -L "$n"
 cat "$p" > "$b"
 cat > "$n"
 chmod 600 "$n"
