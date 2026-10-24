@@ -9,15 +9,15 @@ from copy import deepcopy
 from typing import Any
 
 from . import consumer_lifecycle, consumer_runtime
-from .consumer_profile import Target
+from .consumer_profile import NETWORK_PROFILES, Target
 from .kubernetes import contains, fingerprint, kube, reference
 from .network_assets import MANAGER, download, labels, render, selection
 
 
 def require_profile(target: Target) -> int:
-    if target.profile != "isolated-network-local" or target.https_port is None:
+    if target.profile not in NETWORK_PROFILES or target.https_port is None:
         raise ValueError(
-            "Networking requires a fresh isolated-network-local profile; no CNI replacement"
+            "Networking requires an explicit reviewed network profile; no CNI replacement"
         )
     return target.https_port
 

@@ -11,6 +11,8 @@
   no engine resize, node change, state rewrite or Stage B activation is authorized.
 - Resolve host eligibility, implement an explicit transition and qualify it on a
   disposable target before requesting retained-target execution approval.
+- Fresh full-profile lifecycle is implemented; retained migration and live
+  full-installation qualification remain pending.
 - D06 remains incomplete until provider handoff and the consumer's persistent
   installation acceptance pass. This document is a plan, not a live runbook.
 
@@ -69,9 +71,9 @@ Preserve the approved ledger's immutable source basis. Re-render a selected,
 reviewed provider/chart revision and reconcile any differences in a subsequent
 review rather than treating older estimates as current measurements.
 
-- Add a new, independently versioned profile; retain existing profile bytes and
-  digests. Extend fresh creation, ownership validation, health, networking and
-  capability reporting consistently for its node budgets and HTTPS contract.
+- The new independently versioned profile supports fresh creation, ownership
+  validation, health, networking and capability reporting for its node budgets
+  and HTTPS contract. Existing profile bytes and digests remain unchanged.
 - Prove allocatable **3750m/5532Mi** on the control plane and **3750m/13724Mi** on
   the worker. Preserve raw machine capacity as a separate observation.
 - Account for actual system Pods, init maxima, restartable sidecars, Pod overhead,
@@ -158,8 +160,8 @@ and restore remain the separate D07 boundary.
 
 | PR-sized slice | Scope and verification before merge/use | Dependency |
 |:--|:--|:--|
-| Full-profile lifecycle | Implement the versioned profile across fresh creation, identity, health, rendering and handoff; retain existing profiles; test exact accounting and rejection; run `make validate` | Approved design; live use still blocked on Gate 1 |
-| Retained transition capability | Implement the bounded journaled protocol, private versioned backups, preflight and explicit recovery; test ownership drift, races, stale paths and every interruption boundary, including real Linux shell fixtures; run `make validate` | Full-profile lifecycle |
+| Full-profile lifecycle (implemented; unqualified) | Implement the versioned profile across fresh creation, identity, health, rendering and handoff; retain existing profiles; test exact accounting and rejection; run `make validate` | Approved design; live use still blocked on Gate 1 |
+| Retained transition capability | Implement the bounded journaled protocol, private versioned backups, preflight and explicit recovery; test ownership drift, races, stale paths and every interruption boundary, including real Linux shell fixtures; run `make validate` | Full-profile lifecycle (implemented; unqualified) |
 | Qualification and operational procedure | Exercise the reviewed disposable transition and complete capacity envelope under separately authorized live scopes; document evidence requirements and tested recovery; run `make validate`; keep unproven gates pending | Both provider slices and eligible host; consumer full-stack accounting may progress in parallel |
 | D06 consumer handoff | In fleetiq-deploy, pin qualified merged provider, refresh render/quotas and release evidence, prepare exact retained transition and Stage B requests, then record separately authorized results; pass affected deployment checks | Qualified provider and resolved host/identity prerequisites |
 

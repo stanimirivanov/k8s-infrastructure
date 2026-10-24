@@ -1,7 +1,8 @@
 # Isolated networking and trusted Gateway ingress
 
 - Status: I03 implementation; report live qualification separately
-- Profile: `local-kind/isolated-network-local`
+- Profiles: `local-kind/isolated-network-local`, `local-kind/isolated-network-full-local`
+- Full-size profile: fresh-target implementation available; live full-stack qualification pending
 
 ## TL;DR
 

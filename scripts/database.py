@@ -10,7 +10,7 @@ from urllib.error import URLError
 
 import yaml
 
-from .consumer_profile import Target
+from .consumer_profile import NETWORK_PROFILES, Target
 from .database_assets import CONTROLLERS, download, render, selection, storage_class
 from .delegated_argo_config import load_delegation
 
@@ -19,7 +19,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("asset-check", "apply", "health", "handoff", "qualify"))
     parser.add_argument("--consumer")
-    parser.add_argument("--profile", choices=("isolated-network-local",))
+    parser.add_argument("--profile", choices=NETWORK_PROFILES)
     parser.add_argument("--docker-context")
     parser.add_argument("--state-root", type=Path)
     parser.add_argument("--https-port", type=int)

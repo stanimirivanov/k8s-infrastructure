@@ -142,8 +142,9 @@ storage and 2-CPU/4Gi per-node Docker budgets. A healthy disposable run does not
 prove legacy repair or permit migrating persistent resources.
 
 The [approved complete-stack resource design](node-capacity.md#approved-complete-fleetiq-resource-design)
-remains nonselectable and unqualified. Review real host capacity, bound or measure
-init peaks, add a versioned larger profile and explicit retained-target migration,
+is implemented as a fresh-target selectable profile but remains unqualified.
+Review real host capacity, bound or measure init peaks, implement the explicit
+retained-target migration,
 and re-render application/controller placement and quotas. Prove cold-start,
 release-overlap and restart pressure before requesting Stage B approval.
 

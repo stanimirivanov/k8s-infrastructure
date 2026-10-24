@@ -7,7 +7,7 @@ import time
 from typing import Any
 
 from . import consumer_lifecycle, consumer_runtime
-from .consumer_profile import Target
+from .consumer_profile import NETWORK_PROFILES, Target
 from .delegated_argo_config import LABEL, Delegation, download_assets, selection
 from .delegated_argo_render import reference, render
 from .kubernetes import contains, fingerprint, kube
@@ -101,7 +101,7 @@ def apply(target: Target, delegation: Delegation) -> dict[str, Any]:
 
         database_health(target)
         scope_health(target, delegation.database_namespaces)
-    if target.profile not in {"isolated-argo-local", "isolated-network-local"}:
+    if target.profile not in ("isolated-argo-local", *NETWORK_PROFILES):
         raise ValueError(
             "Delegated Argo requires the explicit isolated-argo-local profile; no implicit resizing or adoption"
         )
@@ -109,7 +109,7 @@ def apply(target: Target, delegation: Delegation) -> dict[str, Any]:
     consumer_lifecycle.health(target)
     namespaces_delegated(target, delegation)
     shared, documents = render(
-        delegation, download_assets(), networking=target.profile == "isolated-network-local"
+        delegation, download_assets(), networking=target.profile in NETWORK_PROFILES
     )
     found = inventory(target, shared, documents, complete=False)
     missing = [item for item in shared if reference(item) not in found]
@@ -207,7 +207,7 @@ def health(target: Target, delegation: Delegation) -> dict[str, Any]:
     consumer_lifecycle.health(target)
     namespaces_delegated(target, delegation)
     shared, documents = render(
-        delegation, download_assets(), networking=target.profile == "isolated-network-local"
+        delegation, download_assets(), networking=target.profile in NETWORK_PROFILES
     )
     return observe(target, delegation, shared, documents)
 
@@ -329,7 +329,7 @@ def remove(target: Target, delegation: Delegation, confirmation: str | None) -> 
     consumer_lifecycle.owned(target)
     namespaces_delegated(target, delegation)
     shared, documents = render(
-        delegation, download_assets(), networking=target.profile == "isolated-network-local"
+        delegation, download_assets(), networking=target.profile in NETWORK_PROFILES
     )
     found = inventory(target, shared, documents, complete=False)
     workflows = json.loads(

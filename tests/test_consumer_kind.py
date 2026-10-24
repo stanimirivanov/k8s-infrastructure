@@ -186,6 +186,171 @@ class ConsumerTests(unittest.TestCase):
             command.assert_called_once()
             sleep.assert_not_called()
 
+    def test_full_profile_capability_previews_are_offline(self):
+        from scripts import consumer_kind, database, delegated_argo, network
+
+        full = Target("neutral", "local-engine", self.root, "isolated-network-full-local", 18443)
+        delegation = self.root / "delegation.json"
+        delegation.write_text(
+            json.dumps(
+                {
+                    "consumer": "neutral",
+                    "workloadNamespaces": ["neutral-apps"],
+                    "approvedTemplates": ["release-check"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        common = [
+            "--profile",
+            full.profile,
+            "--consumer",
+            full.consumer,
+            "--docker-context",
+            full.docker_context,
+            "--state-root",
+            str(self.root),
+            "--https-port",
+            "18443",
+        ]
+        for module in (consumer_kind, database, delegated_argo, network):
+            args = ["handoff", *common]
+            if module is delegated_argo:
+                args += ["--delegation", str(delegation)]
+            with (
+                self.subTest(module=module.__name__),
+                patch.object(runtime, "command") as command,
+                patch.object(state, "load") as private_read,
+                redirect_stdout(io.StringIO()) as output,
+            ):
+                self.assertEqual(module.main(args), 0)
+                result = json.loads(output.getvalue())
+                self.assertEqual(result["execution"], "not-performed")
+                command.assert_not_called()
+                private_read.assert_not_called()
+        self.assertFalse(full.directory.exists())
+
+    def test_predecessor_profile_digests_are_unchanged(self):
+        expected = {
+            "isolated-local": "6fbed03f2057aac02c6450d30827b792db63bdd20630c61d32d279e3027e9e8e",
+            "isolated-argo-local": "711de381bac782ac1063ed7d6403567ec1f066327822d6d1782fb92728e2a9e3",
+            "isolated-network-local": "7c3fec90227a128cc6143dcff83e62d3c5cd4a64c1467f046e566575441d89de",
+        }
+        for profile, digest in expected.items():
+            target = Target(
+                "neutral",
+                "local-engine",
+                self.root,
+                profile,
+                18443 if profile == "isolated-network-local" else None,
+            )
+            self.assertEqual(identity(target)["profileDigest"], f"sha256:{digest}")
+
+    def test_full_profile_cannot_adopt_retained_network_owner_or_changed_port(self):
+        old = Target("fleetiq", "local-engine", self.root, "isolated-network-local", 18443)
+        full = Target("fleetiq", "local-engine", self.root, "isolated-network-full-local", 18443)
+        record = state.reserve(old, ENDPOINT)
+        before = old.path("owner.json").read_bytes()
+        with self.assertRaisesRegex(ValueError, "profile/context mismatch"):
+            state.load(full)
+        with (
+            patch.object(runtime, "command") as command,
+            self.assertRaisesRegex(ValueError, "profile/context mismatch"),
+        ):
+            lifecycle.health(full)
+        command.assert_not_called()
+        self.assertEqual(old.path("owner.json").read_bytes(), before)
+        self.assertEqual(state.load(old), record)
+        other_root = self.root / "fresh"
+        other_root.mkdir()
+        full = Target("neutral", "local-engine", other_root, full.profile, 18443)
+        state.reserve(full, ENDPOINT)
+        changed = Target("neutral", "local-engine", other_root, full.profile, 19443)
+        with self.assertRaisesRegex(ValueError, "profile/context mismatch"):
+            state.load(changed)
+
+    def test_full_creation_requires_eight_cpu_twenty_four_gib_before_reservation(self):
+        self.target = Target(
+            "neutral", "local-engine", self.root, "isolated-network-full-local", 18443
+        )
+        for cpus, memory in ((4, 24 * 1024**3), (8, 24 * 1024**3 - 1), (8, 24 * 1024**3)):
+            info = json.dumps(
+                {"os": "linux", "architecture": "amd64", "cpus": cpus, "memory": memory}
+            )
+            with (
+                self.subTest(cpus=cpus, memory=memory),
+                patch.object(runtime, "command", side_effect=["kind v0.31.0", info]),
+                patch.object(runtime, "engine", return_value=ENDPOINT),
+                patch.object(state, "reserve") as reserve,
+            ):
+                if cpus < 8 or memory < 24 * 1024**3:
+                    with self.assertRaisesRegex(ValueError, "headroom minimums"):
+                        lifecycle.create(self.target)
+                    reserve.assert_not_called()
+                else:
+                    self.assertEqual(runtime.prerequisites(self.target, creating=True), ENDPOINT)
+        self.assertFalse(self.target.directory.exists())
+
+    def test_full_creation_orders_caps_capacity_cni_then_readiness(self):
+        self.target = Target(
+            "neutral", "local-engine", self.root, "isolated-network-full-local", 18443
+        )
+        mocks = self.mock_runtime(existing=False)
+        events = []
+
+        def capacity(_target):
+            updates = [c.args[1] for c in mocks["command"].call_args_list if "update" in c.args[1]]
+            self.assertEqual(len(updates), 2)
+            budgets = load_profile(name=self.target.profile)["nodes"]
+            for args, role in zip(updates, budgets, strict=True):
+                self.assertEqual(args[args.index("--cpus") + 1], "4")
+                self.assertEqual(
+                    args[args.index("--memory") + 1], str(budgets[role]["memoryBytes"])
+                )
+                self.assertEqual(
+                    args[args.index("--memory-swap") + 1], str(budgets[role]["memoryBytes"])
+                )
+            events.append("capacity")
+
+        mocks["capacity"].side_effect = capacity
+        with (
+            patch("scripts.network_runtime.listener_available") as listener,
+            patch("scripts.network_runtime.install", side_effect=lambda _: events.append("cni")),
+            patch.object(lifecycle, "finish_creation", return_value={}) as finish,
+        ):
+            lifecycle.create(self.target)
+        self.assertEqual(events, ["capacity", "cni"])
+        listener.assert_called_once_with(self.target)
+        finish.assert_called_once()
+        create = next(c.args[1] for c in mocks["command"].call_args_list if "create" in c.args[1])
+        self.assertEqual(create[create.index("--wait") + 1], "0s")
+        self.assertEqual(state.load(self.target)["phase"], "provisioned")
+
+    def test_full_handoff_reports_envelopes_and_no_full_stack_acceptance(self):
+        self.target = Target(
+            "neutral", "local-engine", self.root, "isolated-network-full-local", 18443
+        )
+        self.reserve_ready()
+        self.mock_runtime()
+        result = lifecycle.health(self.target)
+        expected = {"control-plane": 5532, "worker": 13724}
+        for node in result["nodeAllocatable"]:
+            self.assertEqual(node["schedulerEnvelope"]["cpuMillicores"], 3750)
+            self.assertEqual(
+                node["schedulerEnvelope"]["memoryBytes"], expected[node["role"]] * 1024**2
+            )
+        self.assertIn(
+            "full-installation capacity and performance", result["capabilitiesNotQualified"]
+        )
+        changed = ready(self.target)
+        changed["items"][1]["status"]["allocatable"]["memory"] = "3484Mi"
+        with self.assertRaises(ValueError):
+            runtime.check_readiness(self.target, changed)
+        wrong = nodes(self.target)
+        wrong[f"{self.target.name}-worker"]["memory"] = 4 * 1024**3
+        with self.assertRaises(ValueError):
+            runtime.verify_nodes(wrong, profile=self.target.profile)
+
     def test_profiles_are_distinct_and_preserve_reserved_perfeng_identity(self):
         other = Target("future-project", "local-engine", self.root)
         self.assertNotEqual(other.name, self.target.name)

@@ -537,18 +537,21 @@ class CapacityShellTests(unittest.TestCase):
 
 
 class FullInstallationProposalTests(unittest.TestCase):
-    def test_proposal_is_not_selectable_and_leaves_per_node_peak_headroom(self):
+    def test_approved_profile_matches_ledger_and_leaves_per_node_peak_headroom(self):
         import yaml
 
-        from scripts.consumer_profile import PROFILES, load_profile
+        from scripts.consumer_profile import load_profile
 
         proposal = yaml.safe_load(
             (
                 Path(__file__).resolve().parents[1] / "docs/capacity/fleetiq-full-installation.yaml"
             ).read_text(encoding="utf8")
         )
-        self.assertEqual(proposal["status"], "approved-design-not-selectable")
-        self.assertNotIn(proposal["profile"], PROFILES)
+        self.assertEqual(proposal["status"], "approved-design-selectable-unqualified")
+        profile = load_profile(name=proposal["profile"])
+        self.assertEqual(profile["nodes"], proposal["nodes"])
+        self.assertEqual(profile["minimumEngine"], proposal["minimumEngine"])
+        self.assertEqual(proposal["basis"]["liveQualification"], "pending")
         for role, budget in proposal["nodes"].items():
             e = envelope(budget)
             sizing = proposal["sizing"][role]

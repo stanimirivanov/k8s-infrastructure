@@ -16,8 +16,9 @@
 The owner approved the FleetIQ 4-CPU/6Gi control plane and 4-CPU/14Gi worker
 resource design. The retained foundation uses 2-CPU/4Gi nodes and already has
 original kubelet backups from its completed scheduler-envelope repair. The
-approved design remains non-selectable and unqualified. The current repair
-command checks the current profile, refuses foreign reservations and refuses
+design was non-selectable and unqualified at approval. Fresh-target lifecycle
+implementation is the first step; live qualification remains separate. The current
+repair command checks the current profile, refuses foreign reservations and refuses
 stale backup paths. It cannot be reused as an enlargement command.
 
 The selected engine must expose at least eight CPUs and 24Gi. Changing engine

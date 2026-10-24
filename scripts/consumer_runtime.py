@@ -9,7 +9,7 @@ from typing import Any
 
 import yaml
 
-from .consumer_profile import LABEL, Target, load_profile
+from .consumer_profile import LABEL, NETWORK_PROFILES, Target, load_profile
 from .consumer_state import read_bounded
 from .local_kind import run
 from .node_capacity import verify_allocatable
@@ -137,7 +137,7 @@ def inspect_node(target: Target, reference: str, name: str) -> dict[str, Any]:
         or not re.fullmatch(r"[a-f0-9]{64}", node.get("id", ""))
     ):
         raise ValueError("Foreign node container identity")
-    if target.profile == "isolated-network-local":
+    if target.profile in NETWORK_PROFILES:
         verify_listener(target, node)
     return node
 

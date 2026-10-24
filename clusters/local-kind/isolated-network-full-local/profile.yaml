@@ -1,0 +1,16 @@
+# Approved full-size fresh-cluster design; live qualification remains pending.
+# Selecting this profile never migrates retained state or authorizes a host resize.
+version: 1
+profile: isolated-network-full-local
+kindVersion: v0.31.0
+nodeImage: kindest/node:v1.35.0@sha256:452d707d4862f52530247495d180205e029056831160e22870e37e3f6c1ac31f
+minimumEngine:
+  cpus: 8
+  memoryBytes: 25769803776
+nodes:
+  control-plane:
+    cpus: 4
+    memoryBytes: 6442450944
+  worker:
+    cpus: 4
+    memoryBytes: 15032385536
