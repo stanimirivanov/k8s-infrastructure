@@ -18,6 +18,7 @@
 | Changing the substrate/consumer handoff | [Capability contract](architecture/substrate-capability.md) and [ADR index](decisions/README.md) |
 | Capped kind scheduling capacity and full-installation sizing | [Node capacity](node-capacity.md), [ADR 0008](decisions/0008-capped-kind-node-allocatable.md) |
 | Approved FleetIQ full-installation design and retained transition | [Transition plan](migrations/fleetiq-full-installation-transition.md), [ADR 0009](decisions/0009-explicit-retained-profile-transition.md) |
+| Retained full-profile transition and recovery tooling | [Operating procedure](retained-profile-transition.md) |
 | Disposable scheduler/restart proof | [Capacity qualification](capacity-qualification.md) |
 | Local kind operations | [Local-kind guide](local-kind.md) |
 | FleetIQ or another isolated local consumer | [Isolated consumer guide](isolated-local-consumers.md), [ADR 0004](decisions/0004-isolated-local-consumer-profiles.md) |
