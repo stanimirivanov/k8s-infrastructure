@@ -21,16 +21,18 @@ def preview(target: Target) -> dict:
     return {
         **capacity.preview(target, "qualify"),
         "namespace": target.consumer + "-capacity",
+        "priorityClass": priority_class(target),
         "fixtureImage": selection()["probes"]["client"],
         "maximumConcurrentPods": 3,
         "effects": [
             "Require an existing, exactly owned, healthy foundation-only disposable cluster",
             "Restart both recorded kubelets; verify original owner, node UIDs and safe envelopes",
             "Prove reconciliation is idempotent after restart",
+            "Create only the absent neutral non-default PriorityClass with priority zero and Never preemption",
             "On each node create one bounded positive control and CPU/memory over-envelope probes",
             "Require native Unschedulable evidence; delete only exact fixture Pod UIDs on success",
         ],
-        "onFailure": "Stop and retain namespace, Pods and cluster; no automatic cleanup or deletion",
+        "onFailure": "Stop and retain PriorityClass, namespace, remaining Pods and cluster; no automatic cleanup or deletion",
         "exclusions": [
             "cluster creation/deletion",
             "retained-target repair",
@@ -38,6 +40,40 @@ def preview(target: Target) -> dict:
             "full-stack capacity acceptance",
         ],
     }
+
+
+def priority_class(target: Target) -> dict:
+    """Priority admission derives Pod preemption policy from this non-default class."""
+    return {
+        "apiVersion": "scheduling.k8s.io/v1",
+        "kind": "PriorityClass",
+        "metadata": {
+            "name": target.consumer + "-capacity-probe",
+            "labels": {LABEL: target.consumer},
+        },
+        "value": 0,
+        "globalDefault": False,
+        "preemptionPolicy": "Never",
+        "description": "Non-preempting disposable capacity qualification probes only.",
+    }
+
+
+def check_priority_class(target: Target, uid: str) -> None:
+    """Refuse class replacement or policy changes before admitting more probes."""
+    expected = priority_class(target)
+    value = json.loads(
+        kube(target, ["get", "priorityclass", expected["metadata"]["name"], "-o", "json"])
+    )
+    metadata = value["metadata"]
+    if (
+        metadata.get("uid") != uid
+        or metadata.get("deletionTimestamp")
+        or metadata.get("labels", {}).get(LABEL) != target.consumer
+        or value.get("value") != 0
+        or value.get("globalDefault", False) is not False
+        or value.get("preemptionPolicy") != "Never"
+    ):
+        raise ValueError("Capacity qualification PriorityClass identity or policy changed")
 
 
 def pod(target: Target, role: str, probe: str) -> dict:
@@ -57,6 +93,9 @@ def pod(target: Target, role: str, probe: str) -> dict:
         "spec": {
             "automountServiceAccountToken": False,
             "restartPolicy": "Never",
+            "priorityClassName": priority_class(target)["metadata"]["name"],
+            # A matching explicit policy also makes admission fail closed if the
+            # class is replaced with a preempting definition after preflight.
             "preemptionPolicy": "Never",
             "activeDeadlineSeconds": 600,
             "nodeSelector": {LABEL: target.consumer, "k8s-infrastructure.io/role": role},
@@ -100,6 +139,13 @@ def observe_pod(target: Target, namespace: str, name: str, uid: str) -> dict:
     value = json.loads(kube(target, ["-n", namespace, "get", "pod", name, "-o", "json"]))
     if value["metadata"].get("uid") != uid or value["metadata"].get("deletionTimestamp"):
         raise ValueError("Capacity fixture Pod identity changed")
+    spec = value["spec"]
+    if (
+        spec.get("priorityClassName") != priority_class(target)["metadata"]["name"]
+        or spec.get("preemptionPolicy") != "Never"
+        or spec.get("priority") != 0
+    ):
+        raise ValueError("Capacity probe admission changed the non-preemption contract")
     return value
 
 
@@ -197,6 +243,15 @@ def qualify(target: Target) -> dict:
         raise ValueError(
             "Capacity qualification namespace exists; inspect retained fixtures before retry"
         )
+    policy = priority_class(target)
+    policy_name = policy["metadata"]["name"]
+    if kube(
+        target, ["get", "priorityclass", policy_name, "--ignore-not-found", "-o", "name"]
+    ).strip():
+        raise ValueError(
+            "Capacity qualification PriorityClass exists; inspect retained fixtures before retry"
+        )
+    print("Capacity qualification: verifying kubelet restart and idempotence stages.", flush=True)
     for node_id in owner["nodeIds"].values():
         guard(target, owner, uids)
         runtime.command(
@@ -219,6 +274,13 @@ def qualify(target: Target) -> dict:
     if reconciliation["restartedNodes"]:
         raise ValueError("Capacity reconciliation was not idempotent after restart")
     guard(target, owner, uids)
+    print("Capacity qualification: creating neutral non-preempting PriorityClass.", flush=True)
+    created_policy = json.loads(kube(target, ["create", "-f", "-", "-o", "json"], [policy]))
+    policy_uid = created_policy.get("items", [created_policy])[0]["metadata"]["uid"]
+    if not policy_uid:
+        raise ValueError("Capacity fixture PriorityClass UID missing")
+    check_priority_class(target, policy_uid)
+    print("Capacity qualification: creating neutral namespace.", flush=True)
     created = json.loads(
         kube(
             target,
@@ -242,7 +304,9 @@ def qualify(target: Target) -> dict:
         for probe in ("positive", "cpu", "memory"):
             guard(target, owner, uids)
             check_namespace(target, namespace, namespace_uid)
+            check_priority_class(target, policy_uid)
             desired = pod(target, role, probe)
+            print(f"Capacity qualification: creating {role}/{probe} probe.", flush=True)
             created = json.loads(kube(target, ["create", "-f", "-", "-o", "json"], [desired]))
             actual = created.get("items", [created])[0]
             name, uid = desired["metadata"]["name"], actual["metadata"]["uid"]
@@ -260,6 +324,7 @@ def qualify(target: Target) -> dict:
     if capacity.configure(target)["restartedNodes"]:
         raise ValueError("Post-fixture reconciliation unexpectedly changed capacity")
     guard(target, owner, uids)
+    check_priority_class(target, policy_uid)
     return {
         "cluster": target.name,
         "context": target.context,
@@ -270,7 +335,14 @@ def qualify(target: Target) -> dict:
         "kubeletRestart": "observed on original nodes",
         "reconciliation": "idempotent",
         "namespaceUID": namespace_uid,
-        "fixtureRetention": "Pods UID-deleted on success; empty namespace and cluster retained",
+        "priorityClass": {
+            "name": policy_name,
+            "uid": policy_uid,
+            "value": 0,
+            "preemptionPolicy": "Never",
+            "globalDefault": False,
+        },
+        "fixtureRetention": "Pods UID-deleted on success; PriorityClass, empty namespace and cluster retained",
         "notQualified": [
             "legacy retained-target repair",
             "full FleetIQ stack",

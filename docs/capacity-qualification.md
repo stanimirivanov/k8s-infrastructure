@@ -5,7 +5,7 @@
 - Prove scheduler rejection and restart stability on a separately approved disposable target.
 - Preview is offline. Live execution requires exact target/idle-window approval and `--execute`.
 - Create the target explicitly first; qualification never creates, adopts or deletes a cluster.
-- Successful runs delete only recorded fixture Pod UIDs; failed runs retain their state.
+- Successful per-node proofs delete only recorded fixture Pod UIDs; remaining fixtures are retained on failure.
 - This proof does not approve persistent repair, resource enlargement or the complete FleetIQ installation.
 
 ## Prerequisites and approval boundary
@@ -28,7 +28,12 @@ resources to make the example fit. Keep live qualification pending if it does no
 Approval covers the exact disposable name, Docker/Kubernetes contexts, state root,
 profile, resource envelope, creation-time bounded private kubelet config inspection,
 backup/replacement and restart, and the qualification's two kubelet restarts,
-reconciliation reads and neutral Pod creation/UID deletion. No retained cluster,
+reconciliation reads, creation of the exact neutral cluster-scoped PriorityClass,
+and neutral Pod creation/UID deletion. The PriorityClass is non-default, has
+priority zero and disables preemption; it grants no access and changes no existing
+workload or global default. It is retained with the namespace and cluster.
+This fixture requires explicit inclusion in any approval issued before it existed.
+No retained cluster,
 consumer credential, host trust, engine configuration or storage drill is included.
 Cluster deletion is separate and requires its exact name and explicit authorization.
 
@@ -75,15 +80,20 @@ The bounded run:
 
 1. Verifies foundation readiness, original creation claim, container identities,
    exact Docker budgets, node UIDs, pressure and safe allocatable.
-2. Refuses an existing qualification namespace before any restart.
+2. Refuses an existing qualification namespace or same-name PriorityClass before any restart.
 3. Restarts each original kubelet, waits for allocatable and base health, and
    confirms unchanged ownership and API node identities. Reconciliation must
    then be idempotent, without another restart or configuration write.
-4. Creates one neutral namespace. On each node, starts a 20m/32Mi positive-control
+4. Creates `<consumer>-capacity-probe`, a priority-zero, `globalDefault: false`
+   PriorityClass with `preemptionPolicy: Never`, verifies its UID/policy, then
+   creates one neutral namespace. On each node, starts a 20m/32Mi positive-control
    Pod (100m/64Mi limit), then two sleeping probes requesting respectively one
    millicore or 1Mi above that node's **whole** allocatable envelope. Over-budget
    probes use the scheduler through node selectors; they never set `nodeName`
-   or preempt other Pods. Only three probe Pods coexist at a time.
+   or preempt other Pods. Every Pod references the exact class and asserts the
+   matching `Never` policy. Admission rejects a raced conflicting class; observed
+   Pods must also retain the class name, priority zero and `Never` policy.
+   Only three probe Pods coexist at a time.
 5. Requires `Pending`, no bound node, and `PodScheduled=False` with reason
    `Unschedulable` and an explicit `Insufficient cpu` or `Insufficient memory`
    message. API failure, missing scheduling evidence, image-pull failure or
@@ -91,7 +101,7 @@ The bounded run:
    both before and after the denials.
 6. Checks original ownership/UIDs before every mutation and deletes only the
    exact created Pod UIDs with server-side preconditions. It retains the empty
-   namespace and cluster, then proves reconciliation remains idempotent.
+   namespace, PriorityClass and cluster, then proves reconciliation remains idempotent.
 
 Each probe has a 120-second observation deadline, each API request is bounded,
 and successful Pod deletion has a 60-second wait. Pods have a 600-second active
@@ -104,15 +114,16 @@ a probe binding to any node fails qualification immediately.
 Retain the public final summary from standard output alongside the reviewed
 provider revision and approved target. Command progress precedes the final JSON;
 do not treat the entire output stream as a standalone JSON document. Evidence
-contains cluster incarnation, node UIDs/container IDs, fixture UIDs, per-resource
+contains cluster incarnation, node UIDs/container IDs, PriorityClass identity/policy,
+fixture UIDs, per-resource
 scheduler rejection and restart/idempotence outcomes. It contains no kubeconfig,
 private kubelet settings or application credentials.
 
 A failed run stops without cleanup or rollback. Inspect the exact recorded
-namespace, Pods and original node-local backup on that disposable target under
+PriorityClass, namespace, remaining Pods and original node-local backup on that disposable target under
 its authorized scope. Do not delete a stale backup, alter an owner record, reuse
-an existing namespace or rerun creation to force success. A successful run also
-leaves its namespace to prevent silent fixture adoption on retry.
+an existing namespace/PriorityClass or rerun creation to force success. A successful
+run also leaves both fixtures to prevent silent adoption on retry.
 
 Whole-cluster disposal uses the original lifecycle command only after exact-target
 removal authorization; it permanently destroys disposable data:
@@ -135,3 +146,19 @@ remains nonselectable and unqualified. Review real host capacity, bound or measu
 init peaks, add a versioned larger profile and explicit retained-target migration,
 and re-render application/controller placement and quotas. Prove cold-start,
 release-overlap and restart pressure before requesting Stage B approval.
+
+## Priority admission troubleshooting
+
+Kubernetes [non-preempting PriorityClasses](https://v1-35.docs.kubernetes.io/docs/concepts/scheduling-eviction/pod-priority-preemption/#non-preempting-priorityclass)
+are the source of a Pod's admitted priority/preemption policy. An explicit
+`Never` policy without a matching named class conflicts with the default
+`PreemptLowerPriority` policy and is rejected before scheduling. Pod-side
+`Never` alone therefore cannot establish the qualification contract.
+
+The fixture sets both the supported class reference and matching explicit policy;
+the latter makes a conflicting replacement fail at admission. Public progress
+markers identify restart, class, namespace and per-probe creation stages without
+exposing command output or private configuration. An admission rejection is an
+incomplete qualification, never scheduler-denial evidence. Do not retry an
+existing failed namespace or broaden a previous approval silently; review the
+corrected provider revision, fixture scope and exact recovery target first.
