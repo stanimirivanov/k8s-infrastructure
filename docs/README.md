@@ -17,6 +17,7 @@
 | Changing infrastructure code or target safety | [Engineering standards](development/engineering-standards.md) |
 | Changing the substrate/consumer handoff | [Capability contract](architecture/substrate-capability.md) and [ADR index](decisions/README.md) |
 | Capped kind scheduling capacity and full-installation sizing | [Node capacity](node-capacity.md), [ADR 0008](decisions/0008-capped-kind-node-allocatable.md) |
+| Disposable scheduler/restart proof | [Capacity qualification](capacity-qualification.md) |
 | Local kind operations | [Local-kind guide](local-kind.md) |
 | FleetIQ or another isolated local consumer | [Isolated consumer guide](isolated-local-consumers.md), [ADR 0004](decisions/0004-isolated-local-consumer-profiles.md) |
 | Argo CD installation | [Local Argo CD guide](local-argocd.md) |

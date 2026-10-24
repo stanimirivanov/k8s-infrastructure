@@ -98,3 +98,10 @@ Windows runs the same pure/runtime tests but cannot execute a Linux node shell;
 its platform-specific fixture skips do not claim live qualification. The tested
 [sizing proposal](../capacity/fleetiq-full-installation.yaml) is never selectable.
 Live scheduler/pressure and retained repair require a separately approved target.
+
+The [capacity qualification](../capacity-qualification.md) adds offline regression
+coverage for native scheduler evidence, positive controls, original-target and
+fixture UID binding, failure retention and idempotent reconciliation. Its pure
+preview runs in unit checks; actual scheduler and kubelet behavior requires a
+separately approved disposable run outside the offline gate. It does not select
+a larger profile or qualify the full application stack.

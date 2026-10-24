@@ -132,8 +132,10 @@ them. Stop rather than borrowing another project's capacity.
 ## Retained-target transition and qualification
 
 1. Merge the provider correction and bind the selected immutable source.
-2. Authorize a disposable target to prove capacity repair, unschedulable requests
-   above the envelope, restart/recovery and original node/cluster identity.
+2. Review the [disposable capacity qualification](capacity-qualification.md).
+   Authorize its exact target to prove corrected scheduler rejection, kubelet
+   restart/idempotence and original node/cluster identity. Legacy retained-target
+   repair and injected partial-failure recovery remain separate acceptance work.
 3. Separately approve correcting the retained target's **current** envelope.
    Keep its original profile, 2-CPU/4Gi node caps, node IDs and retained storage.
 4. Review the larger proposal and real host inventory. Add a selectable versioned

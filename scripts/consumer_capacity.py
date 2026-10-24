@@ -334,7 +334,7 @@ def configure(target: Target) -> dict:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("apply", "health"))
+    parser.add_argument("action", choices=("apply", "health", "qualify"))
     parser.add_argument("--consumer", required=True)
     parser.add_argument("--profile", required=True, choices=PROFILES)
     parser.add_argument("--docker-context", required=True)
@@ -346,7 +346,12 @@ def main(argv: list[str] | None = None) -> int:
         target = Target(
             args.consumer, args.docker_context, args.state_root, args.profile, args.https_port
         )
-        if not args.execute:
+        if args.action == "qualify":
+            from .capacity_qualification import preview as qualification_preview
+            from .capacity_qualification import qualify
+
+            result = qualify(target) if args.execute else qualification_preview(target)
+        elif not args.execute:
             result = preview(target, args.action)
         elif args.action == "apply":
             result = configure(target)
