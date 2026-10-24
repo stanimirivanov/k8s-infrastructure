@@ -6,7 +6,7 @@
   container-aware. The scheduler uses **Allocatable**, not the raw capacity field.
 - New isolated targets configure a safe allocatable envelope before readiness.
   Existing targets require a separately approved explicit repair; health never repairs.
-- [The full FleetIQ proposal](capacity/fleetiq-full-installation.yaml) uses a
+- [The approved FleetIQ resource design](capacity/fleetiq-full-installation.yaml) uses a
   4-CPU/6Gi control plane and 4-CPU/14Gi worker, with an 8-CPU/24Gi engine.
   It is not selectable or live-qualified and does not authorize resizing.
 - This change does not mutate Perfeng, existing profile identities or retained data.
@@ -88,7 +88,7 @@ whose restart did not complete can be restarted through the same explicit path.
 `health --execute` only observes. New creation runs the same configuration step
 between Docker limits and CNI/readiness. No step changes legacy Perfeng provisioning.
 
-## Complete FleetIQ resource proposal
+## Approved complete FleetIQ resource design
 
 Basis: provider revision `41c558a` rendered 19 provider Pods, with main-container
 limits of 1664Mi on the control plane and 5632Mi on the worker. The published
@@ -97,7 +97,7 @@ FleetIQ charts at `7c516856` add backend 256Mi, static edge 128Mi and PostgreSQL
 
 | Item | Control plane | Worker |
 |:--|--:|--:|
-| Proposed Docker cap | 4 CPUs / 6Gi | 4 CPUs / 14Gi |
+| Approved design Docker cap | 4 CPUs / 6Gi | 4 CPUs / 14Gi |
 | Pod allocatable after daemon/eviction reserves | 3750m / 5532Mi | 3750m / 13724Mi |
 | Provider main-container memory limits | 1664Mi | 5632Mi |
 | Consumer steady main-container limits | 0 | 1408Mi |
@@ -122,7 +122,7 @@ placement is not guaranteed by this document; re-render consumer placement and
 quotas against the approved nodes. Backups, new device workers, replicas or added
 controllers require a new ledger.
 
-The proposal's 20Gi node caps need an engine with at least 8 CPUs/24Gi and a host
+The design's 20Gi node caps need an engine with at least 8 CPUs/24Gi and a host
 with at least 32Gi physical RAM, **24Gi actually available** and 30Gi free backing
 storage at the reviewed startup window. Existing project demand counts against
 that headroom. These are admission prerequisites, not resource reservations or
@@ -138,13 +138,14 @@ them. Stop rather than borrowing another project's capacity.
    repair and injected partial-failure recovery remain separate acceptance work.
 3. Separately approve correcting the retained target's **current** envelope.
    Keep its original profile, 2-CPU/4Gi node caps, node IDs and retained storage.
-4. Review the larger proposal and real host inventory. Add a selectable versioned
-   profile and an explicitly reviewed retained-target migration in subsequent work;
-   changing `--profile` is not an in-place upgrade and must continue to refuse.
+4. The larger resource design is approved; follow the
+   [full-installation transition plan](migrations/fleetiq-full-installation-transition.md).
+   Host eligibility, a selectable versioned profile and explicit retained-target
+   migration remain prerequisites; changing `--profile` must continue to refuse.
 5. Re-render full Argo/app/database/release placement, resource quotas and memory
    overlap against the selected profile. Qualify pressure, throttling and API/leader
    stability under cold start, release overlap and restart before Stage B approval.
 
-No existing-target repair or enlarged-profile run is performed by this PR.
+Design approval does not perform an existing-target repair or enlarged-profile run.
 The former permissive health result now fails closed until explicit repair.
 Old provider source remains usable for inspection; it is not capacity acceptance.

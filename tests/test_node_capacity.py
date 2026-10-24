@@ -547,7 +547,7 @@ class FullInstallationProposalTests(unittest.TestCase):
                 Path(__file__).resolve().parents[1] / "docs/capacity/fleetiq-full-installation.yaml"
             ).read_text(encoding="utf8")
         )
-        self.assertEqual(proposal["status"], "proposed-not-selectable")
+        self.assertEqual(proposal["status"], "approved-design-not-selectable")
         self.assertNotIn(proposal["profile"], PROFILES)
         for role, budget in proposal["nodes"].items():
             e = envelope(budget)

@@ -1,5 +1,7 @@
-# Proposal only: not a selectable profile, host change, or execution approval.
-status: proposed-not-selectable
+# Resource design approved by the owner; execution and qualification remain separate.
+# This ledger is not a selectable profile or authorization to change a host/cluster.
+status: approved-design-not-selectable
+designApprovedOn: 2026-10-24
 profile: isolated-network-full-local
 basis:
   providerRevision: 41c558a54bc923fa69d7afc42bc663b763c3add5
