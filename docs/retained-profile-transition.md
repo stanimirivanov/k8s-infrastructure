@@ -77,6 +77,14 @@ all observed foundation controllers and both uncordoned nodes must be Ready. The
 namespace UIDs are held stable; changing Pod identities on restart is expected.
 Observations are not an atomic scheduling or configuration admission lock.
 
+Live Kubernetes Node capacity includes CPU/memory plus resources such as
+`pods`, `ephemeral-storage` and hugepages. The runtime extracts and validates
+CPU/memory for comparison with the reviewed request; extra live resources do not
+change the selected profile or scheduler envelope. Both `oldMachineCapacity`
+and `newMachineCapacity` in the request must still contain exactly `cpu` and
+`memory`. Missing, invalid or changed live CPU/memory values stop preflight
+before journal creation or node changes.
+
 Use the operator-private existing state root outside Git, with an appropriate
 Windows ACL when applicable. Do not copy it from another cluster. The following
 relative paths remain under that root:
