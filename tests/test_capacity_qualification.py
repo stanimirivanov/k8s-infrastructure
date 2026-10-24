@@ -47,6 +47,7 @@ class CapacityQualificationTests(unittest.TestCase):
         }
         self.pods: dict[str, dict] = {}
         self.namespace_exists = False
+        self.policy = None
         self.events = []
 
     def boundaries(self):
@@ -87,10 +88,14 @@ class CapacityQualificationTests(unittest.TestCase):
     def kube(self, target, args, documents=None):
         if documents:
             value = copy.deepcopy(documents[0])
-            if value["kind"] == "Namespace":
+            if value["kind"] == "PriorityClass":
+                value["metadata"]["uid"] = "policy-uid"
+                self.policy = value
+            elif value["kind"] == "Namespace":
                 self.namespace_exists = True
                 value["metadata"]["uid"] = "namespace-uid"
             else:
+                self.admit(value)
                 name = value["metadata"]["name"]
                 role = value["spec"]["nodeSelector"]["k8s-infrastructure.io/role"]
                 value["metadata"]["uid"] = name + "-uid"
@@ -115,6 +120,8 @@ class CapacityQualificationTests(unittest.TestCase):
                 self.pods[name] = value
                 self.events.append(("create", name))
             return json.dumps(value)
+        if "priorityclass" in args:
+            return json.dumps(self.policy) if self.policy else ""
         if "namespace" in args:
             return (
                 json.dumps({"metadata": {"uid": "namespace-uid"}}) if self.namespace_exists else ""
@@ -124,6 +131,23 @@ class CapacityQualificationTests(unittest.TestCase):
         if "wait" in args:
             return ""
         raise AssertionError(args)
+
+    def admit(self, value):
+        """Model priority admission independently of the fixture constructor.
+
+        Kubernetes v1.35 derives Pod policy from its named class. A mismatching
+        explicit policy is rejected; unknown class names are not admitted.
+        """
+        spec = value["spec"]
+        if spec.get("priorityClassName"):
+            if not self.policy or spec["priorityClassName"] != self.policy["metadata"]["name"]:
+                raise ValueError("PriorityClass not found")
+            policy, priority = self.policy["preemptionPolicy"], self.policy["value"]
+        else:
+            policy, priority = "PreemptLowerPriority", 0
+        if "preemptionPolicy" in spec and spec["preemptionPolicy"] != policy:
+            raise ValueError("Explicit Pod policy conflicts with priority admission")
+        spec["preemptionPolicy"], spec["priority"] = policy, priority
 
     def test_preview_is_pure_and_cli_requires_explicit_execution(self):
         with (
@@ -173,6 +197,9 @@ class CapacityQualificationTests(unittest.TestCase):
                 spec = value["spec"]
                 self.assertNotIn("nodeName", spec)
                 self.assertEqual(spec["preemptionPolicy"], "Never")
+                self.assertEqual(
+                    spec["priorityClassName"], self.target.consumer + "-capacity-probe"
+                )
                 self.assertEqual(spec["nodeSelector"][LABEL], self.target.consumer)
                 container = spec["containers"][0]
                 self.assertIn("@sha256:", container["image"])
@@ -195,11 +222,16 @@ class CapacityQualificationTests(unittest.TestCase):
         self.assertEqual(len([event for event in self.events if event[0] == "delete"]), 6)
         self.assertEqual(self.pods, {})
         self.assertTrue(self.namespace_exists)
+        self.assertEqual(result["priorityClass"]["uid"], "policy-uid")
+        self.assertIsNotNone(self.policy)
 
     def test_existing_namespace_and_consumer_workloads_refuse_before_restart(self):
-        for mode in ("namespace", "workloads"):
+        for mode in ("namespace", "workloads", "priorityclass"):
             with self.subTest(mode=mode):
                 self.namespace_exists = mode == "namespace"
+                self.policy = (
+                    qualification.priority_class(self.target) if mode == "priorityclass" else None
+                )
                 _, process = self.boundaries()
                 with (
                     patch.object(
@@ -318,6 +350,7 @@ class CapacityQualificationTests(unittest.TestCase):
         for phase in ("restart", "probe"):
             with self.subTest(phase=phase):
                 self.namespace_exists = False
+                self.policy = None
                 self.pods.clear()
                 self.events.clear()
                 self.boundaries()
@@ -333,6 +366,61 @@ class CapacityQualificationTests(unittest.TestCase):
                     qualification.qualify(self.target)
                 self.assertFalse(any(event[0] == "delete" for event in self.events))
                 self.assertEqual(bool(self.pods), phase == "probe")
+
+    def test_priority_admission_reproduces_original_failure_and_accepts_new_shape(self):
+        old = qualification.pod(self.target, "worker", "positive")
+        del old["spec"]["priorityClassName"]
+        old["spec"]["preemptionPolicy"] = "Never"
+        with self.assertRaisesRegex(ValueError, "conflicts with priority admission"):
+            self.admit(old)
+        current = qualification.pod(self.target, "worker", "positive")
+        with self.assertRaisesRegex(ValueError, "not found"):
+            self.admit(copy.deepcopy(current))
+        self.policy = qualification.priority_class(self.target)
+        self.assertFalse(self.policy["globalDefault"])
+        self.assertEqual(self.policy["value"], 0)
+        self.admit(current)
+        self.assertEqual(current["spec"]["preemptionPolicy"], "Never")
+        self.assertEqual(current["spec"]["priority"], 0)
+        # Admission must reject a raced policy replacement, before a probe can preempt.
+        self.policy["preemptionPolicy"] = "PreemptLowerPriority"
+        with self.assertRaisesRegex(ValueError, "conflicts with priority admission"):
+            self.admit(qualification.pod(self.target, "worker", "cpu"))
+
+    def test_class_replacement_and_policy_drift_are_refused(self):
+        value = qualification.priority_class(self.target)
+        value["metadata"]["uid"] = "policy-uid"
+        variants = [
+            {**value, "metadata": {**value["metadata"], "uid": "replacement"}},
+            {**value, "preemptionPolicy": "PreemptLowerPriority"},
+            {**value, "globalDefault": True},
+            {**value, "value": 1000},
+            {**value, "metadata": {**value["metadata"], "labels": {}}},
+        ]
+        for actual in variants:
+            with (
+                self.subTest(actual=actual),
+                patch.object(qualification, "kube", return_value=json.dumps(actual)),
+                self.assertRaisesRegex(ValueError, "PriorityClass identity or policy"),
+            ):
+                qualification.check_priority_class(self.target, "policy-uid")
+
+    def test_admitted_preemption_policy_is_observed_before_probe_can_pass(self):
+        spec = qualification.pod(self.target, "worker", "positive")["spec"]
+        for extra in (
+            {"preemptionPolicy": "PreemptLowerPriority", "priority": 0},
+            {"preemptionPolicy": "Never", "priority": 1000},
+            {},
+        ):
+            actual = {"metadata": {"uid": "fixture-uid"}, "spec": {**spec, **extra}}
+            with (
+                self.subTest(extra=extra),
+                patch.object(qualification, "kube", return_value=json.dumps(actual)),
+                self.assertRaisesRegex(ValueError, "non-preemption contract"),
+            ):
+                qualification.observe_pod(
+                    self.target, "namespace", "worker-positive", "fixture-uid"
+                )
 
     def test_namespace_replacement_and_non_idempotent_repair_refuse(self):
         self.boundaries()

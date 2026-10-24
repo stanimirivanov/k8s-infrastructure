@@ -105,3 +105,9 @@ fixture UID binding, failure retention and idempotent reconciliation. Its pure
 preview runs in unit checks; actual scheduler and kubelet behavior requires a
 separately approved disposable run outside the offline gate. It does not select
 a larger profile or qualify the full application stack.
+
+Priority admission regressions model the pinned Kubernetes behavior: the old
+Pod-only `Never` policy is rejected, while a matching non-default PriorityClass
+admits the non-preempting probes. Tests also reject stale/replaced classes,
+policy drift, mismatching admission output and conflicting replacement races.
+These test doubles do not count as a passing native admission/scheduler run.
