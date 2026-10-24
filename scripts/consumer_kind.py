@@ -10,6 +10,7 @@ import yaml
 
 from . import consumer_lifecycle as lifecycle
 from .consumer_profile import PROFILES, Target, configuration, load_profile
+from .node_capacity import POLICY, envelope
 
 
 def preview(action: str, target: Target) -> dict:
@@ -26,9 +27,14 @@ def preview(action: str, target: Target) -> dict:
         "kubeconfigReference": str(target.path("kubeconfig")),
         "kindConfiguration": configuration(target),
         "resourceBudgets": load_profile(name=target.profile),
+        "capacityPolicy": POLICY,
+        "schedulerEnvelopes": {
+            role: envelope(budget)
+            for role, budget in load_profile(name=target.profile)["nodes"].items()
+        },
         "mutations": {
-            "up": "Create only the absent named cluster and reserve its private identity files; then bound owned nodes",
-            "ensure": "Create only when cluster and state are absent, otherwise verify exact healthy ownership",
+            "up": "Create only the absent named cluster and reserve private identity files; bound owned nodes; inspect/backup/update private kubelet configs and restart kubelets to correct allocatable before readiness",
+            "ensure": "Create only when cluster and state are absent, including explicit kubelet capacity configuration; otherwise only verify exact healthy ownership",
             "health": "Observe owned cluster identity, readiness and capacity; no desired-state mutation",
             "handoff": "Observe public capability metadata after exact ownership/readiness checks",
             "down": "Permanently delete only the confirmed owned cluster and its dedicated state files",

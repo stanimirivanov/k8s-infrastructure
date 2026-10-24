@@ -94,7 +94,7 @@ available to its consumer and to operators:
 | Identity | Stable substrate name, provider profile and infrastructure revision |
 | Access | Dedicated kubeconfig path and exact context name |
 | Kubernetes | Server version and supported node operating systems/architectures |
-| Nodes | Schedulable capacity summary and relevant taints or placement limits |
+| Nodes | Verified scheduler envelope, separately labelled raw machine capacity, enforced node limits and relevant taints/placement limits |
 | Storage | Default or named dynamic `ReadWriteOnce` StorageClass and retention behavior |
 | Network | Cluster DNS result and outbound-network expectation |
 | GitOps | Argo CD version, namespace and controller readiness |
@@ -105,6 +105,12 @@ provider account secrets, Kubernetes Secret data or sensitive billing details.
 The implementation may initially expose this information through bounded
 status output. A committed machine-readable schema is deferred until two real
 implementations prove stable shared semantics.
+
+For capped isolated kind nodes, `rawMachineCapacity` is a machine observation,
+not an allocatable guarantee. Handoff/health must verify `schedulerEnvelope`
+against enforced Docker budgets after daemon/eviction reservations. Inflated
+legacy reports fail closed; correction is an explicitly approved operation,
+never a side effect of observation. See [node capacity](../node-capacity.md).
 
 ## Compatibility and first import
 

@@ -61,9 +61,11 @@ disposable target; an existing consumer needs a separately reviewed migration.
 
 Engine minimums do not prove free host capacity. Separate clusters share the
 engine, kernel, storage and host. They do not isolate Perfeng benchmark timing.
-The handoff reports Kubernetes allocatable and Docker container budgets
-separately; a consumer must not treat host-derived allocatable as a safe workload
-quota. Consumer workload budgets and placement need their own acceptance.
+The handoff reports raw machine capacity, Docker budgets and a verified safe
+scheduler envelope separately. New nodes configure kubelet reservations before
+readiness; health rejects inflated legacy allocatable values. Retained nodes need
+an explicitly approved [capacity repair](node-capacity.md), never implicit ensure
+repair. Consumer workload budgets and placement still need their own acceptance.
 
 ## Offline preview
 

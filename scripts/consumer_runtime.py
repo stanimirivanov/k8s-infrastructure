@@ -12,6 +12,7 @@ import yaml
 from .consumer_profile import LABEL, Target, load_profile
 from .consumer_state import read_bounded
 from .local_kind import run
+from .node_capacity import verify_allocatable
 
 # Inspect only identity and resource metadata; never container environments or secrets.
 NODE_FORMAT = (
@@ -282,8 +283,12 @@ def check_readiness(target: Target, data: dict[str, Any]) -> list[dict[str, Any]
             for key in ("cpu", "memory", "pods")
         ):
             raise ValueError("Node allocatable capacity is unavailable")
+        capacity_policy = verify_allocatable(
+            item["status"], load_profile(name=target.profile)["nodes"][role]
+        )
         result.append(
             {
+                **capacity_policy,
                 "name": item["metadata"]["name"],
                 "role": role,
                 "taints": [

@@ -1,0 +1,52 @@
+# Proposal only: not a selectable profile, host change, or execution approval.
+status: proposed-not-selectable
+profile: isolated-network-full-local
+basis:
+  providerRevision: 41c558a54bc923fa69d7afc42bc663b763c3add5
+  chartRevision: 7c51685608c61851319ac7313b4a1739cc0ec89b
+  providerAccounting: main-containers-only
+  liveQualification: pending
+minimumEngine:
+  cpus: 8
+  memoryBytes: 25769803776 # 24 GiB; node caps total 20 GiB
+hostPrerequisites:
+  physicalMemoryGiB: 32
+  availableMemoryGiB: 24
+  availableDiskGiB: 30
+  idleBenchmarkWindow: true
+nodes:
+  control-plane:
+    cpus: 4
+    memoryBytes: 6442450944 # 6 GiB
+  worker:
+    cpus: 4
+    memoryBytes: 15032385536 # 14 GiB
+sizing:
+  control-plane:
+    providerRequestCpuMillicores: 300
+    providerRequestMemoryMi: 512
+    providerMainLimitMemoryMi: 1664
+    allowancesMi:
+      systemPods: 2048 # Planned API server/etcd/CoreDNS/provisioner envelope; measure it.
+      providerRolloutOverlap: 512
+      unmeasuredInit: 768 # Contingency, not a bound on currently unbounded init containers.
+    peakRequestCpuMillicores: 2800 # Planning envelope, including system Pods/init/surge.
+  worker:
+    providerRequestCpuMillicores: 800
+    providerRequestMemoryMi: 1280
+    providerMainLimitMemoryMi: 5632 # Network/database + nine Argo Pods.
+    applicationMainLimitsMi:
+      backend: 256
+      staticEdge: 128
+      postgres: 1024
+    allowancesMi:
+      releaseJobs: 1024 # At most two Jobs, each 512Mi; serving never gets migration credentials.
+      applicationRolloutOverlap: 384 # One extra backend plus static edge.
+      providerRolloutOverlap: 512
+      databaseOverlap: 1024 # Reserve one extra instance only for a reviewed maintenance operation.
+      unmeasuredInit: 1536 # Includes the known 1Gi CNI init; remaining init peaks must be measured/bounded.
+    peakRequestCpuMillicores: 2900
+    applicationSteadyRequestCpuMillicores: 400
+    applicationSteadyRequestMemoryMi: 384
+    maximumConcurrentReleaseJobs: 2
+    maximumReleaseJobMemoryMi: 512

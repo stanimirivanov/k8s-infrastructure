@@ -19,6 +19,7 @@
 | [0005](0005-delegated-consumer-argo.md) | Proposed | Delegate isolated Argo controllers, shared APIs and constrained release authority |
 | [0006](0006-isolated-network-and-gateway.md) | Proposed | Bootstrap fresh policy-enforcing networking and consumer-owned trusted Gateway routes |
 | [0007](0007-local-database-and-retained-storage.md) | Proposed | Qualify local retained storage and provider-owned database operators with explicit consumer namespace authority |
+| [0008](0008-capped-kind-node-allocatable.md) | Proposed | Correct capped kind scheduling envelopes and separate repair from resource enlargement |
 
 ## Numbering under concurrent work
 
