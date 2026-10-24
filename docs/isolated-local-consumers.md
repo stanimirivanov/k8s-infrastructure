@@ -67,6 +67,46 @@ readiness; health rejects inflated legacy allocatable values. Retained nodes nee
 an explicitly approved [capacity repair](node-capacity.md), never implicit ensure
 repair. Consumer workload budgets and placement still need their own acceptance.
 
+## Full-installation profile
+
+`isolated-network-full-local` implements the approved larger resource design for
+**fresh targets only**, using the same pinned networking/database/Argo assets as
+the existing network profile. It requires explicit `--https-port` and keeps the
+same loopback-only API/HTTPS bindings, PID limit and no-swap policy.
+
+| Resource | Control plane | Worker |
+|:--|--:|--:|
+| Docker cap | 4 CPUs / 6Gi | 4 CPUs / 14Gi |
+| Verified Pod envelope | 3750m / 5532Mi | 3750m / 13724Mi |
+
+Creation refuses engines below eight CPUs/24Gi before reserving state or creating
+nodes. The operator must additionally verify the
+[host prerequisites and transition gates](migrations/fleetiq-full-installation-transition.md):
+32Gi physical RAM, 24Gi actually available, 30Gi free backing storage and an idle
+window. The runtime engine minimum is not a free-host-capacity sensor. Bootstrap
+is temporarily uncapped, as for existing profiles. Live full-stack capacity and
+performance qualification are pending; health proves the declared foundation
+checks and explicitly reports full-installation acceptance as unqualified.
+
+The new profile is accepted by consumer lifecycle/capacity, network, database and
+delegated Argo commands. Capability health and handoff still require their own
+installation/observation; selecting the profile installs neither Argo nor a
+consumer database or workload. No controller version, authority or workload
+resource limit changes follow from the larger node budgets.
+
+Use the following **offline** preview with a prepared private state directory:
+
+```sh
+uv run --locked python -m scripts.consumer_kind up \
+  --profile isolated-network-full-local --consumer example \
+  --docker-context default --state-root ../example-private-state --https-port 18443
+```
+
+Existing state with `isolated-network-local` must refuse this selection. Do not
+edit its owner record, remove backups or recreate the target. The explicit
+retained transition is a separate, not-yet-implemented capability. Any execute,
+cleanup, engine resize or qualification needs exact-target authorization.
+
 ## Offline preview
 
 For policy-enforcing networking and HTTPS, select the separately qualified

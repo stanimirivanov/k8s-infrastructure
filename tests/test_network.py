@@ -61,6 +61,26 @@ class NetworkTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             Target("neutral", "local-engine", self.root, "isolated-local", 18443)
 
+    def test_full_profile_network_configuration_and_listener_guards(self):
+        self.target = Target(
+            "neutral", "local-engine", self.root, "isolated-network-full-local", 18443
+        )
+        self.assertEqual(network_runtime.require_profile(self.target), 18443)
+        config = configuration(self.target)
+        self.assertTrue(config["networking"]["disableDefaultCNI"])
+        self.assertEqual(config["nodes"][1]["extraPortMappings"][0]["listenAddress"], "127.0.0.1")
+        node = {
+            "role": "worker",
+            "ports": {"8443/tcp": [{"HostIp": "127.0.0.1", "HostPort": "18443"}]},
+        }
+        consumer_runtime.verify_listener(self.target, node)
+        node["ports"]["8443/tcp"][0]["HostIp"] = "0.0.0.0"
+        with self.assertRaises(ValueError):
+            consumer_runtime.verify_listener(self.target, node)
+        for port in (None, True, 443, 65536):
+            with self.subTest(port=port), self.assertRaises(ValueError):
+                Target("neutral", "local-engine", self.root, self.target.profile, port)
+
     def test_preview_has_no_process_download_private_reads_or_state_writes(self):
         with (
             patch(

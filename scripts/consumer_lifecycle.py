@@ -6,7 +6,7 @@ from typing import Any
 
 from . import consumer_runtime as runtime
 from . import consumer_state as state
-from .consumer_profile import Target, identity, load_profile
+from .consumer_profile import NETWORK_PROFILES, Target, identity, load_profile
 from .local_kind import ROOT
 
 
@@ -53,6 +53,11 @@ def observe(target: Target, *, wait: bool = False) -> dict[str, Any]:
             "persistent storage/database",
             "backup/restore",
             "consumer workload acceptance",
+            *(
+                ["full-installation capacity and performance"]
+                if target.profile == "isolated-network-full-local"
+                else []
+            ),
         ],
     }
 
@@ -82,7 +87,7 @@ def create(target: Target) -> dict[str, Any]:
     runtime.tools(target)
     if target.name in runtime.clusters(target):
         raise ValueError("Named consumer cluster already exists; refusing adoption")
-    if target.profile == "isolated-network-local":
+    if target.profile in NETWORK_PROFILES:
         from .network_runtime import listener_available
 
         listener_available(target)
@@ -103,7 +108,7 @@ def create(target: Target) -> dict[str, Any]:
                 "--wait",
                 # Custom-CNI nodes cannot be Ready until the next bootstrap
                 # phase. The original Ready gate runs after Cilium installation.
-                "0s" if target.profile == "isolated-network-local" else "300s",
+                "0s" if target.profile in NETWORK_PROFILES else "300s",
                 "--retain",
             ],
         )
@@ -137,7 +142,7 @@ def create(target: Target) -> dict[str, Any]:
         from .consumer_capacity import configure
 
         configure(target)
-        if target.profile == "isolated-network-local":
+        if target.profile in NETWORK_PROFILES:
             from .network_runtime import install
 
             install(target)

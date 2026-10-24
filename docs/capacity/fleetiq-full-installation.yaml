@@ -1,6 +1,7 @@
 # Resource design approved by the owner; execution and qualification remain separate.
-# This ledger is not a selectable profile or authorization to change a host/cluster.
-status: approved-design-not-selectable
+# Select the separate reviewed runtime profile only for fresh targets.
+# Neither selectability nor this ledger authorizes live changes.
+status: approved-design-selectable-unqualified
 designApprovedOn: 2026-10-24
 profile: isolated-network-full-local
 basis:

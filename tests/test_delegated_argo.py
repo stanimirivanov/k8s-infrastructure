@@ -442,6 +442,35 @@ class DelegatedArgoTests(unittest.TestCase):
             any(item["kind"] == "RoleBinding" for item in write.call_args_list[3].args[1])
         )
 
+    def test_full_profile_uses_networked_argo_render_and_delegation_preflight(self):
+        target = Target(
+            self.target.consumer,
+            self.target.docker_context,
+            self.root,
+            "isolated-network-full-local",
+            18443,
+        )
+        with (
+            patch.object(runtime.consumer_lifecycle, "health"),
+            patch.object(runtime, "namespaces_delegated"),
+            patch.object(runtime, "download_assets", return_value={}),
+            patch.object(runtime, "render", return_value=([], [])) as render,
+            patch.object(runtime, "observe", return_value={}),
+        ):
+            runtime.health(target, self.delegation)
+            self.assertTrue(render.call_args.kwargs["networking"])
+        with (
+            patch.object(runtime.consumer_lifecycle, "health") as health,
+            patch.object(
+                runtime, "namespaces_delegated", side_effect=ValueError("delegation preflight")
+            ),
+            patch.object(runtime, "download_assets") as download,
+            self.assertRaisesRegex(ValueError, "delegation preflight"),
+        ):
+            runtime.apply(target, self.delegation)
+        health.assert_called_once_with(target)
+        download.assert_not_called()
+
     def test_apply_refuses_the_smaller_profile_before_cluster_access(self):
         smaller = Target(self.target.consumer, self.target.docker_context, self.root)
         with (

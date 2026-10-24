@@ -9,7 +9,7 @@ from urllib.error import URLError
 
 import yaml
 
-from .consumer_profile import Target, configuration
+from .consumer_profile import NETWORK_PROFILES, Target, configuration
 from .network_assets import download, render, selection
 from .network_tls import validate_hostname
 
@@ -19,7 +19,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "action", choices=("asset-check", "apply", "health", "handoff", "qualify", "remove")
     )
-    parser.add_argument("--profile", choices=("isolated-network-local",))
+    parser.add_argument("--profile", choices=NETWORK_PROFILES)
     parser.add_argument("--consumer")
     parser.add_argument("--docker-context")
     parser.add_argument("--state-root", type=Path)

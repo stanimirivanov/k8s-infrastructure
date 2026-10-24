@@ -8,7 +8,7 @@
   Existing targets require a separately approved explicit repair; health never repairs.
 - [The approved FleetIQ resource design](capacity/fleetiq-full-installation.yaml) uses a
   4-CPU/6Gi control plane and 4-CPU/14Gi worker, with an 8-CPU/24Gi engine.
-  It is not selectable or live-qualified and does not authorize resizing.
+  It is selectable for fresh targets, remains unqualified and does not authorize resizing.
 - This change does not mutate Perfeng, existing profile identities or retained data.
 
 ## Root cause and policy
@@ -140,8 +140,9 @@ them. Stop rather than borrowing another project's capacity.
    Keep its original profile, 2-CPU/4Gi node caps, node IDs and retained storage.
 4. The larger resource design is approved; follow the
    [full-installation transition plan](migrations/fleetiq-full-installation-transition.md).
-   Host eligibility, a selectable versioned profile and explicit retained-target
-   migration remain prerequisites; changing `--profile` must continue to refuse.
+   The versioned full profile now supports fresh targets. Host eligibility, live
+   qualification and explicit retained-target migration remain prerequisites;
+   changing `--profile` on existing state must continue to refuse.
 5. Re-render full Argo/app/database/release placement, resource quotas and memory
    overlap against the selected profile. Qualify pressure, throttling and API/leader
    stability under cold start, release overlap and restart before Stage B approval.

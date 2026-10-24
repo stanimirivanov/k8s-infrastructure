@@ -40,6 +40,11 @@ def preview(action: str, target: Target) -> dict:
             "down": "Permanently delete only the confirmed owned cluster and its dedicated state files",
         }[action],
         "execution": "not-performed",
+        **(
+            {"fullInstallationQualification": "pending; separate live acceptance required"}
+            if target.profile == "isolated-network-full-local"
+            else {}
+        ),
     }
 
 
