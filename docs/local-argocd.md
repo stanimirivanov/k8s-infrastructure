@@ -8,6 +8,8 @@
 
 - The official Argo CD `v3.5.2` bootstrap and controller-readiness logic now
   live here with their relevant Git history.
+- Redis `8.2.3-alpine` uses the reviewed Docker Hub multi-platform digest and
+  `IfNotPresent`; other components retain the upstream selection.
 - Validation and command previews are offline; live access requires explicit
   `--execute` and the selected state root.
 - This repository owns only installation and controller readiness. Consumers
@@ -46,15 +48,23 @@ The Kustomization is stored at
 `clusters/local-kind/perfeng-local/addons/argocd/kustomization.yaml`. Its
 resource URL names the official `argoproj/argo-cd` repository, semantic release
 `v3.5.2` and `manifests/install.yaml` path directly. This keeps the selected
-release understandable without duplicating the component image versions already
-tested by the upstream release.
+release understandable. [ADR 0011](decisions/0011-pin-local-argocd-redis-image.md)
+records one reviewed exception: Kustomize selects canonical
+`docker.io/library/redis` at index digest
+`sha256:08ad0b1d280850169a790dba1393ff7a90aef951fc19632cf4d3ce4f78e679ba`,
+the same multi-platform content as upstream Redis `8.2.3-alpine` on ECR Public.
+The single-object `redis-pull-policy.yaml` patch changes only the `redis`
+container's policy to `IfNotPresent`. A cached immutable image needs no tag
+refresh; an absent image still requires a successful registry pull.
 
 Offline validation rejects:
 
 - a branch, floating alias, commit-only identifier or malformed semantic tag;
 - a non-HTTPS URL, unexpected host, repository or manifest path;
 - query strings and fragments;
-- image overrides or other unreviewed Kustomization fields; and
+- any image transformation or patch other than that exact Redis selection;
+- changed patch targets, container fields or pull policies;
+- another Argo CD release without reviewing its Redis selection together; and
 - an unexpected namespace name, owner or substrate label.
 
 The reviewed non-HA installation contains six Deployments and the
@@ -63,6 +73,25 @@ has a 300-second Kubernetes rollout timeout. A failed live check reports
 the exact controller, desired and ready replica counts, and bounded Pod phase,
 container readiness, restart count and waiting reason. Diagnostic text removes
 embedded URL credentials and GitHub-shaped tokens.
+
+This change is limited to `local-kind/perfeng-local`. Isolated/delegated
+consumer assets retain their independent selections. No new credential, cache
+service, CI job or registry fallback is installed. Docker Hub still has public
+pull limits; cold-pull availability requires separate live acceptance.
+
+### Explicit rollout and rollback
+
+Merging this provider commit changes no running cluster or consumer lock.
+Perfeng must first select the merged provider revision in a separate reviewed
+change, then use its supported explicit bootstrap path. Reapplying changes the
+Redis Pod template and can replace its Pod. Namespace, Deployment, Secret and
+consumer Application ownership remain unchanged; no credential reset is part
+of this change. Readiness must still pass through the existing bounded checks.
+
+Rollback selects the previous reviewed provider revision and explicitly
+reapplies it through that same owner. The former registry and `Always` policy
+return, including their pull-throttling exposure. Do not delete the namespace,
+Secrets or consumer resources as a rollback shortcut.
 
 ## Offline validation and preview
 
@@ -151,9 +180,24 @@ occurring in the consumer-switch pull request.
 ### Release validation fails
 
 Compare the Kustomization with the exact URL constraints in
-`scripts/argocd.py`. Use an official semantic release URL. Do not add an image
-override merely to make validation pass; dependency selection changes require
-their own review.
+`scripts/argocd.py`. Use the official reviewed semantic release URL and exact
+Redis digest/patch. Additional overrides, a redirected patch path or a changed
+release are refused. Review the image and policy together when upgrading.
+
+### Redis image pulls are throttled
+
+The prior upstream Redis selection used ECR Public with `Always`. Two jobs in
+Perfeng run 40214268159 retained `ImagePullBackOff` and UID-correlated
+`rate-limit` events after init completed. Those reports do not attribute the
+quota to a particular account or IP. Check the consumer's selected provider
+revision before expecting the new Docker Hub digest and `IfNotPresent` policy;
+this provider PR does not update that lock.
+
+For a new failure, inspect the Pod waiting reason and bounded event evidence.
+Docker Hub also enforces pull limits; network, TLS and missing-manifest errors
+require their own diagnosis. Preserve the immutable digest and reviewed
+identity while resolving access or availability. Do not substitute a floating
+tag, invent a credential reset or increase readiness deadlines without evidence.
 
 ### Namespace validation fails
 

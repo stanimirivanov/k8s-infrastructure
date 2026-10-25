@@ -36,6 +36,18 @@ class ArgoCDBootstrapTests(unittest.TestCase):
     def test_repository_configuration_selects_official_semantic_release(self) -> None:
         self.assertEqual(argocd.validate_configuration(), "v3.5.2")
 
+    def test_reviewed_redis_digest_and_pull_policy_patch_are_accepted(self) -> None:
+        configuration = argocd.load_yaml(argocd.ROOT / argocd.BOOTSTRAP / "kustomization.yaml")
+        configuration["images"] = [
+            {
+                "name": "public.ecr.aws/docker/library/redis",
+                "newName": "docker.io/library/redis",
+                "digest": "sha256:08ad0b1d280850169a790dba1393ff7a90aef951fc19632cf4d3ce4f78e679ba",
+            }
+        ]
+        configuration["patches"] = [{"path": "redis-pull-policy.yaml"}]
+        self.assertEqual(argocd.argocd_version(configuration), "v3.5.2")
+
     def test_floating_release_is_rejected(self) -> None:
         configuration = argocd.load_yaml(argocd.ROOT / argocd.BOOTSTRAP / "kustomization.yaml")
         configuration["resources"][1] = (
@@ -44,6 +56,84 @@ class ArgoCDBootstrapTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "semantic release tag"):
             argocd.argocd_version(configuration)
+
+    def test_redis_selection_rejects_unreviewed_images_patches_and_release(self) -> None:
+        original = argocd.load_yaml(argocd.ROOT / argocd.BOOTSTRAP / "kustomization.yaml")
+        for field, value in (
+            ("name", "other/redis"),
+            ("newName", "example.test/redis"),
+            ("digest", "sha256:" + "0" * 64),
+            ("digest", "latest"),
+            ("newTag", "latest"),
+        ):
+            with self.subTest(field=field, value=value):
+                configuration = copy.deepcopy(original)
+                configuration["images"][0][field] = value
+                with self.assertRaises(ValueError):
+                    argocd.argocd_version(configuration)
+        for key, value in (
+            ("images", []),
+            ("images", original["images"] * 2),
+            ("patches", []),
+            ("patches", [{"path": "../redirect.yaml"}]),
+            ("patches", original["patches"] * 2),
+            ("labels", []),
+            (
+                "resources",
+                [
+                    "namespace.yaml",
+                    "https://raw.githubusercontent.com/argoproj/argo-cd/v3.5.3/manifests/install.yaml",
+                ],
+            ),
+        ):
+            with self.subTest(key=key, value=value):
+                configuration = copy.deepcopy(original)
+                configuration[key] = value
+                with self.assertRaises(ValueError):
+                    argocd.argocd_version(configuration)
+
+    def test_pull_policy_patch_cannot_change_target_or_other_resource_fields(self) -> None:
+        original = argocd.load_yaml(argocd.ROOT / argocd.BOOTSTRAP / "redis-pull-policy.yaml")
+        for change in (
+            "kind",
+            "name",
+            "namespace",
+            "container",
+            "always",
+            "never",
+            "image",
+            "sidecar",
+            "replicas",
+        ):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                bootstrap = root / argocd.BOOTSTRAP
+                bootstrap.mkdir(parents=True)
+                for filename in ("kustomization.yaml", "namespace.yaml"):
+                    (bootstrap / filename).write_text(
+                        (argocd.ROOT / argocd.BOOTSTRAP / filename).read_text()
+                    )
+                document = copy.deepcopy(original)
+                container = document["spec"]["template"]["spec"]["containers"][0]
+                if change == "kind":
+                    document["kind"] = "StatefulSet"
+                elif change == "name":
+                    document["metadata"][change] = "other"
+                elif change == "namespace":
+                    document["metadata"][change] = argocd.NAMESPACE
+                elif change == "container":
+                    container["name"] = "secret-init"
+                elif change in {"always", "never"}:
+                    container["imagePullPolicy"] = change.title()
+                elif change == "image":
+                    container["image"] = "example.test/redis:latest"
+                elif change == "sidecar":
+                    document["spec"]["template"]["spec"]["containers"].append({"name": "other"})
+                else:
+                    document["spec"]["replicas"] = 2
+                (bootstrap / "redis-pull-policy.yaml").write_text(json.dumps(document))
+                with self.assertRaisesRegex(ValueError, "Redis pull-policy patch"):
+                    argocd.validate_configuration(root)
 
     def test_non_official_manifest_host_is_rejected(self) -> None:
         configuration = argocd.load_yaml(argocd.ROOT / argocd.BOOTSTRAP / "kustomization.yaml")

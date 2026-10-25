@@ -32,7 +32,7 @@ def argocd_version(kustomization: dict[str, Any]) -> str:
     """Return the semantic release selected by the official install manifest."""
     resources = kustomization.get("resources")
     if (
-        set(kustomization) != {"apiVersion", "kind", "namespace", "resources"}
+        set(kustomization) != {"apiVersion", "kind", "namespace", "resources", "images", "patches"}
         or kustomization.get("apiVersion") != "kustomize.config.k8s.io/v1beta1"
         or kustomization.get("kind") != "Kustomization"
         or kustomization.get("namespace") != NAMESPACE
@@ -40,6 +40,15 @@ def argocd_version(kustomization: dict[str, Any]) -> str:
         or len(resources) != 2
         or resources[0] != "namespace.yaml"
         or not isinstance(resources[1], str)
+        or kustomization.get("images")
+        != [
+            {
+                "name": "public.ecr.aws/docker/library/redis",
+                "newName": "docker.io/library/redis",
+                "digest": "sha256:08ad0b1d280850169a790dba1393ff7a90aef951fc19632cf4d3ce4f78e679ba",
+            }
+        ]
+        or kustomization.get("patches") != [{"path": "redis-pull-policy.yaml"}]
     ):
         raise ValueError("Invalid Argo CD Kustomize bootstrap")
 
@@ -64,6 +73,8 @@ def argocd_version(kustomization: dict[str, Any]) -> str:
         or not all(number.isdigit() for number in numbers)
     ):
         raise ValueError("Argo CD must use an explicit semantic release tag")
+    if version != "v3.5.2":
+        raise ValueError("The Redis image override is reviewed only for Argo CD v3.5.2")
     return version
 
 
@@ -90,6 +101,17 @@ def validate_configuration(root: Path = ROOT) -> str:
     bootstrap = root / BOOTSTRAP
     version = argocd_version(load_yaml(bootstrap / "kustomization.yaml"))
     validate_namespace(load_yaml(bootstrap / "namespace.yaml"))
+    if load_yaml(bootstrap / "redis-pull-policy.yaml") != {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": {"name": "argocd-redis"},
+        "spec": {
+            "template": {
+                "spec": {"containers": [{"name": "redis", "imagePullPolicy": "IfNotPresent"}]}
+            }
+        },
+    }:
+        raise ValueError("Invalid reviewed Redis pull-policy patch")
     return version
 
 

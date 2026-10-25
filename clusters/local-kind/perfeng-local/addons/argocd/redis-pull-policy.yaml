@@ -1,0 +1,11 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  # Match upstream before the parent Kustomization assigns namespace argocd.
+  name: argocd-redis
+spec:
+  template:
+    spec:
+      containers:
+        - name: redis
+          imagePullPolicy: IfNotPresent
