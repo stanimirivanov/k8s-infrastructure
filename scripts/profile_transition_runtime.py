@@ -133,11 +133,17 @@ def bind(target: Target, request: dict, journal: dict | None = None) -> tuple[by
     for role in ROLES:
         evidence = request["nodes"][role]
         name = f"{target.name}-{role}"
+        observed_capacity = nodes[role]["status"]["capacity"]
+        if not isinstance(observed_capacity, dict):
+            raise ValueError("Node capacity must be a resource map")
+        # Kubernetes reports other resources too; only project live observations.
+        # The reviewed request still passes the exact-key machine validator.
+        observed_machine = machine({key: observed_capacity.get(key) for key in ("cpu", "memory")})
         if (
             record["nodeIds"].get(name) != evidence["containerId"]
             or containers[name]["id"] != evidence["containerId"]
             or nodes[role]["metadata"]["uid"] != evidence["uid"]
-            or machine(nodes[role]["status"]["capacity"]) != machine(evidence["newMachineCapacity"])
+            or observed_machine != machine(evidence["newMachineCapacity"])
         ):
             raise ValueError("Original node identity or stable engine capacity changed")
     capacity.preflight_workloads(successor)

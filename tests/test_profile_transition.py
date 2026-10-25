@@ -82,7 +82,14 @@ class TransitionFixture(unittest.TestCase):
                     },
                 },
                 "status": {
-                    "capacity": self.CURRENT_MACHINE,
+                    # Node status includes resources outside the reviewed CPU/memory pair.
+                    "capacity": {
+                        **self.CURRENT_MACHINE,
+                        "ephemeral-storage": "1055762868Ki",
+                        "hugepages-1Gi": "0",
+                        "hugepages-2Mi": "0",
+                        "pods": "110",
+                    },
                     "nodeInfo": {"kubeletVersion": "v1.35.0"},
                     "allocatable": {"cpu": "5750m", "memory": "19Gi", "pods": "110"},
                     "conditions": [
@@ -518,6 +525,48 @@ class TransitionTests(TransitionFixture):
         record["phase"] = "deleting"
         owner.save(self.successor, record)
         self.assertEqual(owner.load(self.successor)["phase"], "deleting")
+
+    def test_live_capacity_normalizes_equivalent_quantities_without_mutating_observations(self):
+        for node in self.statuses.values():
+            node["status"]["capacity"].update(cpu="8000m", memory="33554432Ki")
+        before = copy.deepcopy(self.statuses)
+        result = self.run_transition("inspect")
+        self.assertTrue(result["readyForApproval"])
+        self.assertEqual(self.statuses, before)
+        self.assertEqual(self.events, [])
+        self.assertFalse(self.target.path("transition.json").exists())
+
+    def test_invalid_or_changed_live_capacity_refuses_before_journal_or_mutation(self):
+        invalid = (None, [], {}, {"cpu": "8"}, {"memory": "32Gi"})
+        for key in ("cpu", "memory"):
+            for value in (None, 8, "", "invalid", "0", "-1", "NaN"):
+                invalid += ({**NEW_MACHINE, key: value},)
+        invalid += ({**NEW_MACHINE, "cpu": "7"}, {**NEW_MACHINE, "memory": "31Gi"})
+        for role in model.ROLES:
+            original = copy.deepcopy(self.statuses[role]["status"]["capacity"])
+            for value in invalid:
+                with self.subTest(role=role, capacity=value):
+                    self.statuses[role]["status"]["capacity"] = value
+                    with self.assertRaises(ValueError):
+                        self.run_transition()
+                    self.assertEqual(self.events, [])
+                    self.assertFalse(self.target.path("transition.json").exists())
+                    self.assertEqual(
+                        self.target.path("owner.json").read_bytes(), self.original_owner
+                    )
+            self.statuses[role]["status"]["capacity"] = original
+
+    def test_reviewed_capacity_remains_strict_for_both_nodes_and_observation_periods(self):
+        for role in model.ROLES:
+            for period in ("oldMachineCapacity", "newMachineCapacity"):
+                for extra in ("pods", "ephemeral-storage", "hugepages-1Gi", "hugepages-2Mi"):
+                    with self.subTest(role=role, period=period, extra=extra):
+                        changed = copy.deepcopy(self.request)
+                        changed["nodes"][role][period][extra] = "0"
+                        with self.assertRaisesRegex(ValueError, "Explicit CPU/memory"):
+                            transition.execute(self.target, changed, "inspect")
+                        self.assertEqual(self.events, [])
+                        self.assertFalse(self.target.path("transition.json").exists())
 
     def test_read_only_inspect_and_unfinished_guard_do_not_change_owner(self):
         result = self.run_transition("inspect")
