@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Callable
 
 from . import consumer_capacity as capacity
 from . import consumer_lifecycle as lifecycle
@@ -23,6 +24,10 @@ from .profile_transition_model import (
     request_successor,
     validate_request,
 )
+
+# The ordinary CLI never supplies this callback. The separate disposable drill
+# can stop after a completed effect, before its durable intention is advanced.
+AfterEffect = Callable[[str, str | None], None]
 
 
 def successor_owner(target: Target, journal: dict) -> bytes:
@@ -308,7 +313,9 @@ def wait_node(target: Target, journal: dict, role: str) -> None:
         time.sleep(2)
 
 
-def advance(target: Target, journal: dict, *, recovery: bool) -> None:
+def advance(
+    target: Target, journal: dict, *, recovery: bool, after_effect: AfterEffect | None = None
+) -> None:
     operation = journal["request"]["operationId"]
     if journal["phase"] in {"prepared", "backups"}:
         guarded(target, journal)
@@ -371,6 +378,8 @@ def advance(target: Target, journal: dict, *, recovery: bool) -> None:
                         node["containerId"],
                     ],
                 )
+                if after_effect is not None:
+                    after_effect("cap", role)
             # Do not declare the write phase until the actual cap change is proved.
             actual = runtime.node_identity(target)[f"{target.name}-{role}"]
             if not check_caps(actual, budget) or actual["id"] != node["containerId"]:
@@ -380,6 +389,8 @@ def advance(target: Target, journal: dict, *, recovery: bool) -> None:
         if journal["stages"][role] == "write-intent":
             guarded(target, journal)
             private.write(target, node, operation, desired, recovery=recovery)
+            if after_effect is not None:
+                after_effect("write", role)
             journal["stages"][role] = "restart-intent"
             store.save(target, journal)
         if journal["stages"][role] == "restart-intent":
@@ -397,12 +408,16 @@ def advance(target: Target, journal: dict, *, recovery: bool) -> None:
                     "kubelet",
                 ],
             )
+            if after_effect is not None:
+                after_effect("restart", role)
             wait_node(target, journal, role)
             journal["stages"][role] = "verified"
             store.save(target, journal)
 
 
-def finalize(target: Target, journal: dict, *, recovery: bool) -> dict:
+def finalize(
+    target: Target, journal: dict, *, recovery: bool, after_effect: AfterEffect | None = None
+) -> dict:
     successor = request_successor(target, journal["request"])
     guarded(target, journal)
     runtime.verify_nodes(runtime.node_identity(target), profile=successor.profile)
@@ -416,6 +431,8 @@ def finalize(target: Target, journal: dict, *, recovery: bool) -> dict:
         desired = successor_owner(target, journal)
         if digest(current) == journal["predecessorOwnerHash"]:
             store.replace(target.path("owner.json"), desired, journal["predecessorOwnerHash"])
+            if after_effect is not None:
+                after_effect("owner-commit", None)
         elif current != desired or not recovery:
             raise ValueError("Ownership finalization requires explicit recorded recovery")
         bind(target, journal["request"], journal)
@@ -443,7 +460,13 @@ def finalize(target: Target, journal: dict, *, recovery: bool) -> dict:
     }
 
 
-def execute(target: Target, request: dict, action: str) -> dict:
+def execute(
+    target: Target, request: dict, action: str, *, after_effect: AfterEffect | None = None
+) -> dict:
+    if after_effect is not None and (
+        not target.consumer.startswith("qual-") or action != "apply" or not callable(after_effect)
+    ):
+        raise ValueError("Effect checkpoints are limited to explicit disposable apply drills")
     request = validate_request(target, request)
     if action == "inspect":
         if store.exists(target.path("transition.json")):
@@ -481,5 +504,5 @@ def execute(target: Target, request: dict, action: str) -> dict:
         else:
             journal = store.load(target, request)
         if journal["phase"] not in {"finalizing", "complete"}:
-            advance(target, journal, recovery=action == "recover")
-        return finalize(target, journal, recovery=action == "recover")
+            advance(target, journal, recovery=action == "recover", after_effect=after_effect)
+        return finalize(target, journal, recovery=action == "recover", after_effect=after_effect)
