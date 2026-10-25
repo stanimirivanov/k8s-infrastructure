@@ -124,6 +124,12 @@ condition changes, stop and review workload maintenance and data recovery.
 
 ## Gate 4: Disposable qualification
 
+The [interruption drill](../transition-interruption-qualification.md) provides
+fixed, explicitly selected disposable post-effect stops and a case-by-case
+approval/evidence procedure. The 2026-10-25 minimal memory-success/idempotence/
+scheduler run passed; its live interruption matrix remains pending. Neither
+result replaces eligible-host, fresh full-profile or complete-stack evidence.
+
 Prepare an exact preview and obtain separate approval for a disposable target
 on the eligible engine, including temporary bootstrap demand, resource envelope,
 private reads/writes, restart/failure injection, fixture cleanup and retained

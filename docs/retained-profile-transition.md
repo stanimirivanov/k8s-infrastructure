@@ -251,6 +251,16 @@ accepted hashes. Rollback/downsize needs a separate demand and safety assessment
 Completed journal/lock files remain as history even after separately authorized
 cluster removal; a future reused name needs an explicit state-history decision.
 
+## Disposable interruption drills
+
+Use the separate [interruption qualification procedure](transition-interruption-qualification.md)
+for fixed post-effect stops on a fresh `qual-` predecessor. Ordinary transition
+commands do not expose failure injection. A deliberate stop is not successful
+recovery: preserve the journal and obtain separate approval for the existing
+`recover` command. Never reuse a completed qualification cluster by resetting its
+history. The minimal successful path is qualified; the live interrupted-recovery
+matrix, full-profile host eligibility and D06 remain pending.
+
 ## Verification boundaries
 
 `make validate` exercises pure request/policy checks, mocked native interruptions,
