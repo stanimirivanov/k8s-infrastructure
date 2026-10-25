@@ -22,6 +22,7 @@
 | [0008](0008-capped-kind-node-allocatable.md) | Proposed | Correct capped kind scheduling envelopes and separate repair from resource enlargement |
 | [0009](0009-explicit-retained-profile-transition.md) | Proposed | Require an explicit journaled transition for enlarged retained consumer profiles |
 | [0010](0010-disposable-transition-test-profile.md) | Proposed | Separate disposable memory-transition tests from full-installation qualification |
+| [0011](0011-pin-local-argocd-redis-image.md) | Proposed | Pin the Perfeng local Argo CD Redis source and pull policy while preserving image content |
 
 ## Numbering under concurrent work
 

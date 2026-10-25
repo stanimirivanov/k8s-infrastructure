@@ -5,3 +5,10 @@ resources:
   - namespace.yaml
   # Argo CD v3.5.2
   - https://raw.githubusercontent.com/argoproj/argo-cd/v3.5.2/manifests/install.yaml
+images:
+  # Redis 8.2.3-alpine; identical multi-platform content on ECR Public and Docker Hub.
+  - name: public.ecr.aws/docker/library/redis
+    newName: docker.io/library/redis
+    digest: sha256:08ad0b1d280850169a790dba1393ff7a90aef951fc19632cf4d3ce4f78e679ba
+patches:
+  - path: redis-pull-policy.yaml
