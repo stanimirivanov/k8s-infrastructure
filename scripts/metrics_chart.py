@@ -112,11 +112,13 @@ def validate_rendered(objects: list[dict[str, Any]]) -> None:
         raise ValueError("Resource-metrics budgets or private certificate mounts differ")
     api = by_key["APIService", "v1beta1.metrics.k8s.io"]["spec"]
     if (
-        api["insecureSkipTLSVerify"] is not False
+        "insecureSkipTLSVerify" in api
         or not api.get("caBundle")
         or api["service"] != {"name": "metrics-server", "namespace": "monitoring", "port": 443}
     ):
-        raise ValueError("Metrics API aggregation must verify its serving CA")
+        raise ValueError(
+            "Metrics API aggregation must omit the default-false TLS flag and verify its serving CA"
+        )
     rules = by_key["ClusterRole", "substrate-metrics-server"]["rules"]
     if rules != [
         {"apiGroups": [""], "resources": ["nodes/metrics"], "verbs": ["get"]},
