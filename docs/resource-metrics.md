@@ -62,6 +62,15 @@ cluster CA from its projected service-account volume to validate kubelet serving
 Neither `--kubelet-insecure-tls` nor an aggregation TLS bypass is supported. Readiness/liveness
 HTTPS probes do not constitute certificate verification; the APIService and actual scrape path do.
 
+Chart patch 1.0.1 omits the optional `insecureSkipTLSVerify` field. Kubernetes defines it as
+a boolean with `omitempty` in the pinned
+[APIService type](https://github.com/kubernetes/kube-aggregator/blob/v0.35.0/pkg/apis/apiregistration/v1/types.go):
+false is the default and is absent from the API response. Rendering explicit false creates
+a persistent desired/live representation difference in the exercised Argo CD installation.
+Omission retains certificate verification with the required CA and exact Service binding.
+The chart validator enforces that canonical rendering; live health still accepts absent or
+explicit-false representations for compatibility and refuses an actual bypass.
+
 ## Offline verification and preview
 
 Prerequisites are Python 3.12, uv 0.12.5, GNU Make and Helm v4.1.4. `make bootstrap` installs the
@@ -176,6 +185,13 @@ benchmark runtime promotion and M04 completion remain separate gates.
   timestamp, extend the gate or bulk-approve it. Do not use `kubectl certificate approve` as a bypass.
 - APIService unavailable: inspect the selected namespace, Service endpoints, certificate SANs,
   CA bundle and Metrics Server logs. A missing registration is not zero resource usage.
+- APIService Healthy/Available but Argo CD OutOfSync: compare the selected and live public CA,
+  Service binding and every reported diff. With chart 1.0.0, an explicit
+  `insecureSkipTLSVerify: false` can differ from the omitted API default even while TLS and
+  metrics health pass. Select the reviewed merged provider containing chart 1.0.1 through
+  the consumer's Git workflow, reconcile through Argo CD, then require Synced/Healthy and
+  fresh verified metrics. Preserve the existing CA, Secret, nodes and resource identities.
+  This provider source change alone does not promote a consumer pin or prove live convergence.
 - Scrape x509 errors: verify issuance of cluster-CA-signed kubelet leaves; never disable TLS.
 - Missing/stale node metrics: inspect availability, clocks and scrape health; rerun qualification
   only after the prerequisite is healthy. Never edit retained evidence to say PASS.

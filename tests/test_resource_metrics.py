@@ -470,11 +470,27 @@ class ChartTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.objects = metrics_chart.validate()
 
+    def test_aggregation_render_matches_api_omission_of_default_false(self) -> None:
+        api = next(o for o in self.objects if o["kind"] == "APIService")
+        self.assertNotIn("insecureSkipTLSVerify", api["spec"])
+        self.assertIs(api["spec"].get("insecureSkipTLSVerify", False), False)
+        self.assertTrue(api["spec"]["caBundle"])
+
+    def test_render_validator_refuses_reintroduced_aggregation_flags(self) -> None:
+        for value in (False, True, None, 0, "false"):
+            with self.subTest(value=value):
+                objects = copy.deepcopy(self.objects)
+                api = next(o for o in objects if o["kind"] == "APIService")
+                api["spec"]["insecureSkipTLSVerify"] = value
+                with self.assertRaisesRegex(ValueError, "aggregation"):
+                    metrics_chart.validate_rendered(objects)
+
     def test_rejects_privilege_or_tls_regressions(self) -> None:
         for failure in (
             "scrape-rbac",
             "delegation",
             "aggregation",
+            "missing-ca",
             "kubelet",
             "privileged",
             "extra-secret",
@@ -493,6 +509,8 @@ class ChartTests(unittest.TestCase):
                     binding["roleRef"]["name"] = "cluster-admin"
                 elif failure == "aggregation":
                     by_kind["APIService"]["spec"]["insecureSkipTLSVerify"] = True
+                elif failure == "missing-ca":
+                    del by_kind["APIService"]["spec"]["caBundle"]
                 elif failure == "kubelet":
                     by_kind["Deployment"]["spec"]["template"]["spec"]["containers"][0][
                         "args"
@@ -542,6 +560,8 @@ class ChartTests(unittest.TestCase):
         }
         resource_metrics.validate_health(api, metrics, [node()], "monitoring", NOW)
         metrics["items"][0]["window"] = "1m0s"
+        resource_metrics.validate_health(api, metrics, [node()], "monitoring", NOW)
+        api["spec"]["insecureSkipTLSVerify"] = False
         resource_metrics.validate_health(api, metrics, [node()], "monitoring", NOW)
         del api["spec"]["insecureSkipTLSVerify"]
         resource_metrics.validate_health(api, metrics, [node()], "monitoring", NOW)

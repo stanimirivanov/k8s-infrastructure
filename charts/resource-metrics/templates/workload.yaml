@@ -94,5 +94,5 @@ spec:
   version: v1beta1
   groupPriorityMinimum: 100
   versionPriority: 100
-  insecureSkipTLSVerify: false
+  # Kubernetes omits default-false insecureSkipTLSVerify on read-back.
   caBundle: {{ required "tls.caBundle is required" .Values.tls.caBundle | quote }}
