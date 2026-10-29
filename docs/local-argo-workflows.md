@@ -20,10 +20,10 @@ The installation owns only the `argo-workflows` namespace and upstream controlle
 
 Use the locked environment. These commands read only checked-in configuration and print the target commands:
 
-```powershell
+```bash
 uv run --locked python -m scripts.workflows validate
-uv run --locked python -m scripts.workflows bootstrap --state-root ..\perfeng-environment
-uv run --locked python -m scripts.workflows health --state-root ..\perfeng-environment
+uv run --locked python -m scripts.workflows bootstrap --state-root ../perfeng-environment
+uv run --locked python -m scripts.workflows health --state-root ../perfeng-environment
 ```
 
 The preview derives `.local/perfeng-local.kubeconfig` and `kind-perfeng-local` from the selected state root. It does not read that kubeconfig, download the asset or contact Kubernetes. `make configuration-check` checks the same local release selection. `make workflows-asset-check` is a separate network tier: it downloads the upstream asset and verifies its digest and namespaced RBAC topology, but does not contact Kubernetes.
@@ -32,11 +32,11 @@ The preview derives `.local/perfeng-local.kubeconfig` and `kind-perfeng-local` f
 
 Only after selecting an authorized disposable `perfeng-local` cluster and reviewing the preview, run:
 
-```powershell
-uv run --locked python -m scripts.workflows bootstrap --execute `
-  --state-root ..\perfeng-environment
-uv run --locked python -m scripts.workflows health --execute `
-  --state-root ..\perfeng-environment
+```bash
+uv run --locked python -m scripts.workflows bootstrap --execute \
+  --state-root ../perfeng-environment
+uv run --locked python -m scripts.workflows health --execute \
+  --state-root ../perfeng-environment
 ```
 
 The installer first uses the substrate's dedicated kubeconfig and context checks, verifies node/CoreDNS health, reads namespace identity and checks the release bytes. A missing namespace is acceptable only when the eight Workflow CRDs and controller PriorityClass are also absent. The installer then applies the owned Namespace and verified official manifest through server-side apply without force, checks namespace identity again and waits up to 300 seconds per Deployment. An existing namespace must have this repository's complete labels and exact release version. `health` only reads namespace and rollout status.

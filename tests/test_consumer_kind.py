@@ -439,25 +439,10 @@ class ConsumerTests(unittest.TestCase):
     def test_redirected_private_directory_is_rejected(self):
         destination = self.root / "outside"
         destination.mkdir()
-        try:
-            self.target.directory.symlink_to(destination, target_is_directory=True)
-        except OSError:
-            if os.name != "nt":
-                raise
-            # Windows junction creation requires no developer-mode symlink privilege.
-            import subprocess
-
-            subprocess.run(
-                ["cmd", "/c", "mklink", "/J", str(self.target.directory), str(destination)],
-                check=True,
-                capture_output=True,
-            )
+        self.target.directory.symlink_to(destination, target_is_directory=True)
         with self.assertRaises(ValueError):
             self.target.path("owner.json")
-        if self.target.directory.is_junction():
-            self.target.directory.rmdir()
-        else:
-            self.target.directory.unlink()
+        self.target.directory.unlink()
 
     def test_capacity_setup_runs_after_caps_and_failure_retains_partial_identity(self):
         mocks = self.mock_runtime(existing=False)

@@ -14,7 +14,7 @@
   [CONTRIBUTING.md](../../CONTRIBUTING.md#verification-and-constrained-environments).
 
 Resource-metrics packaging additionally requires Helm v4.1.4. CI installs that
-version on both supported operating systems. `make metrics-check` performs
+version on Linux. `make metrics-check` performs
 strict offline linting/rendering and security assertions; `make verify` includes
 it and the certificate/CSR/CLI regression tests. Rendering uses synthetic,
 non-deployable values, never live certificate material. The explicit certificate
@@ -38,7 +38,7 @@ operations and real kubelet/aggregation TLS acceptance remain separate from CI.
 
 `make docs` remains an alias for `make docs-check` so existing contributor
 commands continue to work. The validation job calls the Make targets rather
-than repeating their individual commands. Windows and Linux run `make verify`;
+than repeating their individual commands. Linux run `make verify`;
 separate jobs run `make supply-chain` and the PR metadata check.
 
 ## Check contracts
@@ -94,8 +94,7 @@ The existing unit gate verifies exact scheduler envelopes, host-sized legacy
 rejection, two-node preflight, config/UID races and partial-restart refusal.
 Linux CI additionally executes real shell fixtures for atomic replacement,
 original-byte backup, stale-file/symlink rejection and private permissions.
-Windows runs the same pure/runtime tests but cannot execute a Linux node shell;
-its platform-specific fixture skips do not claim live qualification. The tested
+These fixture tests do not claim live qualification. The tested
 [sizing proposal](../capacity/fleetiq-full-installation.yaml) is never selectable.
 Live scheduler/pressure and retained repair require a separately approved target.
 

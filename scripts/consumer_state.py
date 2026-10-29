@@ -20,7 +20,7 @@ PHASES = {"creating", "provisioned", "ready", "partial", "deleting"}
 def read_bounded(path: Path, maximum: int = 65536) -> str:
     """Read an ordinary owned file without disclosing private bytes in errors."""
     stat = path.lstat()
-    if not path.is_file() or path.is_symlink() or path.is_junction() or stat.st_size > maximum:
+    if not path.is_file() or path.is_symlink() or stat.st_size > maximum:
         raise ValueError("Expected bounded ordinary consumer state")
     return path.read_text(encoding="utf-8")
 

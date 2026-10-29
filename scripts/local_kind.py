@@ -87,7 +87,7 @@ def run(
     print(f"Starting {label} command...", flush=True)
     started = time.monotonic()
     deadline = started + timeout
-    # Capture bytes: Windows' locale decoder can crash a subprocess reader thread
+    # Capture bytes: locale decoding can fail for arbitrary subprocess bytes
     # on kind's UTF-8 progress symbols, even when the child succeeds.
     with subprocess.Popen(
         command,
@@ -95,8 +95,7 @@ def run(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         env={**environment, "KIND_EXPERIMENTAL_PROVIDER": "docker"},
-        start_new_session=os.name != "nt",
-        creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0,
+        start_new_session=True,
     ) as process:
         while True:
             remaining = deadline - time.monotonic()
@@ -134,10 +133,7 @@ def normalize_state_root(root: Path) -> Path:
         raise ValueError("State root must be an existing ordinary directory") from error
     if not resolved.is_dir():
         raise ValueError("State root must be an existing ordinary directory")
-    if any(
-        candidate.is_symlink() or candidate.is_junction()
-        for candidate in (absolute, *absolute.parents)
-    ):
+    if any(candidate.is_symlink() for candidate in (absolute, *absolute.parents)):
         raise ValueError("Redirected local state is not allowed")
     return resolved
 

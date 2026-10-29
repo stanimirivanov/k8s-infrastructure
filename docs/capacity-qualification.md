@@ -40,25 +40,24 @@ Cluster deletion is separate and requires its exact name and explicit authorizat
 ## Preview the exact target
 
 Prepare a new operator-private ordinary state directory before preview; `Target`
-refuses a missing directory or a redirected path. Verify its inherited Windows
-ACL is private. This creates only an empty directory, not a journal or cluster.
+refuses a missing directory or a redirected path. Use mode 0700 so only the operator can access it. This creates only an empty directory, not a journal or cluster.
 Do not reuse another target's state directory.
 
-```powershell
-New-Item -ItemType Directory -Path 'C:\Users\sonof\FleetIQ\state\qual-capacity-32'
+```bash
+install -d -m 0700 "$HOME/edgeagent-state/qual-capacity-32"
 ```
 
-The following PowerShell inputs are a proposed example, not permission to execute:
+The following Bash inputs are a proposed example, not permission to execute:
 
-```powershell
-$capacityTarget = @(
-  '--profile', 'isolated-argo-local',
-  '--consumer', 'qual-capacity-32',
-  '--docker-context', 'desktop-linux',
-  '--state-root', 'C:\Users\sonof\FleetIQ\state\qual-capacity-32'
+```bash
+capacity_target=(
+  --profile isolated-argo-local
+  --consumer qual-capacity-32
+  --docker-context default
+  --state-root "$HOME/edgeagent-state/qual-capacity-32"
 )
-uv run --locked --offline python -m scripts.consumer_kind up @capacityTarget
-uv run --locked --offline python -m scripts.consumer_capacity qualify @capacityTarget
+uv run --locked --offline python -m scripts.consumer_kind up "${capacity_target[@]}"
+uv run --locked --offline python -m scripts.consumer_capacity qualify "${capacity_target[@]}"
 ```
 
 Both commands are offline without `--execute`. The second reports the fixture-image
@@ -69,11 +68,11 @@ No private ownership file or kubeconfig is read by the qualification preview.
 
 Create only the absent disposable target, then qualify it:
 
-```powershell
-uv run --locked --offline python -m scripts.consumer_kind up @capacityTarget --execute
-if ($LASTEXITCODE -ne 0) { throw 'Creation failed; inspect retained disposable state.' }
-uv run --locked --offline python -m scripts.consumer_capacity qualify @capacityTarget --execute
-if ($LASTEXITCODE -ne 0) { throw 'Qualification incomplete; retain all evidence.' }
+```bash
+uv run --locked --offline python -m scripts.consumer_kind up "${capacity_target[@]}" --execute
+[ $? -eq 0 ] || { echo 'Creation failed; inspect retained disposable state.' >&2; exit 1; }
+uv run --locked --offline python -m scripts.consumer_capacity qualify "${capacity_target[@]}" --execute
+[ $? -eq 0 ] || { echo 'Qualification incomplete; retain all evidence.' >&2; exit 1; }
 ```
 
 The bounded run:
@@ -128,8 +127,8 @@ run also leaves both fixtures to prevent silent adoption on retry.
 Whole-cluster disposal uses the original lifecycle command only after exact-target
 removal authorization; it permanently destroys disposable data:
 
-```powershell
-uv run --locked --offline python -m scripts.consumer_kind down @capacityTarget --execute --confirm-delete qual-capacity-32-local
+```bash
+uv run --locked --offline python -m scripts.consumer_kind down "${capacity_target[@]}" --execute --confirm-delete qual-capacity-32-local
 ```
 
 No disposal command belongs to the persistent `fleetiq-local` target.

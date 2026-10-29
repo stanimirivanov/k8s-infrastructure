@@ -78,9 +78,9 @@ uv run --locked python -m scripts.local_kind down
 
 Preview the existing Perfeng state boundary explicitly without accessing it:
 
-```powershell
-uv run --locked python -m scripts.local_kind health `
-  --state-root ..\perfeng-environment
+```bash
+uv run --locked python -m scripts.local_kind health \
+  --state-root ../perfeng-environment
 ```
 
 Preview reads the checked-in profile and prints exact command arrays. It does
@@ -94,9 +94,9 @@ It does not delete either resource.
 
 After reviewing the preview, add `--execute` to operate the selected state root:
 
-```powershell
-uv run --locked python -m scripts.local_kind health --execute `
-  --state-root ..\perfeng-environment
+```bash
+uv run --locked python -m scripts.local_kind health --execute \
+  --state-root ../perfeng-environment
 ```
 
 The actions are:
