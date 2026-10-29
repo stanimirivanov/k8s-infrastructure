@@ -117,9 +117,9 @@ download the upstream manifest or contact Kubernetes.
 To review compatibility with the currently active Perfeng state location,
 select that path explicitly:
 
-```powershell
-uv run --locked python -m scripts.argocd health `
-  --state-root ..\perfeng-environment
+```bash
+uv run --locked python -m scripts.argocd health \
+  --state-root ../perfeng-environment
 ```
 
 The bootstrap sequence verifies cluster health and the existing namespace
@@ -133,11 +133,11 @@ Neither sequence contains consumer reconciliation or credential creation.
 
 After reviewing the preview, execution requires the intended state root:
 
-```powershell
-uv run --locked python -m scripts.argocd bootstrap --execute `
-  --state-root ..\perfeng-environment
-uv run --locked python -m scripts.argocd health --execute `
-  --state-root ..\perfeng-environment
+```bash
+uv run --locked python -m scripts.argocd bootstrap --execute \
+  --state-root ../perfeng-environment
+uv run --locked python -m scripts.argocd health --execute \
+  --state-root ../perfeng-environment
 ```
 
 Bootstrap accepts three states:

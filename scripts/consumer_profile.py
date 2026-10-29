@@ -120,7 +120,7 @@ class Target:
             raise ValueError("Unknown consumer state path")
         path = self.directory / f"{self.name}.{suffix}"
         for candidate in (path, path.parent):
-            if candidate.is_symlink() or candidate.is_junction():
+            if candidate.is_symlink():
                 raise ValueError("Redirected consumer state refused")
             if candidate.exists() and candidate.resolve() != candidate:
                 raise ValueError("Redirected consumer state refused")

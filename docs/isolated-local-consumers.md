@@ -30,9 +30,8 @@ observe only; ensure reuses only a complete healthy identity or creates a fully
 absent target. It never repairs a partial or foreign target implicitly.
 
 State roots must be operator-private ordinary directories. Linked paths and
-junctions are refused. Files use mode 0600 and the state directory mode 0700;
-on Windows the operator must also provide an appropriately restricted inherited
-ACL. No global kubeconfig or credential store is changed. Do not commit owner
+symlinks are refused. Files use mode 0600 and the state directory mode 0700.
+No global kubeconfig or credential store is changed. Do not commit owner
 records or kubeconfig bytes, and do not copy another consumer's credentials.
 
 ## Profile and resource envelope

@@ -78,7 +78,7 @@ locked cryptography package for strict CSR parsing and certificate issuance. It 
 BSD-3-Clause; the lock also includes CFFI (MIT-0) and pycparser (BSD-3-Clause). Certificate handling does not use a shell
 OpenSSL parser or a new long-running approval service.
 
-```powershell
+```bash
 make bootstrap
 make validate
 uv run --locked python -m scripts.resource_metrics enable-serving
@@ -95,7 +95,7 @@ the existing dedicated kind cluster through the consumer state root, never the a
 Pause benchmark Runs and coordinate one operator; kubelet configuration/restarts must not overlap
 other node administration. These are **mutating** operations and require separate confirmations.
 
-```powershell
+```bash
 uv run --locked python -m scripts.resource_metrics enable-serving --state-root ../perfeng-environment --execute --confirm perfeng-local
 ```
 
@@ -109,14 +109,14 @@ is retained for inspection, never hidden by automatic rollback or cluster recrea
 
 Kubernetes deliberately does not auto-approve kubelet serving CSRs. Inspect pending requests:
 
-```powershell
+```bash
 uv run --locked python -m scripts.resource_metrics inspect --state-root ../perfeng-environment --execute
 ```
 
 Review the printed request name, node name/UID and addresses. Approve each **specific** reviewed
 request, using the values from inspection, not a copied example name:
 
-```powershell
+```bash
 uv run --locked python -m scripts.resource_metrics approve --state-root ../perfeng-environment --request ACTUAL_CSR_NAME --node ACTUAL_NODE_NAME --execute --confirm perfeng-local
 ```
 
@@ -134,7 +134,7 @@ make a compromised cluster administrator safe. Approval is not proof the signer 
 
 Provision the Metrics Server leaf and its independent serving CA, once:
 
-```powershell
+```bash
 uv run --locked python -m scripts.resource_metrics serving-tls --state-root ../perfeng-environment --namespace monitoring --execute --confirm perfeng-local
 ```
 
@@ -158,7 +158,7 @@ Environment selection cannot pin this uncommitted directory or a future placehol
 
 After Argo CD sync/rollout, run the read-only capability check:
 
-```powershell
+```bash
 uv run --locked python -m scripts.resource_metrics health --state-root ../perfeng-environment --namespace monitoring --execute
 ```
 

@@ -5,6 +5,7 @@ capability qualification.
 
 ## TL;DR
 
+- Development and CI require Linux; see [host support](docs/decisions/0012-support-linux-development-hosts.md).
 - This repository will own reusable local and cloud Kubernetes substrates.
 - It will install and qualify Argo CD, but it will not own applications that
   Argo CD reconciles for consuming projects.

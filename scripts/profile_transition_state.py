@@ -23,7 +23,7 @@ from .profile_transition_model import (
 def read(path: Path, maximum: int = 131072) -> bytes:
     """Read bounded ordinary state without exposing contents in diagnostics."""
     metadata = path.lstat()
-    if not path.is_file() or path.is_symlink() or path.is_junction() or metadata.st_size > maximum:
+    if not path.is_file() or path.is_symlink() or metadata.st_size > maximum:
         raise ValueError("Expected bounded ordinary private transition state")
     with path.open("rb") as handle:
         data = handle.read(maximum + 1)
@@ -33,12 +33,11 @@ def read(path: Path, maximum: int = 131072) -> bytes:
 
 
 def sync_directory(path: Path) -> None:
-    if os.name != "nt":
-        directory = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+    directory = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
 
 
 def exists(path: Path) -> bool:
@@ -125,14 +124,9 @@ def locked(target: Target):
         raise ValueError("Unexpected transition lock file")
     with path.open("r+b") as handle:
         try:
-            if os.name == "nt":
-                import msvcrt
+            import fcntl
 
-                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             raise ValueError("Another transition operation holds the target lock") from None
         try:
@@ -141,15 +135,9 @@ def locked(target: Target):
             handle.seek(0)
             yield
         finally:
-            if os.name == "nt":
-                import msvcrt
+            import fcntl
 
-                handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def load(target: Target, request: dict) -> dict:

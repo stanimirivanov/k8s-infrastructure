@@ -85,8 +85,7 @@ and `newMachineCapacity` in the request must still contain exactly `cpu` and
 `memory`. Missing, invalid or changed live CPU/memory values stop preflight
 before journal creation or node changes.
 
-Use the operator-private existing state root outside Git, with an appropriate
-Windows ACL when applicable. Do not copy it from another cluster. The following
+Use the operator-private existing state root outside Git, with mode 0700 and files restricted to mode 0600. Do not copy it from another cluster. The following
 relative paths remain under that root:
 
 | File | Purpose |
