@@ -1,50 +1,27 @@
-Closes #<issue-number>
+## Summary
 
-<!-- PR title: [#<issue-number>] Concise outcome -->
+Closes #
 
-## Linked work
+Describe the problem and resulting behavior using the smallest useful diagram,
+diff sketch or tree. Link the owning issue and relevant milestone.
 
-- Issue:
-- Milestone: MNN — Outcome
+Provider/account/region and target identity; state ownership, compatibility, credentials, network/IAM and cost effects. Record authorized external operations, rollout, recovery, rollback and destroy implications.
 
-## Outcome and scope
+## Evidence
 
-Problem and resulting behavior:
+- **Before:** Reproduction, output or previous behavior.
+- **After:** Verified result and exact commands.
 
-Boundaries and deliberate exclusions:
+`make verify` and `make validate`; live acceptance only when explicitly authorized.
 
-Assumptions and unresolved questions:
+Checks not run, blocking conditions, and residual risk:
 
-## Design, state and operations
+## Merge Danger
 
-- ADRs:
-- Provider/account/region and target identity:
-- State and compatibility effects:
-- Security, network and credential effects:
-- Cost effects and enforcement:
-- Rollout, recovery, rollback and destroy:
-- External operations authorized by:
+**Door:** one-way or two-way
 
-## Verification
+**Blast Radius:** affected scope
 
-- [ ] Ruff formatting
-- [ ] Ruff linting
-- [ ] Type checking
-- [ ] Unit tests
-- [ ] Documentation links
-- [ ] Affected Terraform/Kustomize/policy checks
-- [ ] Live acceptance where explicitly authorized
-
-Commands and non-secret evidence:
-
-Checks not run, blocking reason and residual risk:
-
-## Limitations and review
-
-- [ ] One coherent, independently mergeable outcome
-- [ ] Relevant rejection, timeout and recovery behavior is tested
-- [ ] Documentation and troubleshooting are current
-- [ ] No secrets, state, plans, kubeconfigs, machine paths or unrelated churn
-- [ ] No unapproved external side effects or destructive actions
-
-Known limitations and follow-up:
+Describe material compatibility, security and operational risks, limitations and
+rollback. Evidence and checked boxes do not grant publication, merge or live
+infrastructure authority.

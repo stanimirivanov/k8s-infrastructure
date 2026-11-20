@@ -7,7 +7,8 @@ assignees: ""
 ---
 
 **Repository:** k8s-infrastructure
-**Milestone:** MNN — Outcome
+
+Milestone (when applicable):
 
 ## Goal
 
@@ -15,26 +16,18 @@ Describe the problem and observable result.
 
 ## Scope
 
-- Included behavior and boundaries.
+Bounded behavior, owning modules and explicit exclusions.
 
-## Design decisions
+## Dependencies
 
-- Choices, assumptions, state/compatibility effects and ADRs.
-
-## Security and operations
-
-- Trust boundaries, credentials, cost, external effects, rollout and recovery.
+Link blockers and parent work. Include cross-repository compatibility and rollout order.
 
 ## Acceptance criteria
 
-- [ ] Observable behavior and verification evidence.
-- [ ] Relevant rejection, failure and recovery behavior is covered.
-- [ ] Documentation, compatibility and operational effects are addressed.
+- [ ] Observable behavior and relevant rejection/failure paths.
+- [ ] Contract, security and operational effects are addressed.
 
 ## Verification
 
-- Required offline and explicitly authorized live checks.
-
-## Out of scope
-
-- Explicit exclusions and deferred work.
+Required checks, prerequisites and evidence. Distinguish offline checks from
+explicitly authorized live operations.

@@ -12,22 +12,8 @@ from pathlib import Path
 from .check_docs import markdown_files, validate_links, visible_lines
 
 ROOT = Path(__file__).resolve().parents[1]
-ISSUE_HEADINGS = (
-    "Goal",
-    "Scope",
-    "Design decisions",
-    "Security and operations",
-    "Acceptance criteria",
-    "Verification",
-    "Out of scope",
-)
-PR_HEADINGS = (
-    "Linked work",
-    "Outcome and scope",
-    "Design, state and operations",
-    "Verification",
-    "Limitations and review",
-)
+ISSUE_HEADINGS = ("Goal", "Scope", "Dependencies", "Acceptance criteria", "Verification")
+PR_HEADINGS = ("Summary", "Evidence", "Merge Danger")
 ADR_NAME = re.compile(r"^(\d{4})-[a-z0-9-]+\.md$")
 ADR_HEADING = re.compile(r"^# ADR[- ](\d{4}):\s+\S")
 METADATA = re.compile(r"^- ([A-Za-z][A-Za-z ]+):\s*(.*)$", re.MULTILINE)
@@ -66,7 +52,7 @@ def check_documentation(root: Path) -> list[str]:
 
 
 def check_templates(root: Path) -> list[str]:
-    """Keep issue and PR prompts aligned with CONTRIBUTING's canonical form."""
+    """Validate skill-compatible templates without fixing issue prose or order."""
     errors: list[str] = []
     for name, expected in (
         (".github/ISSUE_TEMPLATE/work-item.md", ISSUE_HEADINGS),
@@ -77,21 +63,14 @@ def check_templates(root: Path) -> list[str]:
             errors.append(f"{name}: required template is missing")
             continue
         text = path.read_text(encoding="utf-8")
-        actual = tuple(re.findall(r"^##\s+(.+?)\s*$", text, re.MULTILINE))
-        if actual != expected:
-            errors.append(f"{name}: section order differs from CONTRIBUTING.md")
-        if "Milestone:" not in text:
-            errors.append(f"{name}: milestone prompt is missing")
+        actual = tuple(re.findall(r"^##\s+(.+?)\s*$", "\n".join(visible_lines(text)), re.MULTILINE))
+        if any(heading not in actual for heading in expected):
+            errors.append(f"{name}: required skill sections are missing")
         if (
             name.startswith(".github/ISSUE_TEMPLATE/")
             and "**Repository:** k8s-infrastructure" not in text
         ):
             errors.append(f"{name}: repository identity is missing")
-        if name == ".github/PULL_REQUEST_TEMPLATE.md":
-            if not text.startswith("Closes #<issue-number>\n"):
-                errors.append(f"{name}: first line must be Closes #<issue-number>")
-            if "[#<issue-number>]" not in text:
-                errors.append(f"{name}: issue-prefixed PR title prompt is missing")
     return errors
 
 
@@ -108,33 +87,21 @@ def check_pr_event(event: Mapping[str, object]) -> list[str]:
     if author == "dependabot[bot]":
         return []
 
-    title = request.get("title")
     body = request.get("body")
-    branch = _mapping(request.get("head")).get("ref")
-    title_match = (
-        re.fullmatch(r"\[#([1-9][0-9]*)\] +\S.*", title) if isinstance(title, str) else None
+    visible = "\n".join(visible_lines(body)) if isinstance(body, str) else ""
+    visible = re.sub(r"<!--[\s\S]*?-->", "", visible)
+    visible = re.sub(r"`[^`]*`", "", visible)
+    # Accept local numbers and fully qualified cross-repository references.
+    closing = re.compile(
+        r"\b(?:closes?|fix(?:es)?|resolves?)\s+"
+        r"(?:#[1-9][0-9]*|[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[1-9][0-9]*|"
+        r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/issues/[1-9][0-9]*)"
+        r"(?=$|[\s.,;:)])",
+        re.IGNORECASE,
     )
-    first_line = body.splitlines()[0] if isinstance(body, str) and body else ""
-    body_match = re.fullmatch(r"Closes #([1-9][0-9]*)", first_line)
-    branch_match = (
-        re.fullmatch(r"(?:feature|fix)/issue-([1-9][0-9]*)", branch)
-        if isinstance(branch, str)
-        else None
-    )
-
-    errors: list[str] = []
-    if title_match is None:
-        errors.append("pull_request.title: start with [#N] and a concise summary")
-    if body_match is None:
-        errors.append("pull_request.body: first line must be Closes #N")
-    if branch_match is None:
-        errors.append("pull_request.head.ref: use feature/issue-N or fix/issue-N")
-    numbers = [
-        match.group(1) for match in (title_match, body_match, branch_match) if match is not None
-    ]
-    if len(set(numbers)) > 1:
-        errors.append("pull_request: title, body, and branch must reference one issue")
-    return errors
+    if not closing.search(visible):
+        return ["pull_request.body: include a visible closing issue reference"]
+    return []
 
 
 def check_adrs(root: Path) -> list[str]:

@@ -46,35 +46,42 @@ class RepositoryPolicyTests(TestCase):
             self.assertEqual(check_templates(root), [])
             issue.write_text("**Milestone:** MNN — Outcome\n## Scope\n", encoding="utf-8")
             self.assertTrue(any("repository identity" in error for error in check_templates(root)))
-            self.assertTrue(any("section order" in error for error in check_templates(root)))
-            pull_request.write_text(
-                pull_request.read_text(encoding="utf-8").replace("Closes #<issue-number>", "Issue"),
+            self.assertTrue(
+                any("required skill sections" in error for error in check_templates(root))
+            )
+            # Skill-compatible issue formats may reorder sections and add context.
+            issue.write_text(
+                "**Repository:** k8s-infrastructure\n"
+                + "\n".join(f"## {heading}" for heading in reversed(ISSUE_HEADINGS)),
                 encoding="utf-8",
             )
-            self.assertTrue(any("first line" in error for error in check_templates(root)))
+            self.assertEqual(check_templates(root), [])
 
-    def test_pr_event_requires_matching_issue_numbers(self) -> None:
+    def test_pr_event_accepts_skill_body_and_arbitrary_branch(self) -> None:
         request = {
-            "title": "[#18] Enforce issue-linked pull requests",
-            "body": "Closes #18\n\nVerification: make verify",
-            "head": {"ref": "feature/issue-18"},
+            "title": "Preserve infrastructure ownership",
+            "body": "## Summary\n\nCloses #18\n\n## Evidence\nmake verify",
+            "head": {"ref": "chore/workflow-migration"},
             "user": {"login": "contributor"},
         }
         self.assertEqual(check_pr_event({"pull_request": request}), [])
-        for field, value in (
-            ("title", "[#19] Wrong issue"),
-            ("body", "Closes #19\n\nWrong issue"),
-            ("head", {"ref": "fix/issue-19"}),
+        for reference in (
+            "Fixes stanimirivanov/k8s-infrastructure#18",
+            "Resolves https://github.com/stanimirivanov/k8s-infrastructure/issues/18",
         ):
-            with self.subTest(field=field):
-                changed = {**request, field: value}
-                self.assertTrue(
-                    any("one issue" in error for error in check_pr_event({"pull_request": changed}))
-                )
-        missing = {**request, "body": "Summary without closing reference"}
-        self.assertTrue(
-            any("first line" in error for error in check_pr_event({"pull_request": missing}))
-        )
+            self.assertEqual(check_pr_event({"pull_request": {**request, "body": reference}}), [])
+        for body in (
+            None,
+            "No linkage",
+            "Closes #0",
+            "Closes #18suffix",
+            "<!-- Closes #18 -->",
+            "```\nCloses #18\n```",
+            "`Closes #18`",
+        ):
+            with self.subTest(body=body):
+                self.assertTrue(check_pr_event({"pull_request": {**request, "body": body}}))
+        self.assertTrue(check_pr_event({}))
 
     def test_dependabot_pr_is_exempt_from_human_issue_format(self) -> None:
         event = {
@@ -95,7 +102,7 @@ class RepositoryPolicyTests(TestCase):
                     {
                         "pull_request": {
                             "title": "[#18] Valid",
-                            "body": "Closes #18\n\nDetails",
+                            "body": "No issue linkage",
                             "head": {"ref": "feature/issue-19"},
                             "user": {"login": "contributor"},
                         }
@@ -110,7 +117,7 @@ class RepositoryPolicyTests(TestCase):
                 output = io.StringIO()
                 with redirect_stdout(output):
                     self.assertEqual(main(["--pr-event"]), 1)
-                self.assertIn("one issue", output.getvalue())
+                self.assertIn("closing issue reference", output.getvalue())
 
     def test_adrs_reject_missing_index_and_number_mismatch(self) -> None:
         with TemporaryDirectory() as temporary:
