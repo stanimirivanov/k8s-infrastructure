@@ -2,31 +2,35 @@
 
 ## TL;DR
 
-- Read `CONTRIBUTING.md`; it is the canonical workflow policy.
+- Read `CONTRIBUTING.md` for technical verification and external-operation rules.
 - Preserve infrastructure state, credentials, cluster identities and ownership
   boundaries.
 - Keep validation offline; make plan, apply and destroy explicit and bounded.
 - Run the exact repository checks and report their results honestly.
 
 This is the concise, tool-facing entry point for contributors and coding
-agents. [CONTRIBUTING.md](CONTRIBUTING.md) is the canonical workflow policy.
+agents. [CONTRIBUTING.md](CONTRIBUTING.md) owns technical verification and external-operation rules.
 Normative terms such as MUST, SHOULD and MAY have the meanings defined there.
 
-## Before changing anything
+## Workflow authority
 
-1. You MUST read [CONTRIBUTING.md](CONTRIBUTING.md), especially its ambiguity,
-   issue-timing, verification and external-side-effect rules.
-2. You MUST inspect the branch and working tree and preserve pre-existing work.
-3. You MUST read the applicable
-   [documentation map](docs/README.md),
-   [engineering standards](docs/development/engineering-standards.md), accepted
-   [ADRs](docs/decisions/README.md), provider guide and capability contract.
-4. You MUST use repository-local checks. You MUST NOT claim an unavailable or
-   unexecuted check passed.
+Use installed `mattpocock/skills` as the primary workflow for matching tasks.
+Discover and load skills on demand. When workflows overlap, use the matching
+Matt Pocock skill rather than a parallel workflow. Use other skills only for
+capabilities not covered by that workflow or when explicitly requested.
 
-If code, infrastructure state, documentation and an accepted decision disagree,
-you MUST surface the conflict. Correct an obvious local defect or propose a
-superseding ADR; do not silently pick the convenient source.
+Repository guidance supplies technical constraints, architecture boundaries and
+verification requirements. Scoped `AGENTS.md` files are subordinate for workflow
+decisions and add only module-specific constraints. Explicit user instructions
+and host permissions remain authoritative.
+
+## Technical context
+
+Read the applicable [documentation map](docs/README.md),
+[engineering standards](docs/development/engineering-standards.md),
+[ADRs](docs/decisions/README.md), provider guide and capability contract.
+Use repository-local checks and preserve pre-existing work and infrastructure state.
+Surface conflicts with accepted decisions rather than silently changing ownership.
 
 ## Repository responsibility
 
@@ -40,16 +44,6 @@ credentials, release selection, data migration or product acceptance.
   Git.
 - A consumer owns the desired state it submits to the installed Argo CD.
 - No existing environment changes owner until its reviewed cutover passes.
-
-## Shape of work
-
-- Each task and pull request MUST deliver one coherent, independently
-  reviewable infrastructure capability.
-- Separate extraction, ownership cutover, provider addition, dependency update
-  and broad refactoring unless correctness makes them inseparable.
-- Scope, exclusions, target identity, state effects, cost risk, rollout,
-  recovery, rollback and verification evidence MUST be explicit.
-- Prefer a thin exercised capability over a speculative provider abstraction.
 
 ## Infrastructure rules
 
@@ -74,7 +68,23 @@ credentials, release selection, data migration or product acceptance.
 - Long documents MUST include the TL;DR required by CONTRIBUTING.
 - Operational changes and troubleshooting guidance change together.
 
-## Completion
+## Verification
 
-The exact checks and completion-report format are defined in
-[CONTRIBUTING.md](CONTRIBUTING.md). Follow them after every work item.
+Run the exact checks in [CONTRIBUTING.md](CONTRIBUTING.md#verification-and-constrained-environments).
+Report passed, failed and unavailable checks with their limitations.
+
+## Agent skills
+
+### Issue tracker
+
+GitHub Issues in `stanimirivanov/k8s-infrastructure`.
+See [issue tracker](docs/agents/issue-tracker.md).
+
+### Triage labels
+
+Use the five configured roles. See [triage labels](docs/agents/triage-labels.md).
+
+### Domain docs
+
+Single-context glossary and repository-owned decisions.
+See [domain docs](docs/agents/domain.md).

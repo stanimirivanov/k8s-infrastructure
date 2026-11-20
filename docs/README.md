@@ -32,5 +32,6 @@
 | Resource Metrics API or kubelet serving certificates | [Verified resource metrics](resource-metrics.md), [ADR-0002](decisions/0002-verified-resource-metrics.md) |
 | Reviewing imported history | [Local-kind](migrations/local-kind-history-import.md) and [Argo CD](migrations/argocd-history-import.md) migration records |
 
-This map routes readers to the smallest relevant guidance. `CONTRIBUTING.md`
-remains the canonical contributor workflow and completion-report policy.
+This map routes readers to technical guidance. [AGENTS.md](../AGENTS.md) selects
+the installed Matt Pocock workflow; [CONTRIBUTING.md](../CONTRIBUTING.md) owns
+technical verification and external-operation constraints.

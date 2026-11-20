@@ -51,15 +51,11 @@ health. Regression tests cover accepted and rejected states.
 The setup-uv action intentionally retains its reviewed commit hash as the owner's
 explicit exception to the general major-version action preference.
 
-On human-authored pull requests, the separate metadata workflow checks the
-event title, first body line, and source branch for one matching issue number.
-It checks out the exact base revision and runs only its trusted policy code; it
-never checks out or executes pull-request source. The job has read-only
-permissions, reads the local event payload without a GitHub API call, and
-needs no repository secret. Require the `Issue-linked pull request metadata`
-job in branch protection to make this a merge gate. Dependabot
-dependency-update pull requests are exempt because their generated branches
-and titles do not follow the issue-linked contributor workflow.
+The metadata workflow validates a visible closing issue link in human PR bodies.
+Titles and branches follow the selected skill without a repository-specific syntax.
+Dependabot remains exempt. The workflow reads the trusted base revision; a migration
+PR must satisfy the old base policy until this change merges. Retain its existing
+job identity so required checks continue to resolve.
 
 `make configuration-check` validates the exact checked-in Perfeng compatibility
 profile, isolated consumer profile/budgets and pinned Argo CD selection. It reads only repository-owned configuration and
