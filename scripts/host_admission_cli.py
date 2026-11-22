@@ -12,6 +12,13 @@ from . import host_admission as model
 from . import host_observation
 
 
+def read_json(path: Path, *, code: str) -> dict:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (ValueError, UnicodeError):
+        raise model.Refusal("Malformed JSON input", code=code) from None
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("preview", "observe", "host-id"))
@@ -23,12 +30,12 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.action == "host-id":
             if not args.execute:
-                raise ValueError("Host observation requires --execute")
+                raise model.Refusal("Host observation requires --execute")
             print(json.dumps({"hostId": host_observation.host_id()}))
             return 0
         if args.request is None:
-            raise ValueError("Explicit request required")
-        request = json.loads(args.request.read_text(encoding="utf-8"))
+            raise model.Refusal("Explicit request required")
+        request = read_json(args.request, code="invalid-request")
         model.validate(request)
         source_digest = model.digest(
             {
@@ -45,9 +52,9 @@ def main(argv: list[str] | None = None) -> int:
         }
         if args.action == "preview":
             if args.execute:
-                raise ValueError("Preview is offline; --execute is unsupported")
+                raise model.Refusal("Preview is offline; --execute is unsupported")
             if args.observation:
-                observed = json.loads(args.observation.read_text(encoding="utf-8"))
+                observed = read_json(args.observation, code="invalid-observation")
                 result.update(
                     model.evaluate(
                         request, observed, host_id=args.host_id or "", now=int(time.time())
@@ -55,7 +62,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
         else:
             if not args.execute or not args.host_id or args.observation:
-                raise ValueError(
+                raise model.Refusal(
                     "Observe requires --execute and --host-id, without saved observations"
                 )
             observed = host_observation.observe(request, expected_host_id=args.host_id)
@@ -68,32 +75,33 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(result, indent=2))
         return 0 if result.get("admitted", True) else 1
     except model.Refusal as error:
-        print(
-            json.dumps(
-                {
-                    "policy": model.POLICY,
-                    "admitted": False,
-                    "liveAdmission": False,
-                    "installedAcceptance": False,
-                    "reason": str(error),
-                }
-            )
+        reason = error.code
+    except (TimeoutError, subprocess.TimeoutExpired):
+        reason = "observation-timeout"
+    except FileNotFoundError:
+        reason = "missing-prerequisite"
+    except PermissionError:
+        reason = "permission-denied"
+    except subprocess.SubprocessError:
+        reason = "measurement-failed"
+    except OSError:
+        reason = "host-evidence-unavailable"
+    except Exception:
+        # An unexpected defect is distinct from missing evidence. Never expose
+        # exception text: it may contain private paths or subprocess arguments.
+        reason = "internal-error"
+    print(
+        json.dumps(
+            {
+                "policy": model.POLICY,
+                "admitted": False,
+                "liveAdmission": False,
+                "installedAcceptance": False,
+                "reason": reason,
+            }
         )
-        return 1
-    except (OSError, ValueError, TypeError, KeyError, AttributeError, subprocess.SubprocessError):
-        # Input and OS exceptions can contain private paths; never echo them.
-        print(
-            json.dumps(
-                {
-                    "policy": model.POLICY,
-                    "admitted": False,
-                    "liveAdmission": False,
-                    "installedAcceptance": False,
-                    "reason": "invalid-input-or-unavailable-host-evidence",
-                }
-            )
-        )
-        return 1
+    )
+    return 1
 
 
 if __name__ == "__main__":

@@ -14,7 +14,11 @@ MAX_AGE_SECONDS = 60
 
 
 class Refusal(ValueError):
-    """A sanitized policy refusal safe to include in a public receipt."""
+    """A policy refusal with a stable, sanitized receipt category."""
+
+    def __init__(self, message: str, *, code: str = "invalid-request") -> None:
+        super().__init__(message)
+        self.code = code
 
 
 def digest(value: Any) -> str:
@@ -26,24 +30,36 @@ def digest(value: Any) -> str:
     )
 
 
-def integer(value: Any) -> int:
+def integer(value: Any, *, code: str = "invalid-request") -> int:
     if type(value) is not int or not 0 <= value <= 2**63 - 1:
-        raise Refusal("Missing or invalid nonnegative integer metric")
+        raise Refusal("Missing or invalid nonnegative integer metric", code=code)
     return value
 
 
-def validate(request: dict) -> None:
+def validate(request: Any) -> None:
     """Require explicit consumer bounds; these are reservations, not measured minima."""
+    if not isinstance(request, dict):
+        raise Refusal("Request must be an object")
+    if not isinstance(request.get("target"), str):
+        raise Refusal("Target must be a string")
     if request.get("version") != 1 or not re.fullmatch(
         r"[a-z][a-z0-9-]{0,63}", request.get("target", "")
     ):
         raise Refusal("Invalid request version or target")
-    if not re.fullmatch(r"sha256:[0-9a-f]{64}", request.get("artifactDigest", "")):
+    if not isinstance(request.get("artifactDigest"), str) or not re.fullmatch(
+        r"sha256:[0-9a-f]{64}", request["artifactDigest"]
+    ):
         raise Refusal("Immutable consumer artifact digest required")
     for field in ("memory", "disk"):
         items = request.get(field)
         if not isinstance(items, list) or not 1 <= len(items) <= 64:
             raise Refusal("Missing or oversized resource accounts")
+        if any(not isinstance(item, dict) for item in items):
+            raise Refusal("Resource accounts must be objects")
+        for item in items:
+            for key in ("kind", "category", "path", "cgroup"):
+                if key in item and not isinstance(item[key], str):
+                    raise Refusal("Account labels and paths must be strings")
         names = [item.get("id") for item in items]
         if any(
             not isinstance(name, str) or not re.fullmatch(r"[a-z][a-z0-9-]{0,63}", name)
@@ -52,6 +68,8 @@ def validate(request: dict) -> None:
             raise Refusal("Invalid or duplicate account identity")
         for item in items:
             integer(item.get("limitBytes"))
+    if any(not isinstance(item.get("path"), str) for item in request["disk"]):
+        raise Refusal("Disk account paths must be strings")
     kinds = {item.get("kind") for item in request["memory"]}
     if kinds != {"workload", "browser", "tooling"}:
         raise Refusal("Explicit workload, browser and tooling accounts required")
@@ -68,26 +86,43 @@ def validate(request: dict) -> None:
 def evaluate(request: dict, observation: dict, *, host_id: str, now: int) -> dict:
     """Pure incremental decision. The live caller supplies current host identity/time."""
     validate(request)
+    if not isinstance(observation, dict):
+        raise Refusal("Observation must be an object", code="invalid-observation")
+    for field in ("memory", "disk"):
+        metrics = observation.get(field)
+        if not isinstance(metrics, dict) or any(
+            not isinstance(metric, dict) for metric in metrics.values()
+        ):
+            raise Refusal("Observation accounts must be objects", code="invalid-observation")
     if (
         observation.get("version") != 1
         or observation.get("requestDigest") != digest(request)
         or observation.get("target") != request["target"]
         or observation.get("hostId") != host_id
     ):
-        raise Refusal("Stale request, target or host identity")
-    age = integer(now) - integer(observation.get("observedAt"))
+        raise Refusal("Stale request, target or host identity", code="identity-mismatch")
+    age = integer(now, code="invalid-observation") - integer(
+        observation.get("observedAt"), code="invalid-observation"
+    )
     if not 0 <= age <= MAX_AGE_SECONDS:
-        raise Refusal("Stale or future observation; observe again")
+        raise Refusal("Stale or future observation; observe again", code="stale-observation")
     for field in ("memory", "disk"):
         if set(observation.get(field, {})) != {item["id"] for item in request[field]}:
-            raise Refusal("Observation account inventory differs from request")
+            raise Refusal(
+                "Observation account inventory differs from request", code="invalid-observation"
+            )
     incremental_memory = 0
     for item in request["memory"]:
-        resident = integer(observation.get("memory", {}).get(item["id"], {}).get("residentBytes"))
+        resident = integer(
+            observation["memory"][item["id"]].get("residentBytes"), code="invalid-observation"
+        )
         if resident > item["limitBytes"]:
-            raise Refusal("Resident memory exceeds declared bound")
+            raise Refusal("Resident memory exceeds declared bound", code="resource-bound-exceeded")
         incremental_memory += item["limitBytes"] - resident
-    remaining_memory = integer(observation.get("memAvailableBytes")) - incremental_memory
+    remaining_memory = (
+        integer(observation.get("memAvailableBytes"), code="invalid-observation")
+        - incremental_memory
+    )
     stores: dict[str, dict] = {}
     physical: dict[str, tuple] = {}
     categories = dict.fromkeys(CATEGORIES, 0)
@@ -100,25 +135,29 @@ def evaluate(request: dict, observation: dict, *, host_id: str, now: int) -> dic
             or not isinstance(account, str)
             or not account
         ):
-            raise Refusal("Missing physical filesystem/account identity")
+            raise Refusal(
+                "Missing physical filesystem/account identity", code="invalid-observation"
+            )
         available, resident = (
-            integer(metric.get("availableBytes")),
-            integer(metric.get("residentBytes")),
+            integer(metric.get("availableBytes"), code="invalid-observation"),
+            integer(metric.get("residentBytes"), code="invalid-observation"),
         )
         if resident > item["limitBytes"]:
-            raise Refusal("Resident disk exceeds declared bound")
+            raise Refusal("Resident disk exceeds declared bound", code="resource-bound-exceeded")
         signature = (filesystem, item["category"], item["limitBytes"], resident)
         if account in physical and physical[account] != signature:
-            raise Refusal("Conflicting aliases for physical account")
+            raise Refusal("Conflicting aliases for physical account", code="invalid-observation")
         store = stores.setdefault(filesystem, {"available": available, "incremental": 0})
         if store["available"] != available:
-            raise Refusal("Conflicting shared filesystem observations")
+            raise Refusal("Conflicting shared filesystem observations", code="invalid-observation")
         if account not in physical:
             physical[account] = signature
             categories[item["category"]] += item["limitBytes"]
             store["incremental"] += item["limitBytes"] - resident
     if any(categories[key] > bound for key, bound in CATEGORIES.items()):
-        raise Refusal("Physical disk category exceeds approved envelope")
+        raise Refusal(
+            "Physical disk category exceeds approved envelope", code="resource-bound-exceeded"
+        )
     filesystems: list[dict[str, Any]] = [
         {
             "filesystemId": key,

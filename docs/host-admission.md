@@ -73,7 +73,7 @@ prove that shared extents have not received duplicate resident credit.
 Directory aliases with identical
 physical device/inode share one account only when category/bound/observation
 agree. Parent/child directory overlap and nested mounts are refused. Native
-ext4 are supported; overlay, remote stores, tmpfs and VM/Desktop storage are
+ext4 is supported; overlay, remote stores, tmpfs and VM/Desktop storage are
 unsupported and fail closed. This intentionally does not infer physical backing
 through virtual storage layers.
 
@@ -149,16 +149,29 @@ Live `du` measures allocated bytes, not logical PVC requests. Unsupported nested
 mounts are refused rather than silently skipped. Filesystem overhead, future
 images, additional node copies and logs must still be included in the request.
 
-`insufficient-memory` or `insufficient-disk` includes the remaining-byte totals;
-stop admitting new heavy work. `invalid-input-or-unavailable-host-evidence`
-is the safe fallback for malformed input or unavailable low-level metrics.
-Explicit policy refusals instead name the violated invariant without private
-paths: stale input, unsupported backing, unbounded tooling,
-identity change or overlapping accounts. Inaccessible metrics, timeout and failed
-measurement also refuse. Inspect the
-private request and prerequisites, correct the cause, then explicitly observe
-again. Never delete retained data, widen the budget, omit a category or retry
-until green automatically. If a bound cannot fit, report the measured shortfall.
+`insufficient-memory` or `insufficient-disk` includes remaining-byte totals;
+stop admitting new heavy work. Other refusals expose a stable sanitized `reason`
+code, never raw exception text:
+
+| Reason | Safe next action |
+|:--|:--|
+| `invalid-request` | Correct request JSON, account bounds/paths or command flags. |
+| `invalid-observation` | Correct saved evidence or inspect malformed/incomplete host metrics, then observe again. |
+| `identity-mismatch` | Verify the intended host and request; obtain fresh matching evidence. |
+| `stale-observation` | Explicitly observe again; saved evidence has expired or is future-dated. |
+| `unsupported-host` / `unsupported-storage` | Use the documented native Linux/ext4 boundary; XFS is refused. |
+| `missing-prerequisite` | Check GNU du, requested directories and Linux/cgroup files locally. |
+| `permission-denied` | Inspect access locally; do not automatically broaden permissions. |
+| `observation-timeout` | Inspect scan scope and host pressure before an explicit retry. |
+| `measurement-failed` | Inspect the local measurement dependency; no command output is published. |
+| `host-evidence-unavailable` | Inspect the host I/O failure locally; this is the safe OS-error fallback. |
+| `resource-bound-exceeded` | Correct an over-bound account; do not clamp its measured usage. |
+| `internal-error` | Report a collector defect; this is not evidence of unavailable capacity. |
+
+Inspect the private request and prerequisites, correct the cause, then explicitly
+observe again. Never delete retained data, widen the budget, omit a category or
+retry until green automatically. If a bound cannot fit, report the measured
+shortfall.
 
 A current-host qualification runs the same observer with an explicit target and
 bounded tooling, saves its sanitized receipt and reports either success or safe

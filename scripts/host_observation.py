@@ -15,7 +15,7 @@ from . import host_admission as model
 def host_id() -> str:
     """Boot identity changes on restart, invalidating all earlier host samples."""
     if platform.system() != "Linux":
-        raise model.Refusal("Only native Linux hosts supported")
+        raise model.Refusal("Only native Linux hosts supported", code="unsupported-host")
     return model.digest(Path("/proc/sys/kernel/random/boot_id").read_text().strip())
 
 
@@ -26,14 +26,14 @@ def collector_cgroup() -> Path:
     for line in Path("/proc/self/cgroup").read_text().splitlines():
         if line.startswith("0::/"):
             return CGROUP_ROOT / line[4:]
-    raise model.Refusal("Unified cgroup v2 required")
+    raise model.Refusal("Unified cgroup v2 required", code="missing-prerequisite")
 
 
 def mem_available() -> int:
     for line in Path("/proc/meminfo").read_text().splitlines():
         if line.startswith("MemAvailable:"):
             return model.integer(int(line.split()[1])) * 1024
-    raise model.Refusal("MemAvailable unavailable")
+    raise model.Refusal("MemAvailable unavailable", code="host-evidence-unavailable")
 
 
 def mount_records() -> list[tuple[Path, str]]:
@@ -55,15 +55,16 @@ def physical_filesystem(path: Path) -> None:
     candidates = [(mount, kind) for mount, kind in mount_records() if path.is_relative_to(mount)]
     if not candidates or max(candidates, key=lambda item: len(item[0].parts))[1] not in {
         "ext4",
-        "xfs",
     }:
-        raise model.Refusal("Only native local ext4 physical stores are supported")
+        raise model.Refusal(
+            "Only native local ext4 physical stores are supported", code="unsupported-storage"
+        )
 
 
 def ordinary_path(value: str) -> Path:
     path = Path(value)
     if not path.is_absolute() or path.resolve(strict=True) != path or not path.is_dir():
-        raise model.Refusal("Ordinary absolute directory required")
+        raise model.Refusal("Ordinary absolute directory required", code="invalid-request")
     return path
 
 
@@ -75,7 +76,7 @@ def memory_observation(request: dict) -> dict:
     for item in request["memory"]:
         if "cgroup" not in item:
             if item["kind"] == "tooling":
-                raise model.Refusal("Tooling requires an enforced cgroup")
+                raise model.Refusal("Tooling requires an enforced cgroup", code="invalid-request")
             result[item["id"]] = {"residentBytes": 0}
             continue
         path = ordinary_path(item["cgroup"])
@@ -83,12 +84,14 @@ def memory_observation(request: dict) -> dict:
             path == previous or path.is_relative_to(previous) or previous.is_relative_to(path)
             for previous in paths
         ):
-            raise model.Refusal("Overlapping or unsupported cgroup accounts")
+            raise model.Refusal(
+                "Overlapping or unsupported cgroup accounts", code="invalid-request"
+            )
         paths.append(path)
         bound = model.integer(int((path / "memory.max").read_text()))
         current = model.integer(int((path / "memory.current").read_text()))
         if bound > item["limitBytes"] or current > item["limitBytes"]:
-            raise model.Refusal("Cgroup memory exceeds requested bound")
+            raise model.Refusal("Cgroup memory exceeds requested bound", code="invalid-request")
         if item["kind"] == "tooling":
             quota, period = (path / "cpu.max").read_text().split()
             if (
@@ -96,20 +99,26 @@ def memory_observation(request: dict) -> dict:
                 or int(quota) <= 0
                 or int(quota) * 1000 > item["cpuMillicores"] * int(period)
             ):
-                raise model.Refusal("Tooling CPU exceeds requested bound")
+                raise model.Refusal("Tooling CPU exceeds requested bound", code="invalid-request")
             collector_accounted |= collector == path or collector.is_relative_to(path)
         stats = dict(line.split() for line in (path / "memory.stat").read_text().splitlines())
         # File cache can also be included in MemAvailable. Credit only anon,
         # conservatively excluding reclaimable cache and all unknown metrics.
+        if "anon" not in stats:
+            raise model.Refusal("Missing anonymous memory metric", code="invalid-observation")
         resident = model.integer(int(stats["anon"]))
         if resident > current:
-            raise model.Refusal("Inconsistent cgroup observation; retry")
+            raise model.Refusal(
+                "Inconsistent cgroup observation; retry", code="invalid-observation"
+            )
         result[item["id"]] = {
             "residentBytes": resident,
             "cgroupId": model.digest([path.stat().st_dev, path.stat().st_ino]),
         }
     if not collector_accounted:
-        raise model.Refusal("Collector is not inside the declared bounded tooling cgroup")
+        raise model.Refusal(
+            "Collector is not inside the declared bounded tooling cgroup", code="invalid-request"
+        )
     return result
 
 
@@ -117,7 +126,7 @@ def collect(request: dict, expected_host_id: str) -> dict:
     model.validate(request)
     start = int(time.time())
     if host_id() != expected_host_id:
-        raise model.Refusal("Host identity changed")
+        raise model.Refusal("Host identity changed", code="identity-mismatch")
     memory = memory_observation(request)
     mounts = mount_points()
     paths: list[Path] = []
@@ -132,10 +141,12 @@ def collect(request: dict, expected_host_id: str) -> dict:
             path != previous and (path.is_relative_to(previous) or previous.is_relative_to(path))
             for previous in paths
         ):
-            raise model.Refusal("Overlapping disk accounts")
+            raise model.Refusal("Overlapping disk accounts", code="invalid-request")
         paths.append(path)
         if any(mount != path and mount.is_relative_to(path) for mount in mounts):
-            raise model.Refusal("Nested mount requires a separate physical account")
+            raise model.Refusal(
+                "Nested mount requires a separate physical account", code="invalid-request"
+            )
         before = path.stat()
         key = (before.st_dev, before.st_ino)
         roots.setdefault(key, path)
@@ -164,11 +175,15 @@ def collect(request: dict, expected_host_id: str) -> dict:
             size, name = record.split("\t", 1)
             resident_by_path[Path(name)] = model.integer(int(size))
     if set(resident_by_path) != set(roots.values()):
-        raise model.Refusal("Incomplete or overlapping physical disk observations")
+        raise model.Refusal(
+            "Incomplete or overlapping physical disk observations", code="invalid-observation"
+        )
     for name, (path, key) in accounts.items():
         after = path.stat()
         if (after.st_dev, after.st_ino) != key:
-            raise model.Refusal("Physical account changed during observation")
+            raise model.Refusal(
+                "Physical account changed during observation", code="identity-mismatch"
+            )
         statistics = os.statvfs(path)
         available = stores.setdefault(key[0], statistics.f_bavail * statistics.f_frsize)
         disks[name] = {
@@ -178,7 +193,7 @@ def collect(request: dict, expected_host_id: str) -> dict:
             "residentBytes": resident_by_path[roots[key]],
         }
     if host_id() != expected_host_id:
-        raise model.Refusal("Host identity changed during observation")
+        raise model.Refusal("Host identity changed during observation", code="identity-mismatch")
     return {
         "version": 1,
         "requestDigest": model.digest(request),
@@ -201,6 +216,11 @@ def observe(request: dict, *, expected_host_id: str) -> dict:
     signal.alarm(30)
     try:
         return collect(request, expected_host_id)
+    except model.Refusal:
+        raise
+    except ValueError:
+        # Linux numeric metrics and GNU du records may be unavailable/malformed.
+        raise model.Refusal("Malformed host metric", code="invalid-observation") from None
     finally:
         signal.alarm(0)
         signal.signal(signal.SIGALRM, previous)

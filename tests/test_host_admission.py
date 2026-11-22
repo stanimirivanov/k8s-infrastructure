@@ -199,11 +199,13 @@ class HostAdmissionTests(unittest.TestCase):
 
         from scripts import host_observation as live
 
-        with (
-            patch.object(live, "mount_records", return_value=[(Path("/"), "overlay")]),
-            self.assertRaisesRegex(ValueError, "local ext4"),
-        ):
-            live.physical_filesystem(Path("/tmp"))
+        for kind in ("overlay", "xfs"):
+            with (
+                self.subTest(kind=kind),
+                patch.object(live, "mount_records", return_value=[(Path("/"), kind)]),
+                self.assertRaisesRegex(ValueError, "local ext4"),
+            ):
+                live.physical_filesystem(Path("/tmp"))
 
     def test_live_disk_credit_counts_hardlinked_bytes_once_across_accounts(self):
         import os
@@ -279,6 +281,111 @@ class HostAdmissionTests(unittest.TestCase):
                 self.assertEqual(cli.main([*args, "--execute"]), 1)
             self.assertNotIn("private-path", output.getvalue())
             self.assertNotIn(directory, output.getvalue())
+
+    def test_cli_failure_categories_are_distinct_and_sanitized(self):
+        import io
+        import json
+        import subprocess
+        import tempfile
+        from contextlib import redirect_stdout
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from scripts import host_admission_cli as cli
+
+        cases = (
+            (TimeoutError("private-path"), "observation-timeout"),
+            (subprocess.TimeoutExpired("private-command", 5), "observation-timeout"),
+            (FileNotFoundError("private-path"), "missing-prerequisite"),
+            (PermissionError("private-path"), "permission-denied"),
+            (subprocess.CalledProcessError(1, "private-command"), "measurement-failed"),
+            (OSError("private-path"), "host-evidence-unavailable"),
+            (AttributeError("private-path"), "internal-error"),
+            (KeyError("private-path"), "internal-error"),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "request.json"
+            path.write_text(json.dumps(request()))
+            for error, reason in cases:
+                with (
+                    self.subTest(reason=reason, error=type(error)),
+                    patch("scripts.host_observation.observe", side_effect=error),
+                    redirect_stdout(io.StringIO()) as output,
+                ):
+                    status = cli.main(
+                        ["observe", "--request", str(path), "--host-id", "host", "--execute"]
+                    )
+                self.assertEqual(status, 1)
+                self.assertEqual(json.loads(output.getvalue())["reason"], reason)
+                self.assertNotIn("private-", output.getvalue())
+
+    def test_malformed_request_and_observation_shapes_have_explicit_refusals(self):
+        import copy
+
+        for value in (None, [], {"version": 1, "target": []}):
+            with self.subTest(value=value), self.assertRaises(admission.Refusal) as error:
+                admission.validate(value)
+            self.assertEqual(error.exception.code, "invalid-request")
+        for field, replacement in (
+            ("memory", [None]),
+            ("disk", [1]),
+            ("target", 1),
+            ("artifactDigest", []),
+        ):
+            value = request()
+            value[field] = replacement
+            with self.subTest(field=field), self.assertRaises(admission.Refusal):
+                admission.validate(value)
+        value = request()
+        for field, replacement in (
+            ("memory", []),
+            ("disk", None),
+            ("memory", {"nodes": None, "browser": {}, "tools": {}}),
+        ):
+            observed = copy.deepcopy(observation(value))
+            observed[field] = replacement
+            with self.subTest(field=field), self.assertRaises(admission.Refusal) as error:
+                admission.evaluate(value, observed, host_id=observed["hostId"], now=1001)
+            self.assertEqual(error.exception.code, "invalid-observation")
+
+    def test_policy_refusals_distinguish_identity_staleness_and_storage(self):
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from scripts import host_observation as live
+
+        value = request()
+        observed = observation(value)
+        for identity, now, code in (
+            ("changed", 1001, "identity-mismatch"),
+            (observed["hostId"], 1061, "stale-observation"),
+        ):
+            with self.assertRaises(admission.Refusal) as error:
+                admission.evaluate(value, observed, host_id=identity, now=now)
+            self.assertEqual(error.exception.code, code)
+        with (
+            patch.object(live, "mount_records", return_value=[(Path("/"), "xfs")]),
+            self.assertRaises(admission.Refusal) as error,
+        ):
+            live.physical_filesystem(Path("/data"))
+        self.assertEqual(error.exception.code, "unsupported-storage")
+
+    def test_cli_malformed_json_and_missing_execute_are_invalid_request(self):
+        import io
+        import tempfile
+        from contextlib import redirect_stdout
+        from pathlib import Path
+
+        from scripts import host_admission_cli as cli
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "request.json"
+            path.write_text("{private-invalid-json")
+            for args in (["preview", "--request", str(path)], ["host-id"]):
+                with redirect_stdout(io.StringIO()) as output:
+                    self.assertEqual(cli.main(args), 1)
+                self.assertIn('"reason": "invalid-request"', output.getvalue())
+                self.assertNotIn("private-", output.getvalue())
 
     def test_tooling_memory_bounds_and_observed_resident_overages_refuse(self):
         value = request()
