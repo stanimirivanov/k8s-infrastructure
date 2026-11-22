@@ -15,13 +15,14 @@ from .local_kind import NODE_IMAGE, ROOT, normalize_state_root
 
 PROFILE = ROOT / "clusters/local-kind/isolated-local/profile.yaml"
 # Network profiles share pinned CNI assets and an exclusive loopback listener.
+MINIMAL_PROFILE = "minimal-demo"
 TRANSITION_TEST_PROFILE = "isolated-network-transition-test-local"
 NETWORK_PROFILES = (
     "isolated-network-local",
     "isolated-network-full-local",
     TRANSITION_TEST_PROFILE,
 )
-PROFILES = ("isolated-local", "isolated-argo-local", *NETWORK_PROFILES)
+PROFILES = ("isolated-local", "isolated-argo-local", *NETWORK_PROFILES, MINIMAL_PROFILE)
 LABEL = "k8s-infrastructure.io/consumer"
 
 
@@ -44,6 +45,12 @@ def load_profile(path: Path | None = None, *, name: str = "isolated-local") -> d
         nodes = {
             "control-plane": {"cpus": 4, "memoryBytes": 6 * 1024**3},
             "worker": {"cpus": 4, "memoryBytes": 14 * 1024**3},
+        }
+    elif name == MINIMAL_PROFILE:
+        minimum = {"cpus": 4, "memoryBytes": 14 * 1024**3}
+        nodes = {
+            "control-plane": {"cpus": 2, "memoryBytes": 4 * 1024**3},
+            "worker": {"cpus": 2, "memoryBytes": 8 * 1024**3},
         }
     elif name == TRANSITION_TEST_PROFILE:
         minimum = {"cpus": 4, "memoryBytes": 14 * 1024**3}
@@ -144,6 +151,8 @@ def configuration(target: Target) -> dict[str, Any]:
             for role in profile["nodes"]
         ],
     }
+    if target.profile == MINIMAL_PROFILE:
+        result["networking"].update(disableDefaultCNI=True, kubeProxyMode="none")
     if target.profile in NETWORK_PROFILES:
         result["networking"] = {
             **result["networking"],
