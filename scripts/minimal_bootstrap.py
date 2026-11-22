@@ -153,7 +153,9 @@ def kernel_metrics(path, memory: int) -> dict:
     }
 
 
-def source_digest(*, network_release: bytes | None = None) -> str:
+def source_digest(
+    *, network_release: bytes | None = None, database_release: bytes | None = None
+) -> str:
     """Bind actual executable source, profiles and lock, including uncommitted changes."""
     paths = sorted(
         [
@@ -166,6 +168,11 @@ def source_digest(*, network_release: bytes | None = None) -> str:
     if network_release is None:
         network_release = (ROOT / NETWORK_RELEASE_PATH).read_bytes()
     manifest[str(NETWORK_RELEASE_PATH)] = hashlib.sha256(network_release).hexdigest()
+    from .database_assets import RELEASE_FILE as database_path
+
+    if database_release is None:
+        database_release = database_path.read_bytes()
+    manifest[str(database_path.relative_to(ROOT))] = hashlib.sha256(database_release).hexdigest()
     return admission.digest(manifest)
 
 
