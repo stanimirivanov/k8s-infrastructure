@@ -214,7 +214,7 @@ class BootstrapTests(unittest.TestCase):
 
 
 class NetworkContinuationTests(unittest.TestCase):
-    def test_continuation_credits_only_the_original_bounded_node_cgroups(self):
+    def test_continuation_credits_owned_cgroups_and_reserves_only_future_stage_disk(self):
         from contextlib import ExitStack
         from tempfile import TemporaryDirectory
         from unittest.mock import patch
@@ -279,9 +279,16 @@ class NetworkContinuationTests(unittest.TestCase):
                 },
             )
 
+            available_gib = 22
+
             def observe(current, *, expected_host_id):
                 result = observation(current)
                 result["memAvailableBytes"] = 18 * bootstrap.admission.GIB
+                for account in result["disk"].values():
+                    account.update(
+                        availableBytes=available_gib * bootstrap.admission.GIB,
+                        residentBytes=bootstrap.admission.GIB,
+                    )
                 self.assertEqual(expected_host_id, observed["hostId"])
                 node_accounts = [item for item in current["memory"] if item["kind"] == "workload"]
                 self.assertEqual(
@@ -314,6 +321,19 @@ class NetworkContinuationTests(unittest.TestCase):
             self.assertEqual(
                 result["networkAdmission"]["memoryRemainingBytes"], 5 * bootstrap.admission.GIB
             )
+            self.assertEqual(
+                result["networkAdmission"]["filesystems"],
+                [
+                    {
+                        "filesystemId": "physical-store",
+                        "incrementalBytes": 12 * bootstrap.admission.GIB,
+                        "remainingBytes": 10 * bootstrap.admission.GIB,
+                    }
+                ],
+            )
+            available_gib = 21
+            with self.assertRaisesRegex(ValueError, "Fresh network host admission refused"):
+                bootstrap.network_bootstrap(target, value, observed["hostId"])
 
     def test_cold_bootstrap_receipt_must_bind_exact_source_and_request_before_provider_access(self):
         from tempfile import TemporaryDirectory

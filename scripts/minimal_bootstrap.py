@@ -425,7 +425,7 @@ def network_bootstrap(
         for field in ("cgroupIdentity", "startedAt")
     ):
         raise ValueError("Bounded node lifetime changed after cold bootstrap")
-    resident_request = {
+    continuation_request = {
         **request,
         "memory": [
             *(item for item in request["memory"] if item["kind"] != "workload"),
@@ -439,13 +439,20 @@ def network_bootstrap(
                 for role, budget in load_profile(name=target.profile)["nodes"].items()
             ),
         ],
+        # Cold admission already charged staging and retained allocations. The
+        # disposable Cilium phase refuses missing cached images and any PVCs
+        # before applying objects. Only runtime and preparation may grow here.
+        "disk": [
+            {**item, "limitBytes": 0} if item["category"] in {"images", "retained"} else item
+            for item in request["disk"]
+        ],
     }
     stores = physical_engine(target, owner["endpoint"])
-    verify_stores(resident_request, None, stores)
+    verify_stores(request, None, stores)
     if runtime.remaining_timeout(30) < 30:
         raise TimeoutError("Insufficient deadline for fresh network admission")
-    observed = host.observe(resident_request, expected_host_id=expected_host_id)
-    verify_stores(resident_request, observed, stores)
+    observed = host.observe(continuation_request, expected_host_id=expected_host_id)
+    verify_stores(request, observed, stores)
     memory_identities = {
         **receipt["memoryAccountIdentities"],
         **{f"bounded-{item['role']}": current[item["name"]]["cgroupIdentity"] for item in journals},
@@ -455,13 +462,13 @@ def network_bootstrap(
     ):
         raise ValueError("Network admission memory account lifetime changed")
     decision = admission.evaluate(
-        resident_request, observed, host_id=host.host_id(), now=int(time.time())
+        continuation_request, observed, host_id=host.host_id(), now=int(time.time())
     )
     if not decision["admitted"] or {item["filesystemId"] for item in decision["filesystems"]} != {
         item["filesystemId"] for item in previous["filesystems"]
     }:
         raise ValueError("Fresh network host admission refused or physical stores changed")
-    tooling_metrics(resident_request)
+    tooling_metrics(continuation_request)
     return {**receipt, "networkAdmission": decision}, journals
 
 

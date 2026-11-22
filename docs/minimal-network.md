@@ -61,11 +61,17 @@ docker --context default exec "<node-id>" \
 The runtime verifies each CRI repository digest and records the observed image
 config digest before applying Cilium objects. Cilium and fixture Pod manifests
 use `imagePullPolicy: Never`, so unstaged content cannot trigger an implicit
-registry pull during qualification. The continued admission charges the
-physical backing stores after preparation. Network probe traffic includes the
-reviewed provider and registry **HTTP** destinations and requires functioning
-DNS and upstream access. Detailed peak/disk attribution for other installations
-and phases remains separate from this Cilium gate.
+registry pull during qualification. The pinned kind image supplies the sandbox
+image. Cold admission reserves 35 GiB across the four disk categories and
+preserves 10 GiB free per backing filesystem. Continuation rechecks those
+stores after staging. This disposable phase admits up to 4 GiB future runtime
+growth and 8 GiB future preparation growth, and preserves the same 10 GiB
+floor. The probe requires preloaded images and an empty volume inventory before
+the first Cilium write, so it carries no future image or retained-volume
+growth. Preparation stays within the original image allowance. Network probe
+traffic includes the reviewed provider and registry **HTTP** destinations and
+requires functioning DNS and upstream access. Measured disk attribution by
+category remains separate from this Cilium gate. [Resource collection issue](https://github.com/stanimirivanov/k8s-infrastructure/issues/64)
 
 ## Commands
 
