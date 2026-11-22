@@ -63,8 +63,8 @@ the exact generated cluster name (`<consumer>-local`) and `artifactDigest` to:
 uv run --locked --offline python -m scripts.minimal_bootstrap source-digest
 ```
 
-This digest hashes the actual Python scripts, kind profiles, networking release
-inventory and dependency lock, including uncommitted changes. Retain the reviewed
+This digest hashes the actual Python scripts, kind profiles, pinned provider
+release inventories and dependency lock, including uncommitted changes. Retain the reviewed
 Git revision or release alongside this receipt. Source or networking pin changes
 require regenerating the request. The receipt binds profile digest, node digest, tooling versions,
 request/admission digest, boot identity, target, owner nonce and immutable IDs.
