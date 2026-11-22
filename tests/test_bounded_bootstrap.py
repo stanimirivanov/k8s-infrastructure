@@ -10,6 +10,8 @@ from scripts.node_capacity import envelope
 
 class ProfileTests(unittest.TestCase):
     def test_minimal_https_listener_is_opt_in_loopback_and_bound_to_owner(self):
+        import yaml
+
         from scripts.consumer_profile import identity
 
         with tempfile.TemporaryDirectory() as directory:
@@ -29,9 +31,15 @@ class ProfileTests(unittest.TestCase):
                 ],
             )
             self.assertEqual(identity(target)["httpsPort"], "18443")
-            self.assertIn(
-                "/kind/minimal-demo-patches", configuration(target)["kubeadmConfigPatches"][0]
+            self.assertEqual(
+                yaml.safe_load(nodes[0]["kubeadmConfigPatches"][0]),
+                {
+                    "apiVersion": "kubeadm.k8s.io/v1beta3",
+                    "kind": "InitConfiguration",
+                    "patches": {"directory": "/kind/minimal-demo-patches"},
+                },
             )
+            self.assertNotIn("kubeadmConfigPatches", nodes[1])
             self.assertNotIn(
                 "httpsPort", identity(Target("qual-cold", "default", root, "minimal-demo"))
             )

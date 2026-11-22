@@ -214,6 +214,107 @@ class BootstrapTests(unittest.TestCase):
 
 
 class NetworkContinuationTests(unittest.TestCase):
+    def test_continuation_credits_only_the_original_bounded_node_cgroups(self):
+        from contextlib import ExitStack
+        from tempfile import TemporaryDirectory
+        from unittest.mock import patch
+
+        from scripts import consumer_state
+        from scripts.consumer_profile import identity
+        from tests.test_host_admission import observation, request
+
+        with TemporaryDirectory() as root, ExitStack() as stack:
+            target = Target("qual-demo", "default", Path(root), "minimal-demo", 18443)
+            owner = consumer_state.reserve(target, "unix:///run/docker.sock")
+            value = request()
+            value.update(target=target.name, artifactDigest=bootstrap.source_digest())
+            observed = observation(value)
+            owner.update(phase="provisioned", incarnation="cluster-uid")
+            journals = [
+                {
+                    "target": target.name,
+                    "nonce": owner["nonce"],
+                    "name": f"{target.name}-{role}",
+                    "role": role,
+                    "id": letter * 64,
+                    "phase": "started",
+                }
+                for role, letter in (("control-plane", "a"), ("worker", "b"))
+            ]
+            owner["nodeIds"] = {item["name"]: item["id"] for item in journals}
+            consumer_state.save(target, owner)
+            peaks = {
+                item["name"]: {"cgroupIdentity": item["id"], "startedAt": "first-start"}
+                for item in journals
+            }
+            paths = {name: Path(f"/sys/fs/cgroup/{name}") for name in peaks}
+            bootstrap.write_receipt(
+                target,
+                {
+                    **identity(target),
+                    "nonce": owner["nonce"],
+                    "stage": "pre-cilium",
+                    "phase": "pre-cilium-allocatable",
+                    "coldBootstrapQualified": True,
+                    "artifactDigest": value["artifactDigest"],
+                    "admission": bootstrap.admission.evaluate(
+                        value, observed, host_id=observed["hostId"], now=1001
+                    ),
+                    "allocatable": {
+                        "cluster": target.name,
+                        "incarnation": owner["incarnation"],
+                        "nodes": {
+                            role: {
+                                "schedulerEnvelope": {
+                                    "cpuMillicores": 1750,
+                                    "memoryBytes": memory * 1024**2,
+                                }
+                            }
+                            for role, memory in (("control-plane", 3484), ("worker", 7580))
+                        },
+                    },
+                    "kernelEvidence": peaks,
+                    "nodes": journals,
+                    "memoryAccountIdentities": {},
+                },
+            )
+
+            def observe(current, *, expected_host_id):
+                result = observation(current)
+                result["memAvailableBytes"] = 18 * bootstrap.admission.GIB
+                self.assertEqual(expected_host_id, observed["hostId"])
+                node_accounts = [item for item in current["memory"] if item["kind"] == "workload"]
+                self.assertEqual(
+                    {item["cgroup"] for item in node_accounts}, set(map(str, paths.values()))
+                )
+                for item in journals:
+                    result["memory"][f"bounded-{item['role']}"] = {
+                        "residentBytes": bootstrap.admission.GIB,
+                        "cgroupId": item["id"],
+                    }
+                return result
+
+            for name, result in [
+                ("host.host_id", observed["hostId"]),
+                ("_node_metrics", (peaks, paths)),
+                ("physical_engine", {}),
+                ("tooling_metrics", []),
+                ("time.time", 1001),
+            ]:
+                stack.enter_context(patch(f"scripts.minimal_bootstrap.{name}", return_value=result))
+            stack.enter_context(
+                patch("scripts.minimal_bootstrap.host.observe", side_effect=observe)
+            )
+            stack.enter_context(
+                patch("scripts.bounded_docker.read_journals", return_value=journals)
+            )
+            stack.enter_context(patch("scripts.consumer_lifecycle.owned", return_value=owner))
+            result, retained = bootstrap.network_bootstrap(target, value, observed["hostId"])
+            self.assertEqual(retained, journals)
+            self.assertEqual(
+                result["networkAdmission"]["memoryRemainingBytes"], 5 * bootstrap.admission.GIB
+            )
+
     def test_cold_bootstrap_receipt_must_bind_exact_source_and_request_before_provider_access(self):
         from tempfile import TemporaryDirectory
         from unittest.mock import patch

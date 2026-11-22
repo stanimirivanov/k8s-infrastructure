@@ -171,7 +171,7 @@ def configuration(target: Target) -> dict[str, Any]:
         if target.profile == MINIMAL_PROFILE:
             from .minimal_foundation import kubeadm_configuration
 
-            result["kubeadmConfigPatches"] = [kubeadm_configuration()]
+            result["nodes"][0]["kubeadmConfigPatches"] = [kubeadm_configuration()]
     return result
 
 
