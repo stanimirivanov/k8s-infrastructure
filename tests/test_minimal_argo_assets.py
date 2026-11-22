@@ -131,7 +131,7 @@ class MinimalArgoAssetTests(unittest.TestCase):
                 patch.object(minimal_argo_fence, "read_fence", side_effect=[before, after]),
                 patch.object(minimal_argo_fence, "kube", side_effect=["", denied]) as kube,
             ):
-                minimal_argo_fence.set_closed(target, delegation, True)
+                minimal_argo_fence.set_closed(target, delegation, True, expected_uid="fence-id")
             commands = [call.args[1] for call in kube.call_args_list]
             self.assertEqual(
                 json.loads(commands[0][-1])[:3],
@@ -145,6 +145,13 @@ class MinimalArgoAssetTests(unittest.TestCase):
             self.assertIn(
                 "--as=system:serviceaccount:qual-argo-releases:release-releaser", commands[1]
             )
+            with (
+                patch.object(minimal_argo_fence, "read_fence", return_value=before),
+                patch.object(minimal_argo_fence, "kube") as refused,
+                self.assertRaisesRegex(ValueError, "UID differs"),
+            ):
+                minimal_argo_fence.set_closed(target, delegation, True, expected_uid="stale-id")
+            refused.assert_not_called()
             with (
                 patch.object(
                     minimal_argo_fence,

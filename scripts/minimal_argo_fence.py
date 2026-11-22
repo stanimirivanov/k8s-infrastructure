@@ -155,8 +155,12 @@ def confirm_admission(target: Target, delegation: Delegation, closed: bool) -> N
         time.sleep(0.25)
 
 
-def set_closed(target: Target, delegation: Delegation, closed: bool) -> None:
+def set_closed(
+    target: Target, delegation: Delegation, closed: bool, *, expected_uid: str | None = None
+) -> None:
     before = read_fence(target, delegation)
+    if expected_uid is not None and before["metadata"]["uid"] != expected_uid:
+        raise ValueError("Argo lifecycle Workflow fence UID differs from receipt")
     mode = "closed" if closed else "open"
     prior = before["data"]["mode"]
     if prior != mode:
