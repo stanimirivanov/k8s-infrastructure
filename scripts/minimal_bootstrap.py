@@ -600,9 +600,13 @@ def _node_metrics(target: Target, journals: list[dict]) -> tuple[dict, dict[str,
         ):
             raise ValueError("Container start lifetime differs from first journaled start")
         paths = [line[4:] for line in lines if line.startswith("0::/")]
-        if len(paths) != 1 or journal["id"] not in paths[0]:
+        parts = Path(paths[0]).parts if len(paths) == 1 else ()
+        scope = f"docker-{journal['id']}.scope"
+        if parts.count(scope) != 1 or "/" in parts or ".." in parts:
             raise ValueError("Cannot bind physical node cgroup to immutable container")
-        path = host.CGROUP_ROOT / paths[0]
+        # systemd can move the node's PID 1 into init.scope. The parent Docker
+        # scope enforces the node budget and includes kubelet/CRI descendants.
+        path = host.CGROUP_ROOT.joinpath(*parts[: parts.index(scope) + 1])
         cgroups[journal["name"]] = path
         memory = load_profile(name=target.profile)["nodes"][journal["role"]]["memoryBytes"]
         if node["swap"] != memory:
