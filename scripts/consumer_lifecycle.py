@@ -7,6 +7,7 @@ from typing import Any
 from . import consumer_runtime as runtime
 from . import consumer_state as state
 from .consumer_profile import (
+    MINIMAL_PROFILE,
     NETWORK_PROFILES,
     TRANSITION_TEST_PROFILE,
     Target,
@@ -14,6 +15,14 @@ from .consumer_profile import (
     load_profile,
 )
 from .local_kind import ROOT
+
+
+def require_legacy_lifecycle(target: Target) -> None:
+    """The unqualified profile has a separate admitted, bounded creation route."""
+    if target.profile == MINIMAL_PROFILE:
+        raise ValueError(
+            "minimal-demo requires scripts.minimal_bootstrap; generic lifecycle refused"
+        )
 
 
 def owned(target: Target, *, require_ready: bool = True) -> dict[str, Any]:
@@ -38,6 +47,7 @@ def owned(target: Target, *, require_ready: bool = True) -> dict[str, Any]:
 
 def observe(target: Target, *, wait: bool = False) -> dict[str, Any]:
     """Return only public readiness/capacity metadata, never kubeconfig or credentials."""
+    require_legacy_lifecycle(target)
     nodes = runtime.read_readiness(target, wait=wait)
     runtime.kubectl(
         target, ["-n", "kube-system", "rollout", "status", "deployment/coredns", "--timeout=60s"]
@@ -94,6 +104,7 @@ def source_identity(target: Target) -> dict[str, Any]:
 
 def create(target: Target) -> dict[str, Any]:
     """Create only an absent target. Partial failures retain evidence, never auto-delete."""
+    require_legacy_lifecycle(target)
     endpoint = runtime.prerequisites(target, creating=True)
     runtime.tools(target)
     if target.name in runtime.clusters(target):
@@ -174,12 +185,14 @@ def finish_creation(target: Target, record: dict[str, Any]) -> dict[str, Any]:
 
 
 def health(target: Target) -> dict[str, Any]:
+    require_legacy_lifecycle(target)
     owned(target)
     return observe(target)
 
 
 def ensure(target: Target) -> dict[str, Any]:
     """Healthy exact-owner reuse only; orphaned state and foreign clusters are refused."""
+    require_legacy_lifecycle(target)
     runtime.prerequisites(target)
     existing = target.name in runtime.clusters(target)
     has_state = target.path("owner.json").exists()
@@ -194,6 +207,7 @@ def ensure(target: Target) -> dict[str, Any]:
 
 def down(target: Target, confirmation: str | None) -> None:
     """Deletion is permanent and separate from health, ensure and failed-create handling."""
+    require_legacy_lifecycle(target)
     if confirmation != target.name:
         raise ValueError(
             "Deletion requires exact --confirm-delete target name; cluster-local data is lost"

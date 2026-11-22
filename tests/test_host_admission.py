@@ -131,7 +131,7 @@ class HostAdmissionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "account inventory"):
             admission.evaluate(value, observed, host_id=observed["hostId"], now=1001)
 
-    def test_offline_preview_never_observes_host_and_new_profile_stays_disabled(self):
+    def test_offline_preview_never_observes_host_or_authorizes_profile_creation(self):
         import io
         import json
         import tempfile
@@ -140,7 +140,8 @@ class HostAdmissionTests(unittest.TestCase):
         from unittest.mock import patch
 
         from scripts import host_admission_cli as cli
-        from scripts.consumer_profile import load_profile
+        from scripts.consumer_lifecycle import create
+        from scripts.consumer_profile import Target
 
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "request.json"
@@ -152,8 +153,8 @@ class HostAdmissionTests(unittest.TestCase):
                 self.assertEqual(cli.main(["preview", "--request", str(path)]), 0)
             observe.assert_not_called()
             self.assertFalse(json.loads(output.getvalue())["liveAdmission"])
-        with self.assertRaises(ValueError):
-            load_profile(name="minimal-demo")
+            with self.assertRaisesRegex(ValueError, "minimal_bootstrap"):
+                create(Target("qual-admission", "default", Path(directory), "minimal-demo"))
 
     def test_live_observation_is_read_only_bounded_and_binds_physical_identity(self):
         import tempfile

@@ -94,7 +94,7 @@ class ClusterTests(unittest.TestCase):
 
     def test_failure_withholds_output_and_completion(self):
         captured = io.StringIO()
-        with redirect_stdout(captured), self.assertRaisesRegex(ValueError, "exit 7"):
+        with redirect_stdout(captured), self.assertRaisesRegex(ValueError, "exit 7") as caught:
             run(
                 [
                     sys.executable,
@@ -105,6 +105,9 @@ class ClusterTests(unittest.TestCase):
                     ),
                 ]
             )
+        from scripts.bootstrap_failure import evidence
+
+        self.assertEqual(evidence(caught.exception, "capacity")["exitCode"], 7)
         self.assertNotIn("private-", captured.getvalue())
         self.assertNotIn("Completed", captured.getvalue())
 

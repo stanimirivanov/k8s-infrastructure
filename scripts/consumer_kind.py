@@ -9,7 +9,14 @@ from pathlib import Path
 import yaml
 
 from . import consumer_lifecycle as lifecycle
-from .consumer_profile import PROFILES, TRANSITION_TEST_PROFILE, Target, configuration, load_profile
+from .consumer_profile import (
+    MINIMAL_PROFILE,
+    PROFILES,
+    TRANSITION_TEST_PROFILE,
+    Target,
+    configuration,
+    load_profile,
+)
 from .node_capacity import POLICY, envelope
 
 
@@ -18,6 +25,10 @@ def preview(action: str, target: Target) -> dict:
     load_profile(name=target.profile)
     for suffix in ("kubeconfig", "owner.json", "kind.yaml"):
         target.path(suffix)
+    if target.profile == MINIMAL_PROFILE:
+        raise ValueError(
+            "minimal-demo requires scripts.minimal_bootstrap preview and explicit qualification"
+        )
     return {
         "action": action,
         "consumer": target.consumer,

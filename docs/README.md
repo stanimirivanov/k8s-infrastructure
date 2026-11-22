@@ -16,6 +16,7 @@
 | Adding or upgrading dependencies | [Dependency policy](development/dependency-policy.md) |
 | Changing infrastructure code or target safety | [Engineering standards](development/engineering-standards.md) |
 | Changing the substrate/consumer handoff | [Capability contract](architecture/substrate-capability.md) and [ADR index](decisions/README.md) |
+| Minimal-demo capped creation and cold-bootstrap qualification | [Minimal bootstrap](minimal-bootstrap.md) |
 | Physical host memory/disk admission | [Host admission](host-admission.md) |
 | Capped kind scheduling capacity and full-installation sizing | [Node capacity](node-capacity.md), [ADR 0008](decisions/0008-capped-kind-node-allocatable.md) |
 | Approved FleetIQ full-installation design and retained transition | [Transition plan](migrations/fleetiq-full-installation-transition.md), [ADR 0009](decisions/0009-explicit-retained-profile-transition.md) |
