@@ -62,8 +62,19 @@ application attempt with the filesystem probe image uses this input:
 
 Review every image, command, credential reference, mount and resource bound.
 Store the document outside Git and supply references instead of secret values.
-Use the preview's digest and exact Job content for the approved attempt. The
-provider creates a digest-named launcher and a separate runtime ServiceAccount.
+Use the preview's digest to identify the approved attempt. Render its exact
+Job manifest offline into a private file for the launcher:
+
+```sh
+(
+  umask 077
+  uv run --locked --offline python -m scripts.minimal_delegation job \
+    --consumer example --docker-context default --state-root /private/state \
+    --https-port 18443 --operation /private/attempt.json > /private/attempt-job.json
+)
+```
+
+The provider creates a digest-named launcher and a separate runtime ServiceAccount.
 The launcher can submit the exact new Job and read that Job and its reviewed
 template. Native admission binds the launcher to the reviewed PodSpec. The
 runtime account carries no API grants or mounted API token. The Job has one
@@ -110,7 +121,8 @@ uv run --locked --offline python -m scripts.minimal_delegation qualify \
 ```
 
 The gate checks positive and forbidden API operations as the exact scoped
-identities. Each of the three workload namespaces opts into `local-retained`
+identities. It submits one neutral Job as the launcher and verifies its
+terminal success and exact Pod owner. Each workload namespace opts into `local-retained`
 Filesystem RWO claims of whole 1–4Gi, with at most four and 8Gi requested per
 namespace. The quotas measure requested storage. The installed filesystem
 probe binds one neutral 1Gi application claim, verifies its Retain PV identity
