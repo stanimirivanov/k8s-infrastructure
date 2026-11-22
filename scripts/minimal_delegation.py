@@ -180,6 +180,24 @@ def configure(target: Target, operation: Operation | None) -> None:
     check_prerequisites(target)
     objects = render(target, operation)
     preflight = database_runtime.inventory(target, objects)
+    # A partially removed policy must not be silently repaired with its grants
+    # still active. Withdraw the affected binding before resuming.
+    if any(key[0] == "RoleBinding" for key in preflight) and any(
+        reference(item) not in preflight
+        for item in (render(target) if operation else objects)
+        if item["kind"] != "RoleBinding"
+    ):
+        raise ValueError("Existing base grant has incomplete controls; withdraw it before recovery")
+    if (
+        operation
+        and ("RoleBinding", operation.launcher, operation.namespace) in preflight
+        and any(
+            reference(item) not in preflight for item in objects if item["kind"] != "RoleBinding"
+        )
+    ):
+        raise ValueError(
+            "Existing attempt grant has incomplete controls; withdraw it before recovery"
+        )
     for item in objects:
         current = preflight.get(reference(item))
         if current:
@@ -239,6 +257,10 @@ def qualification_operation(target: Target, image: str) -> Operation:
                         "name": "probe",
                         "image": image,
                         "command": ["python", "-I", "-c", "pass"],
+                        "env": [
+                            {"name": "FIRST", "value": "control"},
+                            {"name": "NEXT", "value": "$(FIRST)"},
+                        ],
                         "resources": {
                             "requests": {"cpu": "50m", "memory": "64Mi"},
                             "limits": {"cpu": "100m", "memory": "64Mi"},
@@ -394,6 +416,7 @@ def qualify(target: Target, request: dict, host_id: str) -> dict:
                 publish("delegation")
             with failure.phase("authorization-and-admission", "dependency-failure"):
                 receipt["nativeControls"] = probe.prove(target, operation, foreign)
+                receipt["nativeControls"]["neutralJob"] = probe.run_job(target, operation)
                 publish("authorization-and-admission")
             with failure.phase("retained-filesystem", "dependency-failure"):
                 minimal_network.disk_floor(request, host_id, cold["networkAdmission"])

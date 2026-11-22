@@ -17,6 +17,7 @@ from .minimal_delegation_policy import (
     operations_namespace,
     username,
 )
+from .minimal_network import owner_uid
 
 
 def as_account(namespace: str, account: str) -> list[str]:
@@ -257,11 +258,22 @@ def prove(target, operation: Operation, foreign: str) -> dict:
     altered["spec"]["template"]["spec"]["containers"][0]["args"] = ["unreviewed-command"]
     denied(target, altered, actor, expected)
     altered = operation.job()
+    altered["spec"]["template"]["spec"]["containers"][0]["env"].reverse()
+    denied(target, altered, actor, expected)
+    altered = operation.job()
     altered["metadata"]["name"] = "different-attempt"
     denied(target, altered, actor, expected)
     altered = operation.job()
     altered["spec"]["parallelism"] = 2
     denied(target, altered, actor, expected)
+    placement = resource("Pod", "delegation-placement-control", ns, spec=deepcopy(operation.pod))
+    placement["spec"]["volumes"] = [
+        {"name": "data", "persistentVolumeClaim": {"claimName": "delegation-placement-control"}}
+    ]
+    create(target, placement, [])
+    unpinned = deepcopy(placement)
+    unpinned["spec"].pop("nodeSelector")
+    denied(target, unpinned, [], ("admission", f"{target.consumer}-demo-placement"))
     service = resource(
         "Service",
         "delegation-private",
@@ -293,4 +305,69 @@ def prove(target, operation: Operation, foreign: str) -> dict:
     return {
         "jobAdmission": "approved and altered attempts exercised",
         "storageQuota": prove_storage(target, reconciler),
+    }
+
+
+def run_job(target, operation: Operation) -> dict:
+    ns = operation.namespace
+    actor = as_account(operations_namespace(target), operation.launcher)
+    job = create(target, operation.job(), actor, dry_run=False)
+    uid = job["metadata"]["uid"]
+    kube(
+        target,
+        ["-n", ns, "wait", "--for=condition=Complete", f"job/{operation.name}", "--timeout=100s"],
+        request_timeout=100,
+    )
+    direct = json.loads(
+        kube(target, [*actor, "-n", ns, "get", "job", operation.name, "-o", "json"])
+    )
+    items = json.loads(
+        kube(
+            target,
+            [
+                "-n",
+                ns,
+                "get",
+                "pods",
+                "-l",
+                f"batch.kubernetes.io/controller-uid={uid}",
+                "-o",
+                "json",
+            ],
+        )
+    )["items"]
+    if (
+        len(items) != 1
+        or owner_uid(items[0]) != uid
+        or direct["metadata"]["uid"] != uid
+        or direct["status"].get("succeeded") != 1
+        or direct["status"].get("failed", 0) != 0
+    ):
+        raise ValueError("Reviewed Job did not complete once with its exact owner")
+    pod = items[0]
+    spec, status = pod["spec"], pod["status"]
+    wanted = operation.pod["containers"][0]
+    if (
+        spec.get("nodeName") != target.name + "-worker"
+        or spec.get("serviceAccountName") != operation.runtime
+        or spec.get("automountServiceAccountToken") is not False
+        or spec.get("volumes")
+        or spec.get("initContainers")
+        or spec.get("ephemeralContainers")
+        or len(spec["containers"]) != 1
+        or any(
+            spec["containers"][0].get(key) != wanted[key]
+            for key in ("name", "image", "imagePullPolicy", "command", "resources")
+        )
+        or status.get("phase") != "Succeeded"
+        or len(status.get("containerStatuses", [])) != 1
+        or status["containerStatuses"][0].get("restartCount") != 0
+        or status["containerStatuses"][0]["state"]["terminated"]["exitCode"] != 0
+    ):
+        raise ValueError("Qualified Job Pod differs from the exact bounded operation")
+    return {
+        "jobUID": uid,
+        "podUID": pod["metadata"]["uid"],
+        "node": spec["nodeName"],
+        "exitCode": 0,
     }

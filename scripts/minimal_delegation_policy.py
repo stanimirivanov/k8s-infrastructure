@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from . import database_policy, host_admission
 from .consumer_profile import LABEL, MINIMAL_PROFILE, Target
 from .delegated_argo_policy import binding, resource, rule
-from .network_resources import pod_bounds
+from .network_resources import EXTRA_MEMORY, pod_bounds
 
 RECONCILER = "demo-reconciler"
 ATTEMPT_LABEL = "k8s-infrastructure.io/demo-attempt"
@@ -161,7 +161,21 @@ def load_operation(target: Target, value: dict) -> Operation:
             "seccompProfile": {"type": "RuntimeDefault"},
         },
     )
-    pod_bounds(pod)
+    bounds = pod_bounds(pod)
+    memory_request, memory_limit = (
+        (128, 256) if operation.namespace == namespaces(target)[0] else (192, 384)
+    )
+    mib = 1024**2
+    if (
+        bounds["effectiveRequests"]["cpu"] > 100
+        or bounds["effectiveLimits"]["cpu"] > 1000
+        or bounds["steadyRequests"]["memory"] > memory_request * mib
+        or bounds["steadyLimits"]["memory"] > memory_limit * mib
+        or bounds["effectiveLimits"]["memory"] > memory_limit * mib + EXTRA_MEMORY
+    ):
+        raise ValueError(
+            "Reviewed Job exceeds its namespace allocation or initialization allowance"
+        )
     return operation
 
 
@@ -284,6 +298,20 @@ def job_policy(target: Target, operation: Operation) -> list[dict]:
     for path in ("object.metadata", "object.spec.template.metadata"):
         for field in ("annotations", "ownerReferences", "finalizers", "generateName"):
             metadata += f" && !has({path}.{field})"
+    # Kubernetes treats map-style lists as unordered for CEL object equality.
+    # Preserve order separately where runtime semantics depend on it.
+    podspec = "object.spec.template.spec"
+    orders = [(podspec, "volumes", "name", operation.pod.get("volumes", []))]
+    for group in ("containers", "initContainers"):
+        for index, container in enumerate(operation.pod.get(group, [])):
+            ref = f"{podspec}.{group}[{index}]"
+            for field, key in (("env", "name"), ("volumeMounts", "mountPath")):
+                orders.append((ref, field, key, container.get(field, [])))
+    order = " && ".join(
+        f"(has({ref}.{field}) ? {ref}.{field}.map(item, item.{key}) : []) == "
+        + json.dumps([item[key] for item in values])
+        for ref, field, key, values in orders
+    )
     return policy(
         f"{target.consumer}-{operation.launcher}-job",
         "batch",
@@ -300,7 +328,8 @@ def job_policy(target: Target, operation: Operation) -> list[dict]:
             (envelope, "Demo Job must use the reviewed controller and bounded execution"),
             (metadata, "Demo Job metadata must contain only the reviewed attempt and system keys"),
             (
-                "params != null && dyn(object.spec.template.spec) == dyn(params.template.spec)",
+                "params != null && dyn(object.spec.template.spec) == dyn(params.template.spec)"
+                f" && ({order})",
                 "Demo Job PodSpec must exactly match the reviewed template",
             ),
         ],
