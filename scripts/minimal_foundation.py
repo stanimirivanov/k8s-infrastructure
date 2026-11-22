@@ -21,6 +21,7 @@ CONTROL_PLANE = {
 }
 COREDNS = (25, 150, 64, 96)
 PROVISIONER = (50, 200, 64, 64)
+STORAGE_HELPER = (25, 100, 64, 64)
 
 
 def resources(bounds: tuple[int, int, int, int]) -> dict:
@@ -62,6 +63,29 @@ def _kubeadm_patches() -> dict[str, dict]:
     }
 
 
+def bounded_storage_config(data: dict) -> dict:
+    """Keep the pinned storage scripts and bound their generated minimal-demo Pod."""
+    from .database_assets import selection
+
+    image = selection()["images"]["kind-helper"]
+    helper = yaml.safe_load(data["helperPod.yaml"])
+    spec = helper["spec"]
+    containers = spec["containers"]
+    if (
+        helper["kind"] != "Pod"
+        or helper["metadata"]["name"] != "helper-pod"
+        or len(containers) != 1
+        or containers[0]["name"] != "helper-pod"
+        or containers[0]["image"] != image.split("@", 1)[0]
+        or spec.get("initContainers")
+        or spec.get("ephemeralContainers")
+    ):
+        raise ValueError("Pinned kind storage helper inventory changed")
+    containers[0].update(image=image, imagePullPolicy="Never", resources=resources(STORAGE_HELPER))
+    spec.update(automountServiceAccountToken=False, activeDeadlineSeconds=90)
+    return {**data, "helperPod.yaml": yaml.safe_dump(helper)}
+
+
 def _bounded_storage(manifest: str) -> str:
     documents = list(yaml.safe_load_all(manifest))
     deployments = [item for item in documents if item["kind"] == "Deployment"]
@@ -81,6 +105,16 @@ def _bounded_storage(manifest: str) -> str:
     pod["nodeSelector"] = {**pod.get("nodeSelector", {}), **WORKER_SELECTOR}
     pod["containers"][0]["resources"] = resources(PROVISIONER)
     deployment["spec"]["strategy"] = {"type": "Recreate"}
+    configs = [
+        item
+        for item in documents
+        if item["kind"] == "ConfigMap"
+        and item["metadata"]["name"] == "local-path-config"
+        and item["metadata"]["namespace"] == "local-path-storage"
+    ]
+    if len(configs) != 1:
+        raise ValueError("Pinned kind storage configuration inventory changed")
+    configs[0]["data"] = bounded_storage_config(configs[0]["data"])
     return yaml.safe_dump_all(documents)
 
 
