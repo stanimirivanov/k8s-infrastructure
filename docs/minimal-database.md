@@ -37,8 +37,9 @@ connection pool, and backup/restore acceptance remain deployment-owned.
 
 Review the [database asset pins](../clusters/local-kind/isolated-network-local/database/releases.json)
 and run `make database-asset-check` to verify the public assets and rendered
-provider inventory. In a separately authorized preparation window, stage each
-reviewed controller image into the Kubernetes CRI on the owned worker. Obtain
+provider inventory. The `minimalDemoRequiredImages` field lists the images this
+gate needs. In a separately authorized preparation window, stage each listed
+image into the Kubernetes CRI on the owned worker. Obtain
 the worker's immutable container ID from the matching cold-bootstrap receipt.
 Use one digest-qualified image per invocation and charge staging to the approved
 image and tooling budgets. For example:
@@ -93,7 +94,9 @@ establish an installed result.
 Inspect `<target>.database-qualification.json` beneath the target state root's
 private `.local` directory. Use its last completed phase and sanitized failure
 details to distinguish an identity or host admission refusal, missing image,
-controller readiness failure, certificate failure or replacement failure. Keep
+controller readiness failure, certificate failure or replacement failure. A
+failure during replacement can leave the selected Deployment scaled to zero.
+Keep
 the detailed state and kubeconfig private. A failed smaller allocation blocks
 qualification. Use a newly admitted disposable target after reviewing a fix.
 
