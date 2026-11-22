@@ -35,6 +35,7 @@ class MinimalDatabaseProbesTests(unittest.TestCase):
         from scripts import minimal_database_probes as probes
 
         postgres = "ghcr.io/cloudnative-pg/postgresql:18.2@sha256:" + "a" * 64
+        bypass = False
 
         def kube(target, args, documents=None, **kwargs):
             self.assertEqual(target, self.target)
@@ -49,6 +50,9 @@ class MinimalDatabaseProbesTests(unittest.TestCase):
                                 + ".cnpg.io",
                                 "failurePolicy": "Fail",
                                 "sideEffects": "None",
+                                "objectSelector": {"matchLabels": {"test": "only"}}
+                                if bypass
+                                else {},
                                 "clientConfig": {
                                     "service": {
                                         "namespace": "cnpg-system",
@@ -77,6 +81,9 @@ class MinimalDatabaseProbesTests(unittest.TestCase):
 
         with patch.object(probes, "kube", side_effect=kube):
             result = probes.cnpg_admission(self.target, postgres_image=postgres)
+            bypass = True
+            with self.assertRaisesRegex(ValueError, "authority or admission rules"):
+                probes.cnpg_admission(self.target, postgres_image=postgres)
         self.assertEqual(result, {"outcome": "server-dry-run-accepted", "resource": "Cluster"})
 
     def test_certificate_evidence_refuses_a_stale_ready_condition(self):

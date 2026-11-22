@@ -17,6 +17,7 @@ from .kubernetes import contains, kube, reference
 from .network_qualification import wait_condition
 
 RECOVERY_NAME = "minimal-demo-certificate-restart-probe"
+CERT_VALIDATION_LABEL = "cert-manager.io/disable-validation"
 
 
 def _webhook_ready(
@@ -28,6 +29,7 @@ def _webhook_ready(
     api_group: str,
     resource: str,
     operations: set[str],
+    namespace_selector: dict | None = None,
 ) -> None:
     """Wait for the exact fail-closed webhook trust before probing its API."""
     deadline = time.monotonic() + remaining_timeout(90)
@@ -42,6 +44,9 @@ def _webhook_ready(
             (endpoint.get("namespace"), endpoint.get("name")) != service
             or hook.get("failurePolicy") != "Fail"
             or hook.get("sideEffects") not in {"None", "NoneOnDryRun"}
+            or hook.get("namespaceSelector", {}) != (namespace_selector or {})
+            or hook.get("objectSelector")
+            or hook.get("matchConditions")
             or not any(
                 (api_group in rule.get("apiGroups", []) or "*" in rule.get("apiGroups", []))
                 and ("v1" in rule.get("apiVersions", []) or "*" in rule.get("apiVersions", []))
@@ -71,6 +76,11 @@ def _server_probe(target: Target, document: dict, args: list[str]) -> dict:
 
 def certificate_admission(target: Target, issuer: dict) -> dict:
     """Exercise live cert-manager admission without persisting an Issuer."""
+    namespace = json.loads(
+        kube(target, ["get", "namespace", issuer["metadata"]["namespace"], "-o", "json"])
+    )
+    if namespace["metadata"].get("labels", {}).get(CERT_VALIDATION_LABEL) == "true":
+        raise ValueError("Certificate probe namespace bypasses cert-manager validation")
     for webhook_type in ("mutating", "validating"):
         # The pinned mutator handles CertificateRequests produced by issuance;
         # server dry-run exercises the separate validating path for Issuers.
@@ -83,6 +93,13 @@ def certificate_admission(target: Target, issuer: dict) -> dict:
             api_group="cert-manager.io",
             resource="certificaterequests" if mutating else "issuers",
             operations={"CREATE"} if mutating else {"CREATE", "UPDATE"},
+            namespace_selector=None
+            if mutating
+            else {
+                "matchExpressions": [
+                    {"key": CERT_VALIDATION_LABEL, "operator": "NotIn", "values": ["true"]}
+                ]
+            },
         )
     return _server_probe(target, issuer, ["apply", "--server-side", f"--field-manager={MANAGER}"])
 
