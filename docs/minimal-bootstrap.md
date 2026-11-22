@@ -115,6 +115,13 @@ uses identical admitted creation and evidence collection but does not mark a
 named cold-bootstrap qualification. `qualify` requires a `qual-` consumer.
 Neither path installs Cilium, kube-proxy, Argo CD, consumer workloads or ingress.
 
+For a disposable target intended for network qualification, pass the reviewed
+`--https-port 18443` at cold bootstrap. This maps `127.0.0.1:18443` to port 8443
+on the worker. The port is bound into the owner record and verified against
+Docker's stopped container before the first start. Specify the same port for
+subsequent network qualification and explicit removal. Omitting the option
+creates the pre-Cilium target without an HTTPS mapping.
+
 Creation uses a shared 900-second deadline, including read-only provider commands.
 Kind receives at most 600 seconds and allocatable reconciliation at most 280
 seconds, each reduced to the remaining operation budget. The 30-second host

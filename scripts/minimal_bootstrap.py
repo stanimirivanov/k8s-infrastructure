@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
 import socket
+import stat
 import struct
 import subprocess
 import threading
 import time
 import tomllib
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -20,7 +24,7 @@ from . import consumer_runtime as runtime
 from . import consumer_state as state
 from . import host_admission as admission
 from . import host_observation as host
-from .consumer_profile import Target, identity, load_profile
+from .consumer_profile import MINIMAL_PROFILE, Target, identity, load_profile
 from .local_kind import ROOT
 
 
@@ -46,6 +50,7 @@ def preview(target, action: str = "create") -> dict:
         "action": action,
         "target": target.name,
         "profile": target.profile,
+        **({"loopbackHttpsPort": target.https_port} if target.https_port is not None else {}),
         "stage": "pre-cilium",
         "installedAcceptance": False,
         "execution": "not-performed",
@@ -170,7 +175,7 @@ def create(
 def _create(
     target: Target, request: dict, expected_host_id: str, *, qualification: bool = False
 ) -> dict:
-    if target.profile != "minimal-demo":
+    if target.profile != MINIMAL_PROFILE:
         raise ValueError("Dedicated bootstrap requires minimal-demo profile")
     with failure.phase("request-validation", "invalid-configuration"):
         validate_request(target, request, source_digest())
@@ -180,6 +185,13 @@ def _create(
     with failure.phase("prerequisites", "missing-prerequisite"):
         endpoint = runtime.prerequisites(target, creating=True)
         versions = runtime.tools(target)
+        if target.https_port is not None:
+            # Docker still has to acquire this exact binding at the first start.
+            with socket.socket() as listener:
+                try:
+                    listener.bind(("127.0.0.1", target.https_port))
+                except OSError as error:
+                    raise ValueError("Reviewed loopback HTTPS port is unavailable") from error
     with failure.phase("cached-node-image", "missing-prerequisite"):
         cached_image(target)
     from .consumer_lifecycle import source_identity
@@ -220,6 +232,11 @@ def _create(
         "nodeImage": load_profile(name=target.profile)["nodeImage"],
         "toolVersions": versions,
         "admission": decision,
+        "memoryAccountIdentities": {
+            item["id"]: observation["memory"][item["id"]].get("cgroupId")
+            for item in request["memory"]
+            if "cgroup" in item
+        },
         "stage": "pre-cilium",
         "phase": "creating",
         "lastCompletedPhase": "ownership-reservation",
@@ -323,12 +340,128 @@ def _create(
 
 
 def artifact_path(target: Target, suffix: str) -> Path:
-    if suffix not in {"bounded-docker", "bootstrap.json", "bootstrap.pending"}:
+    if suffix not in {"bounded-docker", "bootstrap.json", "bootstrap.pending", "network.lock"}:
         raise ValueError("Unknown bootstrap artifact")
     path = target.directory / f"{target.name}.{suffix}"
     if any(p.is_symlink() for p in (path, path.parent)):
         raise ValueError("Redirected bootstrap artifact")
     return path
+
+
+@contextmanager
+def network_operation(target: Target) -> Iterator[None]:
+    """Serialize continuation and removal on the owned local target."""
+    state.load(target)
+    path = artifact_path(target, "network.lock")
+    descriptor = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_size != 0
+            or info.st_mode & 0o077
+            or info.st_nlink != 1
+            or info.st_uid != os.geteuid()
+        ):
+            raise ValueError("Unexpected private target lock")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise ValueError("Another network or removal operation holds the target lock") from None
+        yield
+    finally:
+        os.close(descriptor)
+
+
+def network_bootstrap(
+    target: Target, request: dict, expected_host_id: str
+) -> tuple[dict, list[dict]]:
+    """Re-admit the network stage against this exact disposable cold bootstrap."""
+    from . import bounded_docker, consumer_lifecycle
+
+    if (
+        target.profile != MINIMAL_PROFILE
+        or target.https_port is None
+        or not target.consumer.startswith("qual-")
+    ):
+        raise ValueError(
+            "Network qualification requires a disposable minimal-demo target with a reviewed HTTPS listener"
+        )
+    validate_request(target, request, source_digest())
+    owner = state.load(target)
+    receipt = json.loads(state.read_bounded(artifact_path(target, "bootstrap.json")))
+    previous = receipt.get("admission", {})
+    if (
+        owner["phase"] != "provisioned"
+        or any(receipt.get(key) != value for key, value in identity(target).items())
+        or receipt.get("nonce") != owner["nonce"]
+        or receipt.get("stage") != "pre-cilium"
+        or receipt.get("phase") != "pre-cilium-allocatable"
+        or receipt.get("coldBootstrapQualified") is not True
+        or receipt.get("artifactDigest") != request["artifactDigest"]
+        or previous.get("requestDigest") != admission.digest(request)
+        or previous.get("hostId") != expected_host_id
+        or previous.get("admitted") is not True
+    ):
+        raise ValueError(
+            "Network continuation requires the exact successful cold-bootstrap receipt"
+        )
+    if host.host_id() != expected_host_id:
+        raise ValueError("Host boot identity changed after cold bootstrap")
+    consumer_lifecycle.owned(target, require_ready=False)
+    journals = bounded_docker.read_journals(artifact_path(target, "bounded-docker"))
+    verify_journals(target, owner, journals)
+    if (
+        journals != receipt.get("nodes")
+        or {item["name"]: item["id"] for item in journals} != owner["nodeIds"]
+    ):
+        raise ValueError("Cold-bootstrap node journals changed")
+    check_allocatable(receipt["allocatable"], target, owner["incarnation"])
+    current, cgroups = _node_metrics(target, journals)
+    if any(
+        current[name][field] != receipt["kernelEvidence"][name][field]
+        for name in current
+        for field in ("cgroupIdentity", "startedAt")
+    ):
+        raise ValueError("Bounded node lifetime changed after cold bootstrap")
+    resident_request = {
+        **request,
+        "memory": [
+            *(item for item in request["memory"] if item["kind"] != "workload"),
+            *(
+                {
+                    "id": f"bounded-{role}",
+                    "kind": "workload",
+                    "cgroup": str(cgroups[f"{target.name}-{role}"]),
+                    "limitBytes": budget["memoryBytes"],
+                }
+                for role, budget in load_profile(name=target.profile)["nodes"].items()
+            ),
+        ],
+    }
+    stores = physical_engine(target, owner["endpoint"])
+    verify_stores(resident_request, None, stores)
+    if runtime.remaining_timeout(30) < 30:
+        raise TimeoutError("Insufficient deadline for fresh network admission")
+    observed = host.observe(resident_request, expected_host_id=expected_host_id)
+    verify_stores(resident_request, observed, stores)
+    memory_identities = {
+        **receipt["memoryAccountIdentities"],
+        **{f"bounded-{item['role']}": current[item["name"]]["cgroupIdentity"] for item in journals},
+    }
+    if any(
+        observed["memory"][key].get("cgroupId") != value for key, value in memory_identities.items()
+    ):
+        raise ValueError("Network admission memory account lifetime changed")
+    decision = admission.evaluate(
+        resident_request, observed, host_id=host.host_id(), now=int(time.time())
+    )
+    if not decision["admitted"] or {item["filesystemId"] for item in decision["filesystems"]} != {
+        item["filesystemId"] for item in previous["filesystems"]
+    }:
+        raise ValueError("Fresh network host admission refused or physical stores changed")
+    tooling_metrics(resident_request)
+    return {**receipt, "networkAdmission": decision}, journals
 
 
 def write_receipt(target: Target, receipt: dict) -> None:
@@ -399,7 +532,12 @@ def verify_journals(target: Target, owner: dict, journals: list[dict]) -> None:
 
 
 def node_metrics(target: Target, journals: list[dict]) -> dict:
+    return _node_metrics(target, journals)[0]
+
+
+def _node_metrics(target: Target, journals: list[dict]) -> tuple[dict, dict[str, Path]]:
     result = {}
+    cgroups = {}
     for journal in journals:
         node = runtime.inspect_node(target, journal["id"], journal["name"])
         runtime.verify_nodes({journal["name"]: node}, profile=target.profile)
@@ -434,6 +572,7 @@ def node_metrics(target: Target, journals: list[dict]) -> dict:
         if len(paths) != 1 or journal["id"] not in paths[0]:
             raise ValueError("Cannot bind physical node cgroup to immutable container")
         path = host.CGROUP_ROOT / paths[0]
+        cgroups[journal["name"]] = path
         memory = load_profile(name=target.profile)["nodes"][journal["role"]]["memoryBytes"]
         if node["swap"] != memory:
             raise ValueError("Node swap cap differs")
@@ -442,7 +581,7 @@ def node_metrics(target: Target, journals: list[dict]) -> dict:
             "id": journal["id"],
             "startedAt": data["startedAt"],
         }
-    return result
+    return result, cgroups
 
 
 def tooling_metrics(request: dict) -> list[dict]:
@@ -603,18 +742,21 @@ def check_allocatable(result: dict, target: Target, incarnation: str) -> None:
 
 
 def down(target: Target, confirmation: str | None) -> dict:
+    if confirmation != target.name:
+        raise ValueError("Deletion requires exact --confirm-delete target name")
+    if target.profile != MINIMAL_PROFILE:
+        raise ValueError("Dedicated removal requires minimal-demo profile")
     with runtime.deadline(180):
-        return _down(target, confirmation)
+        if target.https_port is not None:
+            with network_operation(target):
+                return _down(target)
+        return _down(target)
 
 
-def _down(target: Target, confirmation: str | None) -> dict:
+def _down(target: Target) -> dict:
     """Delete only immutable journal IDs; API absence does not invalidate partial ownership."""
     from . import bounded_docker
 
-    if confirmation != target.name:
-        raise ValueError("Deletion requires exact --confirm-delete target name")
-    if target.profile != "minimal-demo":
-        raise ValueError("Dedicated removal requires minimal-demo profile")
     owner = state.load(target)
     if runtime.prerequisites(target) != owner["endpoint"]:
         raise ValueError("Docker endpoint changed")
@@ -701,6 +843,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--consumer")
     parser.add_argument("--docker-context")
     parser.add_argument("--state-root", type=Path)
+    parser.add_argument("--https-port", type=int)
     parser.add_argument("--request", type=Path)
     parser.add_argument("--host-id")
     parser.add_argument("--confirm-delete")
@@ -712,7 +855,9 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if not args.consumer or not args.docker_context or not args.state_root:
             raise ValueError("Explicit target required")
-        target = Target(args.consumer, args.docker_context, args.state_root, "minimal-demo")
+        target = Target(
+            args.consumer, args.docker_context, args.state_root, "minimal-demo", args.https_port
+        )
         if not args.execute:
             result = preview(target, args.action)
         elif args.action == "down":

@@ -136,15 +136,18 @@ class BootstrapTests(unittest.TestCase):
             self.assertEqual(command.call_args.args[1][3:5], ["image", "inspect"])
 
     def test_preview_is_offline_and_unqualified(self):
+        from tempfile import TemporaryDirectory
         from unittest.mock import patch
 
-        target = SimpleNamespace(
-            name="qual-demo-local", profile="minimal-demo", consumer="qual-demo"
-        )
-        with patch("subprocess.Popen", side_effect=AssertionError("must be offline")):
+        with (
+            TemporaryDirectory() as root,
+            patch("subprocess.Popen", side_effect=AssertionError("must be offline")),
+        ):
+            target = Target("qual-demo", "default", Path(root), "minimal-demo", 18443)
             result = bootstrap.preview(target)
         self.assertFalse(result["installedAcceptance"])
         self.assertEqual(result["stage"], "pre-cilium")
+        self.assertEqual(result["loopbackHttpsPort"], 18443)
 
     def test_environment_discards_ambient_provider_overrides(self):
         from unittest.mock import patch
@@ -208,6 +211,59 @@ class BootstrapTests(unittest.TestCase):
         ):
             with self.assertRaises(ValueError):
                 bootstrap.create(target, {}, "host")
+
+
+class NetworkContinuationTests(unittest.TestCase):
+    def test_cold_bootstrap_receipt_must_bind_exact_source_and_request_before_provider_access(self):
+        from tempfile import TemporaryDirectory
+        from unittest.mock import patch
+
+        from scripts import consumer_state
+        from scripts.consumer_profile import identity
+        from tests.test_host_admission import request
+
+        with TemporaryDirectory() as root:
+            target = Target("qual-demo", "default", Path(root), "minimal-demo", 18443)
+            owner = consumer_state.reserve(target, "unix:///run/docker.sock")
+            owner["phase"] = "provisioned"
+            consumer_state.save(target, owner)
+            value = request()
+            value.update(target=target.name, artifactDigest=bootstrap.source_digest())
+            bootstrap.write_receipt(
+                target,
+                {
+                    **identity(target),
+                    "nonce": owner["nonce"],
+                    "stage": "pre-cilium",
+                    "phase": "pre-cilium-allocatable",
+                    "coldBootstrapQualified": True,
+                    "artifactDigest": value["artifactDigest"],
+                    "admission": {"admitted": True, "hostId": "boot", "requestDigest": "drift"},
+                },
+            )
+            with (
+                patch.object(bootstrap.runtime, "command") as command,
+                self.assertRaisesRegex(ValueError, "bootstrap receipt"),
+            ):
+                bootstrap.network_bootstrap(target, value, "boot")
+            command.assert_not_called()
+
+    def test_network_operation_and_removal_cannot_overlap_for_the_same_target(self):
+        from tempfile import TemporaryDirectory
+        from unittest.mock import patch
+
+        from scripts import consumer_state
+
+        with TemporaryDirectory() as root:
+            target = Target("qual-demo", "default", Path(root), "minimal-demo", 18443)
+            consumer_state.reserve(target, "unix:///run/docker.sock")
+            with (
+                bootstrap.network_operation(target),
+                patch.object(bootstrap.runtime, "command") as command,
+                self.assertRaisesRegex(ValueError, "target lock"),
+            ):
+                bootstrap.down(target, target.name)
+            command.assert_not_called()
 
 
 class CreationTests(unittest.TestCase):
