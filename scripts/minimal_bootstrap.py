@@ -15,6 +15,7 @@ import tomllib
 from datetime import datetime
 from pathlib import Path
 
+from . import bootstrap_failure as failure
 from . import consumer_runtime as runtime
 from . import consumer_state as state
 from . import host_admission as admission
@@ -81,6 +82,34 @@ def validate_engine(info: dict) -> None:
         )
 
 
+def cached_image(target: Target) -> None:
+    image = load_profile(name=target.profile)["nodeImage"]
+    result = json.loads(
+        runtime.command(
+            target,
+            [
+                "docker",
+                "--context",
+                target.docker_context,
+                "image",
+                "inspect",
+                "--format",
+                '{"digests":{{json .RepoDigests}},"os":{{json .Os}},"architecture":{{json .Architecture}}}',
+                image,
+            ],
+        )
+    )
+    repository, digest = image.split("@", 1)
+    repository = repository.split(":", 1)[0]
+    if (
+        not isinstance(result, dict)
+        or repository + "@" + digest not in (result.get("digests") or [])
+        or result.get("os") != "linux"
+        or result.get("architecture") != "amd64"
+    ):
+        raise ValueError("Exact node image must already be cached")
+
+
 def qualify(target, request: dict, expected_host_id: str) -> dict:
     if not target.consumer.startswith("qual-"):
         raise ValueError("Cold bootstrap qualification requires disposable qual- consumer")
@@ -143,40 +172,46 @@ def _create(
 ) -> dict:
     if target.profile != "minimal-demo":
         raise ValueError("Dedicated bootstrap requires minimal-demo profile")
-    validate_request(target, request, source_digest())
+    with failure.phase("request-validation", "invalid-configuration"):
+        validate_request(target, request, source_digest())
     # Imports follow pure refusal, so preview and invalid requests never need a provider.
     from . import bounded_docker
 
-    endpoint = runtime.prerequisites(target, creating=True)
-    versions = runtime.tools(target)
+    with failure.phase("prerequisites", "missing-prerequisite"):
+        endpoint = runtime.prerequisites(target, creating=True)
+        versions = runtime.tools(target)
+    with failure.phase("cached-node-image", "missing-prerequisite"):
+        cached_image(target)
     from .consumer_lifecycle import source_identity
 
-    provenance = source_identity(target)
-    runtime.command(
-        target, ["docker", "--context", target.docker_context, "network", "inspect", "kind"]
-    )
-    if any(
-        artifact_path(target, suffix).exists()
-        for suffix in ("bootstrap.json", "bootstrap.pending", "bounded-docker")
-    ):
-        raise ValueError("Prior bootstrap evidence exists; use a distinct absent target")
-    if runtime.remaining_timeout(15) < 15:
-        raise ValueError("Insufficient deadline for physical daemon proof")
-    stores = physical_engine(target, endpoint)
-    if target.name in runtime.clusters(target):
-        raise ValueError("Existing target cannot be adopted")
-    verify_stores(request, None, stores)
-    if runtime.remaining_timeout(30) < 30:
-        raise ValueError("Insufficient deadline for fresh host observation")
-    observation = host.observe(request, expected_host_id=expected_host_id)
-    verify_stores(request, observation, stores)
-    decision = admission.evaluate(
-        request, observation, host_id=host.host_id(), now=int(time.time())
-    )
-    if not decision["admitted"]:
-        raise ValueError("Fresh physical host admission refused")
-    runtime.remaining_timeout()
-    record = state.reserve(target, endpoint)
+    with failure.phase("physical-admission", "invalid-configuration"):
+        provenance = source_identity(target)
+        runtime.command(
+            target, ["docker", "--context", target.docker_context, "network", "inspect", "kind"]
+        )
+        if any(
+            artifact_path(target, suffix).exists()
+            for suffix in ("bootstrap.json", "bootstrap.pending", "bounded-docker")
+        ):
+            raise ValueError("Prior bootstrap evidence exists; use a distinct absent target")
+        if runtime.remaining_timeout(15) < 15:
+            raise ValueError("Insufficient deadline for physical daemon proof")
+        stores = physical_engine(target, endpoint)
+        if target.name in runtime.clusters(target):
+            raise failure.Failure({"category": "identity-mismatch", "phase": "target-absence"})
+        verify_stores(request, None, stores)
+        if runtime.remaining_timeout(30) < 30:
+            raise ValueError("Insufficient deadline for fresh host observation")
+        observation = host.observe(request, expected_host_id=expected_host_id)
+        verify_stores(request, observation, stores)
+        decision = admission.evaluate(
+            request, observation, host_id=host.host_id(), now=int(time.time())
+        )
+        if not decision["admitted"]:
+            raise ValueError("Fresh physical host admission refused")
+        runtime.remaining_timeout()
+    with failure.phase("ownership-reservation", "identity-mismatch"):
+        record = state.reserve(target, endpoint)
     receipt = {
         **identity(target),
         "nonce": record["nonce"],
@@ -187,6 +222,7 @@ def _create(
         "admission": decision,
         "stage": "pre-cilium",
         "phase": "creating",
+        "lastCompletedPhase": "ownership-reservation",
         "installedAcceptance": False,
         "coldBootstrapQualified": False,
         "startedAt": int(time.time()),
@@ -206,11 +242,17 @@ def _create(
                 floor.append(0)
 
     sampler = threading.Thread(target=sample, daemon=True)
+    current_phase = "adapter-prepare"
+    category = "missing-prerequisite"
     try:
         write_receipt(target, receipt)
         overlay = bounded_docker.prepare(target, record["nonce"], directory)
+        receipt["lastCompletedPhase"] = "adapter-prepared"
+        current_phase, category = "kind-create", "dependency-failure"
         sampler.start()
         run_kind(target, overlay, runtime.remaining_timeout(600))
+        receipt["lastCompletedPhase"] = "kind-created"
+        current_phase, category = "node-identity", "identity-mismatch"
         journals = bounded_docker.read_journals(directory)
         verify_journals(target, record, journals)
         receipt["nodes"] = journals
@@ -221,10 +263,14 @@ def _create(
             raise ValueError("Created node identities differ from prestart journals")
         record.update(nodeIds=ids, incarnation=runtime.incarnation(target), phase="provisioned")
         state.save(target, record)
+        receipt["lastCompletedPhase"] = "node-identity-verified"
+        current_phase, category = "capacity-reconciliation", "dependency-failure"
         initial = node_metrics(target, journals)
         # Reconciliation restarts kubelet only; it never restarts the enclosing cgroup.
         receipt["allocatable"] = configure_capacity(target, runtime.remaining_timeout(280))
         check_allocatable(receipt["allocatable"], target, record["incarnation"])
+        receipt["lastCompletedPhase"] = "allocatable-verified"
+        current_phase, category = "lifetime-verification", "identity-mismatch"
         final = node_metrics(target, journals)
         if any(
             initial[name]["cgroupIdentity"] != final[name]["cgroupIdentity"]
@@ -244,6 +290,8 @@ def _create(
             raise ValueError("Admitted memory account lifetime changed")
         stop.set()
         sampler.join(timeout=2)
+        if sampler.is_alive():
+            raise TimeoutError("Host sampler did not stop")
         if (
             host.host_id() != expected_host_id
             or time.monotonic() - started > 900
@@ -254,11 +302,12 @@ def _create(
         runtime.remaining_timeout()
         receipt.update(phase="pre-cilium-allocatable", coldBootstrapQualified=qualification)
         return receipt
-    except BaseException:
+    except BaseException as error:
         record["phase"] = "partial"
         state.save(target, record)
-        receipt.update(phase="partial", failure="bootstrap-refused-or-incomplete")
-        raise
+        safe_failure = failure.evidence(error, current_phase, category)
+        receipt.update(phase="partial", failure=safe_failure)
+        raise failure.Failure(safe_failure) from None
     finally:
         stop.set()
         if sampler.is_alive():
@@ -323,7 +372,7 @@ def run_kind(target: Target, overlay: dict[str, str], timeout: int) -> None:
             terminate(process)
             raise
     if code:
-        raise ValueError("Bounded kind failed; retain private target evidence")
+        raise subprocess.CalledProcessError(code, "kind")
 
 
 def configure_capacity(target: Target, timeout: int) -> dict:
@@ -346,7 +395,7 @@ def verify_journals(target: Target, owner: dict, journals: list[dict]) -> None:
             for item in journals
         )
     ):
-        raise ValueError("Incomplete or foreign prestart journal")
+        raise failure.Failure({"category": "identity-mismatch", "phase": "node-identity"})
 
 
 def node_metrics(target: Target, journals: list[dict]) -> dict:
@@ -446,7 +495,7 @@ def option(args: list[str], name: str, default: str) -> str:
     return matches[0] if matches else default
 
 
-def physical_engine(target: Target, endpoint: str) -> dict[str, Path]:
+def physical_engine(target: Target, endpoint: str) -> dict[str, list[Path]]:
     if not endpoint.startswith("unix://"):
         raise ValueError("Native Unix Docker socket required")
     socket_path = endpoint.removeprefix("unix://")
@@ -480,7 +529,7 @@ def physical_engine(target: Target, endpoint: str) -> dict[str, Path]:
     ) or any(info.get(key) for key in ("HttpProxy", "HttpsProxy")):
         raise ValueError("Rootless, userns and proxy Docker paths unsupported")
     root = host.ordinary_path(info["DockerRootDir"])
-    stores = {"runtime": root, "images": root}
+    stores = {"runtime": root, "images": root, "retained": root}
     if info["Driver"] == "overlayfs":
         containerd_socket = option(
             args, "--containerd", "/var/run/docker/containerd/containerd.sock"
@@ -501,28 +550,42 @@ def physical_engine(target: Target, endpoint: str) -> dict[str, Path]:
         )
     for path in stores.values():
         host.physical_filesystem(path)
-    return stores
+    return {
+        "runtime": [root, stores["images"]],
+        "images": [stores["images"]],
+        "retained": [root],
+    }
 
 
-def verify_stores(request: dict, observation: dict | None, stores: dict[str, Path]) -> None:
+def verify_stores(request: dict, observation: dict | None, stores: dict[str, list[Path]]) -> None:
     """Charge shared cache through free space; never credit its existing images."""
-    for category, store in stores.items():
-        accounts = [item for item in request["disk"] if item["category"] == category]
-        if not accounts:
-            raise ValueError("Missing physical Docker store account")
-        for item in accounts:
+    if observation is not None:
+        accounts = [observation["disk"][item["id"]]["physicalId"] for item in request["disk"]]
+        if len(set(accounts)) != len(accounts):
+            raise ValueError("Physical disk account aliases are unsupported for bootstrap")
+        # Fresh bootstrap reserves the full 35GiB, including retained/preparation
+        # directories; existing bytes never reduce the future growth reservation.
+        for item in request["disk"]:
+            observation["disk"][item["id"]]["residentBytes"] = 0
+    all_stores = [path for paths in stores.values() for path in paths]
+    for category, paths in stores.items():
+        required = {path.stat().st_dev for path in paths}
+        covered = set()
+        for item in request["disk"]:
+            if item["category"] != category:
+                continue
             path = host.ordinary_path(item["path"])
-            if path.stat().st_dev != store.stat().st_dev or any(
-                path.is_relative_to(other) or other.is_relative_to(path)
-                for other in stores.values()
+            device = path.stat().st_dev
+            if device not in required or any(
+                path.is_relative_to(other) or other.is_relative_to(path) for other in all_stores
             ):
                 raise ValueError(
                     "Use disjoint reservation directories on the Docker store filesystem"
                 )
-            if observation is not None:
-                # Even empty directories occupy blocks. Deliberately discard that
-                # credit so reservations cover the entire future image/runtime growth.
-                observation["disk"][item["id"]]["residentBytes"] = 0
+            if item["limitBytes"] > 0:
+                covered.add(device)
+        if covered != required:
+            raise ValueError("Missing positive reservation for physical Docker store")
 
 
 def check_allocatable(result: dict, target: Target, incarnation: str) -> None:
@@ -663,9 +726,20 @@ def main(argv: list[str] | None = None) -> int:
             )
         print(json.dumps(result, indent=2))
         return 0
-    except (OSError, ValueError, KeyError, TypeError, TimeoutError, subprocess.SubprocessError):
+    except (Exception, KeyboardInterrupt) as error:
         print(
-            "Minimal bootstrap refused or incomplete; retain private owner, shim journals and bootstrap receipt. No cleanup performed."
+            json.dumps(
+                {
+                    "failure": failure.evidence(
+                        error,
+                        "preflight",
+                        "invalid-configuration"
+                        if isinstance(error, ValueError)
+                        else "internal-defect",
+                    ),
+                    "nextInspection": "Check the failed phase; inspect private receipts if ownership was reserved.",
+                }
+            )
         )
         return 1
 

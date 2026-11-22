@@ -29,6 +29,59 @@ class AdmissionTests(unittest.TestCase):
                 SimpleNamespace(name="qual-demo-local"), request, request["artifactDigest"]
             )
 
+    def test_physical_aliases_cannot_reduce_full_reservation(self):
+        from tests.test_host_admission import observation, request
+
+        value = request()
+        images = value["disk"][1]
+        images["limitBytes"] //= 2
+        value["disk"].append({**images, "id": "images-alias"})
+        observed = observation(value)
+        observed["disk"]["images-alias"] = dict(observed["disk"][images["id"]])
+        with self.assertRaisesRegex(ValueError, "alias"):
+            bootstrap.verify_stores(value, observed, {})
+
+    def test_reservation_needs_full_35gib_plus_filesystem_floor(self):
+        from scripts import host_admission
+        from tests.test_host_admission import observation, request
+
+        value = request()
+        observed = observation(value)
+        for metric in observed["disk"].values():
+            metric.update(availableBytes=39 * host_admission.GIB, residentBytes=host_admission.GIB)
+        bootstrap.verify_stores(value, observed, {})
+        decision = host_admission.evaluate(value, observed, host_id=observed["hostId"], now=1001)
+        self.assertFalse(decision["admitted"])
+
+    def test_runtime_requires_positive_reservation_on_both_store_filesystems(self):
+        from unittest.mock import Mock, patch
+
+        from tests.test_host_admission import request
+
+        first, second = Mock(), Mock()
+        first.stat.return_value.st_dev = 1
+        second.stat.return_value.st_dev = 2
+        first.is_relative_to.return_value = False
+        second.is_relative_to.return_value = False
+        value = request()
+        runtime = next(item for item in value["disk"] if item["category"] == "runtime")
+        value["disk"].append(
+            {**runtime, "id": "runtime-second", "path": "/second", "limitBytes": 0}
+        )
+
+        def reservation(path):
+            result = Mock()
+            result.stat.return_value.st_dev = 2 if path == "/second" else 1
+            result.is_relative_to.return_value = False
+            return result
+
+        with patch.object(bootstrap.host, "ordinary_path", side_effect=reservation):
+            with self.assertRaisesRegex(ValueError, "positive"):
+                bootstrap.verify_stores(value, None, {"runtime": [first, second]})
+            runtime["limitBytes"] -= 1
+            value["disk"][-1]["limitBytes"] = 1
+            bootstrap.verify_stores(value, None, {"runtime": [first, second]})
+
     def test_disk_reservation_cannot_understate_the_bootstrap_envelope(self):
         from tests.test_host_admission import request
 
@@ -40,6 +93,48 @@ class AdmissionTests(unittest.TestCase):
 
 
 class BootstrapTests(unittest.TestCase):
+    def test_cached_image_requires_digest_linux_amd64_metadata(self):
+        import json
+        from unittest.mock import patch
+
+        from scripts.consumer_profile import load_profile
+
+        target = Target("qual-demo", "default", Path("/tmp"), "minimal-demo")
+        image = load_profile(name="minimal-demo")["nodeImage"]
+        digest = "kindest/node@" + image.split("@", 1)[1]
+        for architecture in ("amd64", "arm64"):
+            with patch.object(
+                bootstrap.runtime,
+                "command",
+                return_value=json.dumps(
+                    {"digests": [digest], "os": "linux", "architecture": architecture}
+                ),
+            ):
+                if architecture == "amd64":
+                    bootstrap.cached_image(target)
+                else:
+                    with self.assertRaises(ValueError):
+                        bootstrap.cached_image(target)
+
+    def test_uncached_image_refuses_before_reservation(self):
+        from unittest.mock import patch
+
+        from tests.test_host_admission import request
+
+        target = Target("qual-demo", "default", Path("/tmp"), "minimal-demo")
+        value = request()
+        value.update(target=target.name, artifactDigest=bootstrap.source_digest())
+        with (
+            patch.object(bootstrap.runtime, "prerequisites", return_value="unix:///socket"),
+            patch.object(bootstrap.runtime, "tools", return_value={}),
+            patch.object(bootstrap.runtime, "command", return_value="[]") as command,
+            patch.object(bootstrap.state, "reserve") as reserve,
+        ):
+            with self.assertRaisesRegex(ValueError, "cached-node-image"):
+                bootstrap.create(target, value, "host")
+            reserve.assert_not_called()
+            self.assertEqual(command.call_args.args[1][3:5], ["image", "inspect"])
+
     def test_preview_is_offline_and_unqualified(self):
         from unittest.mock import patch
 
@@ -135,6 +230,7 @@ class CreationTests(unittest.TestCase):
             for name, result in [
                 ("runtime.prerequisites", "unix:///var/run/docker.sock"),
                 ("runtime.tools", {}),
+                ("cached_image", None),
                 ("runtime.command", "[]"),
                 ("physical_engine", {}),
                 ("runtime.clusters", []),
@@ -149,12 +245,15 @@ class CreationTests(unittest.TestCase):
             runner = stack.enter_context(
                 patch("scripts.minimal_bootstrap.run_kind", side_effect=ValueError("kind failed"))
             )
-            with self.assertRaisesRegex(ValueError, "kind failed"):
+            with self.assertRaisesRegex(ValueError, "dependency-failure"):
                 bootstrap.create(target, value, observed["hostId"])
             self.assertEqual(consumer_state.load(target)["phase"], "partial")
             receipt = json.loads(bootstrap.artifact_path(target, "bootstrap.json").read_text())
             self.assertFalse(receipt["coldBootstrapQualified"])
             self.assertEqual(receipt["phase"], "partial")
+            self.assertEqual(receipt["failure"]["category"], "dependency-failure")
+            self.assertEqual(receipt["failure"]["phase"], "kind-create")
+            self.assertEqual(receipt["lastCompletedPhase"], "adapter-prepared")
             self.assertEqual(runner.call_count, 1)
 
     def test_success_is_pre_cilium_only_and_foreign_creation_stays_partial(self):
@@ -168,8 +267,12 @@ class CreationTests(unittest.TestCase):
         from scripts.consumer_profile import Target
         from tests.test_host_admission import observation, request
 
-        for foreign in (False, True):
-            with self.subTest(foreign=foreign), TemporaryDirectory() as root, ExitStack() as stack:
+        for foreign, stuck_sampler in ((False, False), (True, False), (False, True)):
+            with (
+                self.subTest(foreign=foreign, stuck_sampler=stuck_sampler),
+                TemporaryDirectory() as root,
+                ExitStack() as stack,
+            ):
                 target = Target("qual-demo", "default", Path(root), "minimal-demo")
                 value = request()
                 value.update(target=target.name, artifactDigest=bootstrap.source_digest())
@@ -203,6 +306,7 @@ class CreationTests(unittest.TestCase):
                 for name, result in [
                     ("runtime.prerequisites", "unix:///var/run/docker.sock"),
                     ("runtime.tools", {}),
+                    ("cached_image", None),
                     ("runtime.command", "[]"),
                     ("physical_engine", {}),
                     ("runtime.clusters", []),
@@ -246,8 +350,20 @@ class CreationTests(unittest.TestCase):
                 stack.enter_context(
                     patch("scripts.minimal_bootstrap.run_kind", side_effect=run_kind)
                 )
-                if foreign:
-                    with self.assertRaisesRegex(ValueError, "foreign"):
+                if stuck_sampler:
+                    sampler = stack.enter_context(
+                        patch("scripts.minimal_bootstrap.threading.Thread")
+                    )
+                    sampler.return_value.is_alive.return_value = True
+                    with self.assertRaisesRegex(ValueError, "timeout"):
+                        bootstrap.qualify(target, value, observed["hostId"])
+                    receipt = json.loads(
+                        bootstrap.artifact_path(target, "bootstrap.json").read_text()
+                    )
+                    self.assertFalse(receipt["coldBootstrapQualified"])
+                    self.assertEqual(receipt["failure"]["category"], "timeout")
+                elif foreign:
+                    with self.assertRaisesRegex(ValueError, "identity-mismatch"):
                         bootstrap.qualify(target, value, observed["hostId"])
                     self.assertEqual(consumer_state.load(target)["phase"], "partial")
                 else:
@@ -310,3 +426,67 @@ class CreationTests(unittest.TestCase):
                         self.assertEqual(receipt["phase"], "removed")
                         self.assertEqual(command.call_args_list[1].args[1][-1], identifier)
                         self.assertTrue(target.path("owner.json").exists())
+
+
+class FailureEvidenceTests(unittest.TestCase):
+    def test_cli_distinguishes_safe_categories_and_never_prints_process_output(self):
+        import io
+        import json
+        import subprocess
+        from contextlib import redirect_stdout
+        from unittest.mock import patch
+
+        from scripts.bootstrap_failure import Failure
+
+        for error, category in (
+            (
+                Failure({"category": "missing-prerequisite", "phase": "cached-node-image"}),
+                "missing-prerequisite",
+            ),
+            (
+                Failure({"category": "identity-mismatch", "phase": "node-identity"}),
+                "identity-mismatch",
+            ),
+            (
+                subprocess.CalledProcessError(
+                    17, ["private-credential"], stderr="private-credential"
+                ),
+                "dependency-failure",
+            ),
+            (
+                subprocess.TimeoutExpired(["private-credential"], 2, stderr="private-credential"),
+                "timeout",
+            ),
+        ):
+            with (
+                self.subTest(category=category),
+                patch.object(bootstrap, "create", side_effect=error),
+                patch.object(bootstrap.state, "read_bounded", return_value="{}"),
+                redirect_stdout(io.StringIO()) as output,
+            ):
+                self.assertEqual(
+                    bootstrap.main(
+                        [
+                            "create",
+                            "--consumer",
+                            "qual-demo",
+                            "--docker-context",
+                            "default",
+                            "--state-root",
+                            "/tmp",
+                            "--request",
+                            "/tmp/request",
+                            "--host-id",
+                            "host",
+                            "--execute",
+                        ]
+                    ),
+                    1,
+                )
+            result = json.loads(output.getvalue())
+            self.assertEqual(result["failure"]["category"], category)
+            self.assertNotIn("private-credential", output.getvalue())
+            if category == "dependency-failure":
+                self.assertEqual(result["failure"]["exitCode"], 17)
+            if category == "timeout":
+                self.assertTrue(result["failure"]["timedOut"])

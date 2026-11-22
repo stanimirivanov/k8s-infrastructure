@@ -56,6 +56,17 @@ def load_profile(path: Path = PROFILE) -> dict[str, Any]:
     return value
 
 
+class CommandFailure(ValueError):
+    """Safe command status, retaining the legacy ValueError/message contract."""
+
+    def __init__(
+        self, message: str, *, exit_code: int | None = None, timed_out: bool = False
+    ) -> None:
+        super().__init__(message)
+        self.exit_code = exit_code
+        self.timed_out = timed_out
+
+
 def run(
     command: list[str],
     *,
@@ -101,7 +112,9 @@ def run(
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 terminate(process)
-                raise ValueError(f"{label} timed out after {timeout}s; inspect the local target")
+                raise CommandFailure(
+                    f"{label} timed out after {timeout}s; inspect the local target", timed_out=True
+                )
             try:
                 stdout, _ = process.communicate(
                     input=input_data,
@@ -115,7 +128,10 @@ def run(
                 print(f"Still running {label} command ({elapsed}s elapsed)...", flush=True)
     if process.returncode:
         # Never echo a kubeconfig or captured authentication data.
-        raise ValueError(f"{label} failed (exit {process.returncode}); inspect the local cluster")
+        raise CommandFailure(
+            f"{label} failed (exit {process.returncode}); inspect the local cluster",
+            exit_code=process.returncode,
+        )
     try:
         output = stdout.decode("utf-8")
     except UnicodeDecodeError:

@@ -17,6 +17,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from . import bootstrap_failure as failure
 from .consumer_profile import MINIMAL_PROFILE, Target, load_profile
 from .consumer_state import read_bounded
 
@@ -131,6 +132,7 @@ def node_arguments(args: list[str], selection: dict) -> tuple[str, list[str]]:
     converted[converted.index("/tmp")] = "/tmp:size=268435456"
     converted[converted.index("/run")] = "/run:size=134217728"
     converted += [
+        "--pull=never",
         "--cpus",
         str(node["cpus"]),
         "--memory",
@@ -151,7 +153,8 @@ def node_arguments(args: list[str], selection: dict) -> tuple[str, list[str]]:
 
 
 def intercept(args: list[str], selection: dict, invoke: Callable[[list[str]], str]) -> str:
-    name, create = node_arguments(args, selection)
+    with failure.phase("adapter-protocol", "unsupported-capability"):
+        name, create = node_arguments(args, selection)
     directory = Path(selection["journalDirectory"])
     node = selection["nodes"][name]
     base = {
@@ -164,13 +167,15 @@ def intercept(args: list[str], selection: dict, invoke: Callable[[list[str]], st
     write_receipt(
         directory / f"{name}.claim", {**base, "phase": "create-requested"}, exclusive=True
     )
-    container_id = invoke(create).strip()
+    with failure.phase("docker-create", "dependency-failure"):
+        container_id = invoke(create).strip()
     if not re.fullmatch(r"[a-f0-9]{64}", container_id):
         raise ValueError("Creation returned no immutable identity; retain claim for diagnosis")
     path = directory / f"{name}.json"
     receipt = {**base, "id": container_id, "phase": "created"}
     write_receipt(path, receipt, exclusive=True)
-    observed = json.loads(invoke(["inspect", "--format", INSPECT, container_id]))
+    with failure.phase("docker-inspect", "dependency-failure"):
+        observed = json.loads(invoke(["inspect", "--format", INSPECT, container_id]))
     expected = {
         "id": container_id,
         "name": f"/{name}",
@@ -189,7 +194,8 @@ def intercept(args: list[str], selection: dict, invoke: Callable[[list[str]], st
         raise ValueError("Stopped node identity or creation limits mismatch; start refused")
     receipt.update(beforeStart=observed, phase="prestart-verified", startRequestedAt=time.time_ns())
     write_receipt(path, receipt)
-    invoke(["start", container_id])
+    with failure.phase("docker-start", "dependency-failure"):
+        invoke(["start", container_id])
     receipt.update(phase="started", startCompletedAt=time.time_ns())
     write_receipt(path, receipt)
     return container_id + "\n"
@@ -218,8 +224,6 @@ def forward(args: list[str], selection: dict) -> list[str]:
     if operation in {"info", "version", "ps", "inspect"}:
         return args
     if operation == "image" and len(args) > 2 and args[1] == "inspect":
-        return args
-    if args == ["pull", selection["image"]]:
         return args
     if args == ["network", "ls", "--filter=name=^kind$", "--format={{.ID}}"]:
         return args
@@ -290,6 +294,7 @@ def prepare(target: Target, nonce: str, directory: Path) -> dict[str, str]:
 
 
 def main() -> int:
+    selection = None
     try:
         path = Path(os.environ["BOUNDED_DOCKER_POLICY"])
         selection = json.loads(read_bounded(path))
@@ -315,12 +320,22 @@ def main() -> int:
 
             print(intercept(args, selection, invoke), end="")
             return 0
-        os.execve(real, [real, *forward(args, selection)], environment)
-    except Exception:
-        print(
-            "Bounded Docker adapter refused or incomplete; retain private evidence.",
-            file=sys.stderr,
-        )
+        with failure.phase("adapter-protocol", "unsupported-capability"):
+            command = forward(args, selection)
+        os.execve(real, [real, *command], environment)
+    except Exception as error:
+        safe = failure.evidence(error, "adapter-initialization")
+        if selection is not None:
+            try:
+                write_receipt(
+                    Path(selection["journalDirectory"])
+                    / f"failure-{os.getpid()}-{time.time_ns()}.json",
+                    {"target": selection["target"], "nonce": selection["nonce"], "failure": safe},
+                    exclusive=True,
+                )
+            except (OSError, ValueError):
+                safe = {**safe, "journalWriteFailed": True}
+        print(json.dumps({"failure": safe}), file=sys.stderr)
         return 1
     return 1
 

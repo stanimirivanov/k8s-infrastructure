@@ -34,7 +34,9 @@ Docker protocols are refused. The shim implements the pinned kind v0.31.0 Docker
 CLI protocol; it is a repository integration adapter, not an upstream kind API.
 
 Both the pinned node image and the shared `kind` Docker network must already
-exist on the selected daemon. The shim does not pull images or create shared
+exist on the selected daemon. Preflight inspects the exact digest-qualified image
+and verifies its local RepoDigests before ownership reservation; node creation
+also uses `--pull=never` to refuse a cache eviction race. The shim does not pull images or create shared
 networks. Provision these prerequisites separately through the operator's
 approved daemon preparation procedure; this command grants no preparation
 permission. Cold bootstrap means fresh node containers, not an empty daemon.
@@ -74,10 +76,15 @@ already enforced cgroup, with aggregate limits at most 1 CPU/2GiB; the collector
 kind, adapter and capacity reconciliation all inherit that scope. The host
 admission policy retains a 4GiB memory floor and 10GiB free disk floor per store.
 
-Reserve the full approved envelope for each of the four disk categories. For images and
-runtime, use small disjoint reservation directories on the corresponding Docker
-and containerd store filesystems, outside the stores themselves. The helper
-checks filesystem identity and discards resident credit for these categories.
+Reserve the full approved 35GiB envelope across the four disk categories, plus
+the admission policy’s 10GiB free floor per filesystem. Physical account aliases
+are refused and resident credit is discarded for every category. For images,
+runtime and retained volumes, use disjoint reservation directories outside the
+stores on their actual filesystems. Images map to the image store, retained
+volumes to Docker root, and runtime to both Docker and containerd roots. Each
+required filesystem needs a positive reservation within the unchanged category
+total; split stores do not enlarge that total. Preparation follows its own
+observed account path. The helper checks filesystem coverage.
 Thus existing shared images are charged by filesystem free space and never
 counted as consumer-owned reusable bytes. Do not pass the shared Docker or
 containerd root as a `du` account: broad scans and parent/child overlaps are
@@ -133,6 +140,14 @@ kubeconfigs, raw Docker output or state. The sanitized receipt includes
 The owner remains `provisioned`, not `ready`; no generic handoff becomes selectable.
 
 ## Failure, diagnosis and explicit cleanup
+
+CLI failures report an allowlisted category and phase without raw provider output.
+After reservation, the bootstrap receipt also retains `lastCompletedPhase` and
+`failure` (including exit code or timeout where applicable). Adapter failures
+write private `failure-*.json` journals with safe categories such as
+`adapter-protocol`, `docker-create`, `docker-inspect` and `docker-start`; inspect
+these alongside node journals when kind exits unsuccessfully. Before reservation
+there may be no receipt: inspect the reported preflight phase and prerequisites.
 
 An admission or physical-proof refusal makes no infrastructure changes. A later
 failure marks ownership `partial` and retains all available journals. Inspect the

@@ -14,7 +14,7 @@ import yaml
 
 from .consumer_profile import LABEL, NETWORK_PROFILES, Target, load_profile
 from .consumer_state import read_bounded
-from .local_kind import COMMAND_TIMEOUT, run
+from .local_kind import COMMAND_TIMEOUT, CommandFailure, run
 from .node_capacity import verify_allocatable
 
 # Inspect only identity and resource metadata; never container environments or secrets.
@@ -52,7 +52,9 @@ def remaining_timeout(cap: int = COMMAND_TIMEOUT) -> int:
     end = _DEADLINE.get()
     remaining = min(cap, int(end - time.monotonic())) if end is not None else cap
     if remaining <= 0:
-        raise ValueError("Consumer operation deadline exhausted; retain partial evidence")
+        raise CommandFailure(
+            "Consumer operation deadline exhausted; retain partial evidence", timed_out=True
+        )
     return remaining
 
 

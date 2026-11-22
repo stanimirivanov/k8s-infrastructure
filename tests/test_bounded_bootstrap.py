@@ -53,6 +53,35 @@ class ProfileTests(unittest.TestCase):
 
 
 class DockerProtocolTests(unittest.TestCase):
+    def test_adapter_failure_retains_safe_journal(self):
+        import json
+        from unittest.mock import patch
+
+        from scripts import bounded_docker
+
+        selection = bounded_docker.policy(self.target, "nonce", self.root)
+        policy = self.root / "policy.json"
+        policy.write_text(json.dumps(selection))
+        with (
+            patch.dict(
+                "os.environ",
+                {"BOUNDED_DOCKER_POLICY": str(policy), "BOUNDED_DOCKER_REAL": "/usr/bin/docker"},
+            ),
+            patch("sys.argv", ["shim", "pull", self.image]),
+        ):
+            self.assertEqual(bounded_docker.main(), 1)
+        errors = list(self.root.glob("failure-*.json"))
+        self.assertEqual(len(errors), 1)
+        error = json.loads(errors[0].read_text())
+        self.assertEqual(error["failure"]["category"], "unsupported-capability")
+        self.assertEqual(error["failure"]["phase"], "adapter-protocol")
+
+    def test_adapter_refuses_even_the_pinned_image_pull(self):
+        from scripts import bounded_docker
+
+        with self.assertRaises(ValueError):
+            bounded_docker.forward(["pull", "exact-image"], {"image": "exact-image"})
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
@@ -123,6 +152,7 @@ class DockerProtocolTests(unittest.TestCase):
         def docker(args):
             events.append(args)
             if args[0] == "create":
+                self.assertIn("--pull=never", args)
                 self.assertEqual(args[-1], self.image)
                 for flag, value in (
                     ("--cpus", "2"),
