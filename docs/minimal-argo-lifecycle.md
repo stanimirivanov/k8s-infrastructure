@@ -107,7 +107,8 @@ can finish between samples. Confirm the collection window covers both operations
 and retain its private JSONL receipt. Record actual controller termination and
 restoration with separately approved `suspend` and `resume` invocations.
 
-Compare the captured cycle without initiating a controller change:
+Compare the captured cycle from the same admitted tooling cgroup. The
+qualification action reads the current target and the captured receipts:
 
 ```sh
 uv run --locked --offline python -m scripts.minimal_argo qualify \
