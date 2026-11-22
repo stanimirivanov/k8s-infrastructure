@@ -96,6 +96,7 @@ class DockerProtocolTests(unittest.TestCase):
         import yaml
 
         from scripts import bounded_docker as adapter
+        from scripts.database_assets import selection
 
         target = Target("qual-cold", "default", self.root, "minimal-demo", 18443)
         storage = {
@@ -110,6 +111,25 @@ class DockerProtocolTests(unittest.TestCase):
                 },
             },
         }
+        helper_image = selection()["images"]["kind-helper"]
+        config = {
+            "kind": "ConfigMap",
+            "metadata": {"name": "local-path-config", "namespace": "local-path-storage"},
+            "data": {
+                "helperPod.yaml": yaml.safe_dump(
+                    {
+                        "apiVersion": "v1",
+                        "kind": "Pod",
+                        "metadata": {"name": "helper-pod"},
+                        "spec": {
+                            "containers": [
+                                {"name": "helper-pod", "image": helper_image.split("@")[0]}
+                            ]
+                        },
+                    }
+                )
+            },
+        }
         calls = []
 
         def docker(command):
@@ -122,7 +142,7 @@ class DockerProtocolTests(unittest.TestCase):
                     }
                 )
             if command[:1] == ["exec"] and command[2] == "cat":
-                return yaml.safe_dump(storage)
+                return yaml.safe_dump_all([storage, config])
             return self.node["id"]
 
         adapter.intercept(self.args, adapter.policy(target, "owner-nonce", self.root), docker)
@@ -139,9 +159,20 @@ class DockerProtocolTests(unittest.TestCase):
         dns = json.loads(patches["corednsdeployment+strategic.json"])["spec"]["template"]["spec"]
         self.assertEqual(dns["nodeSelector"]["k8s-infrastructure.io/role"], "worker")
         self.assertEqual(dns["containers"][0]["resources"]["requests"]["cpu"], "25m")
-        provisioner = yaml.safe_load(patches["default-storage.yaml"])["spec"]["template"]["spec"]
+        result, rendered_config = yaml.safe_load_all(patches["default-storage.yaml"])
+        provisioner = result["spec"]["template"]["spec"]
         self.assertEqual(provisioner["containers"][0]["image"], "untouched")
         self.assertEqual(provisioner["containers"][0]["resources"]["limits"]["memory"], "64Mi")
+        helper = yaml.safe_load(rendered_config["data"]["helperPod.yaml"])["spec"]["containers"][0]
+        self.assertEqual(helper["image"], helper_image)
+        self.assertEqual(helper["imagePullPolicy"], "Never")
+        self.assertEqual(
+            helper["resources"],
+            {
+                "requests": {"cpu": "25m", "memory": "64Mi"},
+                "limits": {"cpu": "100m", "memory": "64Mi"},
+            },
+        )
 
     def test_worker_gateway_publish_is_exact_and_inspected_before_start(self):
         import json

@@ -6,7 +6,7 @@ import json
 from typing import Any
 
 from . import consumer_lifecycle, consumer_runtime
-from .consumer_profile import Target
+from .consumer_profile import MINIMAL_PROFILE, Target
 from .database_assets import (
     MANAGER,
     download,
@@ -97,7 +97,12 @@ def verify_driver(target: Target, documents: list[dict]) -> dict:
             ):
                 raise ValueError("Kind default storage capability differs")
         elif kind == "ConfigMap":
-            if actual.get("data") != expected.get("data"):
+            data = expected["data"]
+            if target.profile == MINIMAL_PROFILE:
+                from .minimal_foundation import bounded_storage_config
+
+                data = bounded_storage_config(data)
+            if actual.get("data") != data:
                 raise ValueError("Kind storage setup, teardown or path differs; no implicit repair")
         elif not contains(comparable_spec(expected), comparable_spec(actual)):
             raise ValueError("Kind storage provisioner configuration differs")
