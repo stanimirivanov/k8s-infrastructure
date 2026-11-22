@@ -219,6 +219,8 @@ def forward(args: list[str], selection: dict) -> list[str]:
         return args
     if args == ["pull", selection["image"]]:
         return args
+    if args == ["network", "ls", "--filter=name=^kind$", "--format={{.ID}}"]:
+        return args
     if args[:2] == ["network", "inspect"] and args[-1] == "kind":
         return args
     # Require an existing kind bridge: network lifecycle is a separate operation.
@@ -230,8 +232,17 @@ def forward(args: list[str], selection: dict) -> list[str]:
             if operation == "exec"
             else {"-f", "--follow", "--timestamps"}
         )
-        while index < len(args) and args[index] in flags:
-            index += 1
+        while index < len(args):
+            if args[index] in flags:
+                index += 1
+            elif operation == "exec" and args[index] == "-e":
+                if index + 1 >= len(args) or not re.fullmatch(
+                    r"[A-Za-z_][A-Za-z0-9_]*=.*", args[index + 1], re.DOTALL
+                ):
+                    raise ValueError("Unsupported node exec environment")
+                index += 2
+            else:
+                break
         if index >= len(args):
             raise ValueError("Missing owned node reference")
         return [*args[:index], recorded_id(args[index], selection), *args[index + 1 :]]

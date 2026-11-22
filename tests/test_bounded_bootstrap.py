@@ -260,14 +260,22 @@ class DockerProtocolTests(unittest.TestCase):
         self.assertEqual([entry[0][0] for entry in events], ["create", "inspect", "start"])
         self.assertTrue(all(event[1:] == ["default", None] for event in events))
         result = subprocess.run(
-            [str(directory / "docker"), "exec", "--privileged", self.name, "true"],
+            [
+                str(directory / "docker"),
+                "exec",
+                "--privileged",
+                "-e",
+                "TEST=value",
+                self.name,
+                "true",
+            ],
             env=environment,
             capture_output=True,
             text=True,
             timeout=10,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(calls.read_text().splitlines()[-1])[0][2], self.node["id"])
+        self.assertEqual(json.loads(calls.read_text().splitlines()[-1])[0][4], self.node["id"])
         with (
             patch.object(adapter.shutil, "which", return_value=str(docker)),
             self.assertRaises(FileExistsError),
@@ -302,3 +310,13 @@ class DockerProtocolTests(unittest.TestCase):
 
         adapter.intercept(args, adapter.policy(self.target, "owner-nonce", self.root), docker)
         self.assertEqual(adapter.read_journals(self.root)[0]["caps"]["memoryBytes"], 8589934592)
+
+    def test_pinned_kind_network_lookup_is_read_only_and_exact(self):
+        from scripts import bounded_docker as adapter
+
+        selection = adapter.policy(self.target, "owner-nonce", self.root)
+        lookup = ["network", "ls", "--filter=name=^kind$", "--format={{.ID}}"]
+        self.assertEqual(adapter.forward(lookup, selection), lookup)
+        for args in (["network", "create", "kind"], ["network", "rm", "kind"], ["network", "ls"]):
+            with self.assertRaises(ValueError):
+                adapter.forward(args, selection)
