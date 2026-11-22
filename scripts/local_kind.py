@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -60,11 +61,33 @@ class CommandFailure(ValueError):
     """Safe command status, retaining the legacy ValueError/message contract."""
 
     def __init__(
-        self, message: str, *, exit_code: int | None = None, timed_out: bool = False
+        self,
+        message: str,
+        *,
+        exit_code: int | None = None,
+        timed_out: bool = False,
+        denial: tuple[str, str] | None = None,
     ) -> None:
         super().__init__(message)
         self.exit_code = exit_code
         self.timed_out = timed_out
+        self.denial = denial
+
+
+def kubectl_denial(stderr: bytes) -> tuple[str, str] | None:
+    # Extract only the native denial category and DNS label, never request details.
+    admission = re.search(
+        rb"ValidatingAdmissionPolicy '([a-z0-9.-]{1,253})' with binding '[a-z0-9.-]+' denied request:",
+        stderr,
+    )
+    if admission:
+        return "admission", admission.group(1).decode("ascii")
+    quota = re.search(rb"exceeded quota: ([a-z0-9.-]{1,253}),", stderr)
+    if quota:
+        return "quota", quota.group(1).decode("ascii")
+    if b"Error from server (Forbidden)" in stderr and b" cannot " in stderr:
+        return "authorization", "forbidden"
+    return None
 
 
 def run(
@@ -116,7 +139,7 @@ def run(
                     f"{label} timed out after {timeout}s; inspect the local target", timed_out=True
                 )
             try:
-                stdout, _ = process.communicate(
+                stdout, stderr = process.communicate(
                     input=input_data,
                     timeout=min(PROGRESS_INTERVAL, remaining),
                 )
@@ -131,6 +154,7 @@ def run(
         raise CommandFailure(
             f"{label} failed (exit {process.returncode}); inspect the local cluster",
             exit_code=process.returncode,
+            denial=kubectl_denial(stderr) if label == "kubectl" else None,
         )
     try:
         output = stdout.decode("utf-8")
