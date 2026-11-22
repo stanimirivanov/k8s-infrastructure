@@ -13,6 +13,10 @@ from .delegated_argo_policy import binding, resource, rule
 from .network_resources import EXTRA_MEMORY, pod_bounds
 
 RECONCILER = "demo-reconciler"
+ROUTINE_RUNTIME = "demo-routine-runtime"
+ROUTINE_LABEL = "k8s-infrastructure.io/demo-routine"
+ROUTINE_CLAIM_PREFIX = "demo-ordinary-"
+NAMESPACE_LABEL = "kubernetes.io/metadata.name"
 ATTEMPT_LABEL = "k8s-infrastructure.io/demo-attempt"
 OWNER_LABEL = "k8s-infrastructure.io/demo-delegation"
 JOB_LABELS = (
@@ -238,24 +242,35 @@ def policy(
     validations: list[tuple[str, str]],
     *,
     parameter: dict | None = None,
+    namespace: str | None = None,
+    object_labels: dict | None = None,
 ) -> list[dict]:
+    match: dict = {}
+    if namespace:
+        match["namespaceSelector"] = {"matchLabels": {NAMESPACE_LABEL: namespace}}
+    constraints = {
+        **match,
+        "resourceRules": [
+            {
+                "apiGroups": [group],
+                "apiVersions": ["v1"],
+                "resources": resources,
+                "operations": list(verbs),
+                "scope": "Namespaced",
+            }
+        ],
+    }
     spec = {
         "failurePolicy": "Fail",
-        "matchConstraints": {
-            "resourceRules": [
-                {
-                    "apiGroups": [group],
-                    "apiVersions": ["v1"],
-                    "resources": resources,
-                    "operations": list(verbs),
-                    "scope": "Namespaced",
-                }
-            ],
-        },
+        "matchConstraints": constraints,
         "matchConditions": [{"name": "reviewed-boundary", "expression": condition}],
         "validations": [{"expression": expr, "message": message} for expr, message in validations],
     }
     binding_spec: dict = {"policyName": name, "validationActions": ["Deny", "Audit"]}
+    if object_labels:
+        match["objectSelector"] = {"matchLabels": object_labels}
+    if match:
+        binding_spec["matchResources"] = match
     if parameter:
         spec["paramKind"] = {"apiVersion": "v1", "kind": "PodTemplate"}
         binding_spec["paramRef"] = {**parameter, "parameterNotFoundAction": "Deny"}
@@ -312,14 +327,28 @@ def job_policy(target: Target, operation: Operation) -> list[dict]:
         + json.dumps([item[key] for item in values])
         for ref, field, key, values in orders
     )
+    name = f"{target.consumer}-{operation.launcher}-job"
+    launcher = f"request.userInfo.username == '{username(operations_namespace(target), operation.launcher)}'"
+    marked = (
+        f"has(object.metadata.labels) && '{ATTEMPT_LABEL}' in object.metadata.labels"
+        f" && object.metadata.labels['{ATTEMPT_LABEL}'] == '{operation.launcher}'"
+    )
+    # The API server resolves params before matchConditions. Restrict actual
+    # resource matching, and require the launcher to use the selected marker.
     return policy(
-        f"{target.consumer}-{operation.launcher}-job",
+        name + "-marker",
         "batch",
         ["jobs"],
         ("CREATE",),
-        f"request.userInfo.username == '{username(operations_namespace(target), operation.launcher)}'"
-        f" || (has(object.metadata.labels) && '{ATTEMPT_LABEL}' in object.metadata.labels"
-        f" && object.metadata.labels['{ATTEMPT_LABEL}'] == '{operation.launcher}')",
+        launcher,
+        [(marked, "Demo launcher must submit its reviewed attempt marker")],
+        namespace=operation.namespace,
+    ) + policy(
+        name,
+        "batch",
+        ["jobs"],
+        ("CREATE",),
+        marked,
         [
             (
                 f"request.namespace == '{operation.namespace}' && object.metadata.name == '{operation.name}'",
@@ -334,7 +363,141 @@ def job_policy(target: Target, operation: Operation) -> list[dict]:
             ),
         ],
         parameter={"name": operation.launcher, "namespace": operation.namespace},
+        namespace=operation.namespace,
+        object_labels={ATTEMPT_LABEL: operation.launcher},
     )
+
+
+def routine_policy(target: Target) -> list[dict]:
+    spaces = namespaces(target)
+    actor = username(operations_namespace(target), RECONCILER)
+    condition = (
+        f"request.namespace in {json.dumps(list(spaces))} && request.userInfo.username == '{actor}'"
+    )
+    required_label = (
+        f"'{ROUTINE_LABEL}' in {{ref}}.labels && {{ref}}.labels['{ROUTINE_LABEL}'] == 'true'"
+    )
+
+    def marked(ref: str) -> str:
+        return f"(has({ref}.labels) && {required_label.format(ref=ref)})"
+
+    own = (
+        f"(request.operation == 'CREATE' || {marked('oldObject.metadata')})"
+        f" && (request.operation == 'DELETE' || {marked('object.metadata')})"
+    )
+    documents = policy(
+        f"{target.consumer}-demo-routine-config",
+        "",
+        ["configmaps", "services"],
+        (*OPERATIONS, "DELETE"),
+        condition,
+        [(own, "Demo reconciler may change only routine-owned configuration and Services")],
+    )
+    documents += policy(
+        f"{target.consumer}-demo-routine-claim",
+        "",
+        ["persistentvolumeclaims"],
+        ("CREATE",),
+        condition,
+        [
+            (
+                f"object.metadata.name.startsWith('{ROUTINE_CLAIM_PREFIX}')",
+                "Demo reconciler must reserve ordinary claim names",
+            )
+        ],
+    )
+    pod = "object.spec.template.spec"
+    mount = (
+        "has(v.emptyDir) || has(v.configMap) || has(v.downwardAPI)"
+        " || (has(v.persistentVolumeClaim) && "
+        f"v.persistentVolumeClaim.claimName.startsWith('{ROUTINE_CLAIM_PREFIX}'))"
+    )
+    refs = (
+        "(!has(c.env) || c.env.all(e, !has(e.valueFrom) || !has(e.valueFrom.secretKeyRef)))"
+        " && (!has(c.envFrom) || c.envFrom.all(e, !has(e.secretRef)))"
+        " && (!has(c.ports) || c.ports.all(p, !has(p.hostPort) || p.hostPort == 0))"
+    )
+    worker = json.dumps({LABEL: target.consumer, "k8s-infrastructure.io/role": "worker"})
+    scope = (
+        f"has({pod}.serviceAccountName) && {pod}.serviceAccountName == '{ROUTINE_RUNTIME}'"
+        f" && (!has({pod}.serviceAccount) || {pod}.serviceAccount == '{ROUTINE_RUNTIME}')"
+        f" && has({pod}.automountServiceAccountToken) && {pod}.automountServiceAccountToken == false"
+        f" && !has({pod}.imagePullSecrets) && !has({pod}.runtimeClassName) && !has({pod}.resourceClaims)"
+        f" && (!has({pod}.volumes) || {pod}.volumes.all(v, {mount}))"
+        f" && {pod}.containers.all(c, {refs})"
+        f" && !has({pod}.nodeName) && has({pod}.nodeSelector) && {pod}.nodeSelector == {worker}"
+        f" && {pod}.schedulerName == 'default-scheduler' && !has({pod}.priorityClassName) && !has({pod}.hostAliases)"
+        f" && {marked('object.spec.template.metadata')}"
+        " && has(object.spec.selector.matchLabels)"
+        f" && '{ROUTINE_LABEL}' in object.spec.selector.matchLabels"
+        f" && object.spec.selector.matchLabels['{ROUTINE_LABEL}'] == 'true'"
+        " && !has(object.spec.template.metadata.annotations)"
+        " && !has(object.metadata.ownerReferences) && !has(object.metadata.finalizers)"
+        " && !has(object.spec.template.metadata.ownerReferences)"
+        " && !has(object.spec.template.metadata.finalizers)"
+    )
+    # Bound the delegated shape to one container and one replica at steady state.
+    # Credential-owning operators account for their separately reviewed init/transitions.
+    compute = (
+        "object.spec.replicas >= 0 && object.spec.replicas <= 1"
+        f" && size({pod}.containers) == 1"
+        f" && !has({pod}.initContainers) && !has({pod}.ephemeralContainers)"
+        f" && !has(dyn({pod}).resources) && !has({pod}.overhead)"
+    )
+    for field, value, maximum in (
+        ("requests", "cpu", "'100m'"),
+        ("requests", "memory", f"request.namespace == '{spaces[0]}' ? '256Mi' : '512Mi'"),
+        ("limits", "cpu", "'1'"),
+        ("limits", "memory", f"request.namespace == '{spaces[0]}' ? '512Mi' : '1Gi'"),
+    ):
+        values = f"dyn({pod}.containers[0].resources).{field}"
+        compute += (
+            f" && has({values}) && size({values}) == 2 && '{value}' in {values}"
+            f" && quantity({values}['{value}']).sign() > 0"
+            f" && !quantity({values}['{value}']).isGreaterThan(quantity({maximum}))"
+        )
+    for kind, rollout in (
+        ("deployments", "object.spec.strategy.type == 'Recreate'"),
+        ("statefulsets", "!has(object.spec.volumeClaimTemplates)"),
+    ):
+        documents += policy(
+            f"{target.consumer}-demo-routine-{kind}",
+            "apps",
+            [kind],
+            (*OPERATIONS, "DELETE"),
+            condition,
+            [
+                (own, "Demo reconciler may change only routine-owned controllers"),
+                (
+                    f"request.operation == 'DELETE' || ({scope})",
+                    "Demo routine workload cannot access controller or Secret credentials",
+                ),
+                (
+                    f"request.operation == 'DELETE' || ({compute} && {rollout})",
+                    "Demo routine workload must fit its bounded single-replica allocation",
+                ),
+            ],
+        )
+    return documents
+
+
+def routine_quota(application: bool) -> dict:
+    # Local namespace ceilings include all Pods and the permitted transient
+    # memory allowance. The consumer still serializes phases across namespaces.
+    controllers, pods, cpu_request, cpu_limit, memory_request, memory_limit = (
+        (10, 10, "650m", "7250m", "1792Mi", "3Gi")
+        if application
+        else (3, 3, "175m", "1500m", "1216Mi", "1920Mi")
+    )
+    return {
+        "count/deployments.apps": str(controllers),
+        "count/statefulsets.apps": str(controllers),
+        "pods": str(pods),
+        "requests.cpu": cpu_request,
+        "limits.cpu": cpu_limit,
+        "requests.memory": memory_request,
+        "limits.memory": memory_limit,
+    }
 
 
 def render(target: Target, operation: Operation | None = None) -> list[dict]:
@@ -351,7 +514,7 @@ def render(target: Target, operation: Operation | None = None) -> list[dict]:
         rules = [
             rule(
                 "",
-                ["configmaps", "secrets", "services"],
+                ["configmaps", "services"],
                 ["get", "list", "watch", "create", "update", "patch", "delete"],
             ),
             rule("", ["persistentvolumeclaims"], ["get", "list", "watch", "create"]),
@@ -362,10 +525,23 @@ def render(target: Target, operation: Operation | None = None) -> list[dict]:
                 rule(
                     "postgresql.cnpg.io",
                     ["clusters"],
-                    ["get", "list", "watch", "create", "update", "patch"],
+                    ["get", "list", "watch"],
                 )
             )
         else:
+            documents.extend(
+                [
+                    resource(
+                        "ServiceAccount", ROUTINE_RUNTIME, ns, automountServiceAccountToken=False
+                    ),
+                    resource(
+                        "ResourceQuota",
+                        "demo-routine-controllers",
+                        ns,
+                        spec={"hard": routine_quota(ns == spaces[0])},
+                    ),
+                ]
+            )
             rules.append(
                 rule(
                     "apps",
@@ -379,6 +555,7 @@ def render(target: Target, operation: Operation | None = None) -> list[dict]:
                 binding(RECONCILER, ns, RECONCILER, RECONCILER, ops),
             ]
         )
+    documents += routine_policy(target)
     documents += policy(
         f"{target.consumer}-demo-service",
         "",
@@ -473,6 +650,7 @@ def render(target: Target, operation: Operation | None = None) -> list[dict]:
                     operation.launcher,
                     operation.runtime,
                     f"{target.consumer}-{operation.launcher}-job",
+                    f"{target.consumer}-{operation.launcher}-job-marker",
                 }
                 else "base",
             }

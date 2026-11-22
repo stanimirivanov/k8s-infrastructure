@@ -5,7 +5,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
+import tempfile
 import time
+from collections.abc import Callable
 from copy import deepcopy
 from pathlib import Path
 
@@ -28,6 +31,10 @@ from .consumer_state import read_bounded
 from .delegated_argo_policy import resource
 from .kubernetes import kube, reference
 from .minimal_delegation_policy import (
+    ATTEMPT_LABEL,
+    JOB_LABELS,
+    OWNER_LABEL,
+    RECONCILER,
     Operation,
     load_operation,
     namespaces,
@@ -103,6 +110,9 @@ def canonical_template(template: dict) -> dict:
     for item in [*pod["containers"], *pod.get("initContainers", [])]:
         item.setdefault("terminationMessagePath", "/dev/termination-log")
         item.setdefault("terminationMessagePolicy", "File")
+        for key in ("args", "command", "env", "envFrom", "volumeMounts"):
+            if item.get(key) == []:
+                item.pop(key)
         for env in item.get("env", []):
             reference_value = env.get("valueFrom", {}).get("fieldRef")
             if reference_value is not None:
@@ -118,13 +128,24 @@ def canonical_template(template: dict) -> dict:
 
 def canonical_policy(kind: str, spec: dict) -> dict:
     value = deepcopy(spec)
-    if kind == "ValidatingAdmissionPolicy":
-        match = value["matchConstraints"]
+    match_key = {
+        "ValidatingAdmissionPolicy": "matchConstraints",
+        "ValidatingAdmissionPolicyBinding": "matchResources",
+    }.get(kind)
+    if match_key and match_key in value:
+        match = value[match_key]
         if match.get("matchPolicy") == "Equivalent":
             match.pop("matchPolicy")
-        for field in ("namespaceSelector", "objectSelector", "excludeResourceRules"):
+        for field in (
+            "namespaceSelector",
+            "objectSelector",
+            "excludeResourceRules",
+            "resourceRules",
+        ):
             if match.get(field) in ({}, []):
                 match.pop(field)
+        if not match:
+            value.pop(match_key)
     return value
 
 
@@ -181,8 +202,129 @@ def install_group(target: Target, documents: list[dict]) -> None:
             kube(target, ["create", "--field-manager=k8s-infrastructure-demo", "-f", "-"], [item])
 
 
-def configure(target: Target, operation: Operation | None) -> None:
+def inspect_existing_job(operation: Operation, actual: dict) -> None:
+    wanted = operation.job()
+    meta, expected_meta = actual["metadata"], wanted["metadata"]
+    uid = meta.get("uid")
+    if (
+        not uid
+        or meta.get("deletionTimestamp")
+        or any(
+            meta.get(key)
+            for key in ("annotations", "ownerReferences", "finalizers", "generateName")
+        )
+        or any(meta.get(key) != expected_meta[key] for key in ("name", "namespace", "labels"))
+    ):
+        raise ValueError("Existing Job does not have the reviewed attempt identity")
+    actual_spec, expected_spec = deepcopy(actual["spec"]), wanted["spec"]
+    expected_spec.update(
+        suspend=False,
+        manualSelector=False,
+        completionMode="NonIndexed",
+        selector={"matchLabels": {JOB_LABELS[0]: uid}},
+    )
+    actual_template = actual_spec.pop("template")
+    expected_template = expected_spec.pop("template")
+    expected_template["metadata"]["labels"].update(
+        dict(zip(JOB_LABELS, (uid, operation.name, uid, operation.name), strict=True))
+    )
+    if actual_spec != expected_spec or canonical_template(actual_template) != canonical_template(
+        expected_template
+    ):
+        raise ValueError("Existing Job differs from the exact reviewed attempt")
+
+
+def preflight_attempt(target: Target, operation: Operation) -> bool:
+    attempt_name = re.compile(r"demo-launch-[0-9a-f]{24}").fullmatch
+    for ns in namespaces(target):
+        grants = json.loads(
+            kube(
+                target,
+                [
+                    "-n",
+                    ns,
+                    "get",
+                    "rolebindings",
+                    "-o",
+                    "json",
+                ],
+            )
+        )["items"]
+        for grant in grants:
+            meta = grant["metadata"]
+            labels = meta.get("labels", {})
+            owner = labels.get(OWNER_LABEL)
+            owned = labels.get(LABEL) == target.consumer and owner not in {None, "base"}
+            delegated = any(
+                subject["kind"] == "ServiceAccount"
+                and subject.get("namespace") == operations_namespace(target)
+                and attempt_name(subject["name"])
+                for subject in grant.get("subjects", [])
+            )
+            if not (owned or delegated):
+                continue
+            if (
+                owner != operation.launcher
+                or meta["name"] != operation.launcher
+                or ns != operation.namespace
+                or meta.get("deletionTimestamp")
+            ):
+                raise ValueError(
+                    "Another reviewed attempt grant is still present; withdraw it before configuring a new attempt"
+                )
+        jobs = json.loads(
+            kube(target, ["-n", ns, "get", "jobs", "-l", ATTEMPT_LABEL, "-o", "json"])
+        )["items"]
+        for job in jobs:
+            meta = job["metadata"]
+            marker = meta["labels"][ATTEMPT_LABEL]
+            if not attempt_name(marker):
+                continue
+            if (ns, meta["name"], marker) == (
+                operation.namespace,
+                operation.name,
+                operation.launcher,
+            ):
+                continue
+            status = job.get("status", {})
+            if (
+                marker == operation.launcher
+                or meta.get("deletionTimestamp")
+                or status.get("active", 0) > 0
+                or status.get("terminating", 0) > 0
+                or not any(
+                    condition["type"] in {"Complete", "Failed"} and condition["status"] == "True"
+                    for condition in status.get("conditions", [])
+                )
+            ):
+                raise ValueError("Another owned Job is active or its outcome is incomplete")
+    raw = kube(
+        target,
+        [
+            "-n",
+            operation.namespace,
+            "get",
+            "job",
+            operation.name,
+            "--ignore-not-found",
+            "-o",
+            "json",
+        ],
+    )
+    if not raw.strip():
+        return False
+    inspect_existing_job(operation, json.loads(raw))
+    return True
+
+
+def configure(
+    target: Target,
+    operation: Operation | None,
+    *,
+    checkpoint: Callable[[str], None] | None = None,
+) -> None:
     check_prerequisites(target)
+    existing_job = preflight_attempt(target, operation) if operation else False
     objects = render(target, operation)
     preflight = database_runtime.inventory(target, objects)
     # A partially removed policy must not be silently repaired with its grants
@@ -207,11 +349,17 @@ def configure(target: Target, operation: Operation | None) -> None:
         current = preflight.get(reference(item))
         if current:
             check_document(item, current, type_checked=False)
-    namespace = [item for item in objects if item["kind"] == "Namespace"]
+    namespaces_to_install = [item for item in objects if item["kind"] == "Namespace"]
     bindings = [item for item in objects if item["kind"] == "RoleBinding"]
-    policies = [item for item in objects if item not in [*namespace, *bindings]]
-    install_group(target, namespace)
+    policies = [item for item in objects if item not in [*namespaces_to_install, *bindings]]
+    if checkpoint:
+        checkpoint("preflight")
+    install_group(target, namespaces_to_install)
+    if checkpoint:
+        checkpoint("operations-namespace")
     install_group(target, policies)
+    if checkpoint:
+        checkpoint("controls-installed")
     with runtime.deadline(60):
         while True:
             try:
@@ -224,12 +372,19 @@ def configure(target: Target, operation: Operation | None) -> None:
                 }:
                     raise
                 time.sleep(1)
-        if operation:
+        # Only dry runs use the provider's authorization to reach the same
+        # admission rules before the scoped RoleBindings become effective.
+        privilege = "--as-group=system:masters"
+        reconciler = [*probe.as_account(operations_namespace(target), RECONCILER), privilege]
+        probe.prove_routine_admission(target, reconciler)
+        if operation and not existing_job:
+            actor = [*probe.as_account(operations_namespace(target), operation.launcher), privilege]
             altered = operation.job()
             altered["spec"]["template"]["spec"]["serviceAccountName"] = "default"
             expected = ("admission", f"{target.consumer}-{operation.launcher}-job")
-            probe.denied(target, altered, [], expected)
-            probe.create(target, operation.job(), [])
+            probe.denied(target, altered, actor, expected)
+            probe.assert_job_marker_required(target, operation, actor)
+            probe.create(target, operation.job(), actor)
         supports = namespaces(target)[2]
         service = resource(
             "Service",
@@ -243,12 +398,55 @@ def configure(target: Target, operation: Operation | None) -> None:
         probe.denied(target, service, [], ("admission", f"{target.consumer}-demo-service"))
         volume = probe.claim(supports, "delegation-admission-control", "5Gi")
         probe.denied(target, volume, [], ("admission", f"{target.consumer}-database-storage-pvc"))
-        install_group(target, bindings)
-        if operation:
-            actor = probe.as_account(operations_namespace(target), operation.launcher)
-            probe.create(target, operation.job(), actor)
-            probe.denied(target, altered, actor, expected)
-    inspect(target, objects)
+        if checkpoint:
+            checkpoint("controls-verified")
+        for grant in bindings:
+            grant_key = reference(grant)
+            if (
+                existing_job
+                and operation
+                and grant_key == ("RoleBinding", operation.launcher, operation.namespace)
+                and grant_key not in preflight
+            ):
+                continue
+            install_group(target, [grant])
+            if checkpoint:
+                kind, name, namespace = reference(grant)
+                checkpoint(f"{kind}/{namespace}/{name}")
+
+
+def configure_recorded(target: Target, operation: Operation | None, incarnation: str) -> dict:
+    attempt = operation.launcher if operation else "base"
+    descriptor, filename = tempfile.mkstemp(
+        prefix=f"{target.name}.delegation-configure-{attempt}-",
+        suffix=".json",
+        dir=target.directory,
+    )
+    os.close(descriptor)
+    path = Path(filename)
+    receipt = {
+        **identity(target),
+        "incarnation": incarnation,
+        "operationDigest": operation.digest if operation else None,
+        "lastCompletedPhase": "target-verified",
+        "outcome": "running",
+    }
+
+    def checkpoint(phase: str) -> None:
+        receipt["lastCompletedPhase"] = phase
+        minimal_network.save_receipt(path, receipt)
+
+    checkpoint("target-verified")
+    try:
+        configure(target, operation, checkpoint=checkpoint)
+        receipt["outcome"] = "configured"
+        checkpoint("completion")
+    except (Exception, KeyboardInterrupt) as error:
+        safe = failure.evidence(error, "delegation-configure", "dependency-failure")
+        receipt.update(outcome="failed", failure=safe)
+        minimal_network.save_receipt(path, receipt)
+        raise failure.Failure(safe) from None
+    return receipt
 
 
 def qualification_operation(target: Target, image: str) -> Operation:
@@ -408,9 +606,7 @@ def qualify(target: Target, request: dict, host_id: str) -> dict:
             raise ValueError(
                 "Existing demo fixtures or retained claims refuse disposable qualification"
             )
-        path = target.directory / f"{target.name}.delegation-qualification.json"
-        with path.open("x", encoding="utf-8") as handle:
-            os.fchmod(handle.fileno(), 0o600)
+        path = minimal_network.reserve_receipt(target, capability="delegation")
         receipt = {
             **identity(target),
             **{
@@ -554,16 +750,16 @@ def main(argv: list[str] | None = None) -> int:
                 with runtime.deadline(240), minimal_bootstrap.network_operation(target):
                     owned = consumer_lifecycle.owned(target, require_ready=False)
                     if args.action == "configure":
-                        configure(target, operation)
+                        result = configure_recorded(target, operation, owned["incarnation"])
                     else:
                         check_prerequisites(target)
                         inspect(target, render(target, operation))
-                    result = {
-                        **identity(target),
-                        "incarnation": owned["incarnation"],
-                        "outcome": "observed",
-                        "operationDigest": operation.digest if operation else None,
-                    }
+                        result = {
+                            **identity(target),
+                            "incarnation": owned["incarnation"],
+                            "outcome": "observed",
+                            "operationDigest": operation.digest if operation else None,
+                        }
         print(json.dumps(result, indent=2))
         return 0
     except failure.Failure as error:

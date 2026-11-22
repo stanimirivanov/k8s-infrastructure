@@ -6,12 +6,17 @@ import json
 from copy import deepcopy
 
 from . import consumer_runtime as runtime
-from .database_qualification import pvc
+from .consumer_profile import LABEL, Target
+from .database_qualification import cluster, pvc, uid_delete
 from .delegated_argo_policy import resource
 from .kubernetes import kube
 from .local_kind import CommandFailure
 from .minimal_delegation_policy import (
+    ATTEMPT_LABEL,
     RECONCILER,
+    ROUTINE_CLAIM_PREFIX,
+    ROUTINE_LABEL,
+    ROUTINE_RUNTIME,
     Operation,
     namespaces,
     operations_namespace,
@@ -30,7 +35,7 @@ def as_account(namespace: str, account: str) -> list[str]:
 
 
 def decision(
-    target, actor: list[str], verb: str, kind: str, namespace: str | None, *, yes: bool
+    target: Target, actor: list[str], verb: str, kind: str, namespace: str | None, *, yes: bool
 ) -> None:
     attrs = {"verb": verb, "resource": kind.split(".")[0]}
     if "." in kind:
@@ -70,7 +75,7 @@ def decision(
         raise ValueError("Native demo SubjectAccessReview differs from expected authorization")
 
 
-def create(target, document: dict, actor: list[str], *, dry_run: bool = True) -> dict:
+def create(target: Target, document: dict, actor: list[str], *, dry_run: bool = True) -> dict:
     raw = kube(
         target,
         [
@@ -88,7 +93,7 @@ def create(target, document: dict, actor: list[str], *, dry_run: bool = True) ->
     return response["items"][0] if response["kind"] == "List" else response
 
 
-def denied(target, document: dict, actor: list[str], expected: tuple[str, str]) -> None:
+def denied(target: Target, document: dict, actor: list[str], expected: tuple[str, str]) -> None:
     try:
         create(target, document, actor)
     except CommandFailure as error:
@@ -100,7 +105,7 @@ def denied(target, document: dict, actor: list[str], expected: tuple[str, str]) 
         raise ValueError("Native demo negative control was admitted")
 
 
-def pvc_delete(target, item: dict) -> None:
+def pvc_delete(target: Target, item: dict) -> None:
     metadata = item["metadata"]
     namespace, name = metadata["namespace"], metadata["name"]
     current = json.loads(kube(target, ["-n", namespace, "get", "pvc", name, "-o", "json"]))
@@ -147,33 +152,33 @@ def claim(namespace: str, name: str, size: str, **spec) -> dict:
     return document
 
 
-def prove_storage(target, reconciler: list[str]) -> dict:
+def prove_storage(target: Target, reconciler: list[str]) -> dict:
     apps, data, support = namespaces(target)
     for ns in (apps, data, support):
         for size in ("1Gi", "4Gi"):
-            create(target, claim(ns, "delegation-size-control", size), reconciler)
+            create(target, claim(ns, ROUTINE_CLAIM_PREFIX + "size-control", size), reconciler)
     for invalid in ("512Mi", "5Gi", "1500Mi"):
         denied(
             target,
-            claim(support, "delegation-size-control", invalid),
+            claim(support, ROUTINE_CLAIM_PREFIX + "size-control", invalid),
             reconciler,
             ("admission", f"{target.consumer}-database-storage-pvc"),
         )
     denied(
         target,
-        claim(support, "delegation-size-control", "1Gi", storageClassName="standard"),
+        claim(support, ROUTINE_CLAIM_PREFIX + "size-control", "1Gi", storageClassName="standard"),
         reconciler,
         ("admission", f"{target.consumer}-database-storage-pvc"),
     )
     denied(
         target,
-        claim(support, "delegation-size-control", "1Gi", accessModes=["ReadWriteMany"]),
+        claim(support, ROUTINE_CLAIM_PREFIX + "size-control", "1Gi", accessModes=["ReadWriteMany"]),
         reconciler,
         ("admission", f"{target.consumer}-database-storage-pvc"),
     )
     denied(
         target,
-        claim(support, "delegation-size-control", "1Gi", volumeName="foreign-retained"),
+        claim(support, ROUTINE_CLAIM_PREFIX + "size-control", "1Gi", volumeName="foreign-retained"),
         reconciler,
         ("admission", f"{target.consumer}-demo-volume"),
     )
@@ -184,14 +189,14 @@ def prove_storage(target, reconciler: list[str]) -> dict:
                 batch.append(
                     create(
                         target,
-                        claim(ns, f"delegation-{reason}-{index}", size),
+                        claim(ns, f"{ROUTINE_CLAIM_PREFIX}{reason}-{index}", size),
                         reconciler,
                         dry_run=False,
                     )
                 )
             denied(
                 target,
-                claim(ns, f"delegation-{reason}-extra", "1Gi"),
+                claim(ns, f"{ROUTINE_CLAIM_PREFIX}{reason}-extra", "1Gi"),
                 reconciler,
                 ("quota", "database-storage"),
             )
@@ -201,7 +206,193 @@ def prove_storage(target, reconciler: list[str]) -> dict:
     return {"wholeGiB": "1–4", "maximumClaims": 4, "maximumRequestedGiB": 8}
 
 
-def prove(target, operation: Operation, foreign: str) -> dict:
+def assert_job_marker_required(target: Target, operation: Operation, actor: list[str]) -> None:
+    unmarked = operation.job()
+    unmarked["metadata"].pop("labels")
+    # Job defaulting copies PodTemplate labels onto an otherwise unlabeled Job.
+    unmarked["spec"]["template"]["metadata"]["labels"].pop(ATTEMPT_LABEL)
+    denied(
+        target,
+        unmarked,
+        actor,
+        ("admission", f"{target.consumer}-{operation.launcher}-job-marker"),
+    )
+
+
+def assert_unrelated_jobs(target: Target, operation: Operation, foreign: str) -> None:
+    # The foreign Job deliberately retains the marker so the immutable namespace
+    # selector is tested independently from the object selector.
+    unrelated = operation.job()
+    unrelated["metadata"].update(name="delegation-unrelated-job", namespace=foreign)
+    unrelated["spec"]["template"]["spec"]["serviceAccountName"] = "default"
+    create(target, unrelated, [])
+    unrelated["metadata"].update(namespace=operation.namespace)
+    unrelated["metadata"].pop("labels")
+    unrelated["spec"]["template"]["metadata"]["labels"].pop(ATTEMPT_LABEL)
+    create(target, unrelated, [])
+
+
+def routine_controller(target: Target, workload: str, *, name: str) -> dict:
+    namespace = namespaces(target)[0]
+    labels = {ROUTINE_LABEL: "true", "app": name}
+    template = {
+        "metadata": {"labels": labels},
+        "spec": {
+            "serviceAccountName": ROUTINE_RUNTIME,
+            "automountServiceAccountToken": False,
+            "nodeSelector": {LABEL: target.consumer, "k8s-infrastructure.io/role": "worker"},
+            "containers": [
+                {
+                    "name": "probe",
+                    "image": "probe.invalid/control-only",
+                    "resources": {
+                        "requests": {"cpu": "50m", "memory": "64Mi"},
+                        "limits": {"cpu": "100m", "memory": "128Mi"},
+                    },
+                }
+            ],
+        },
+    }
+    kind = "Deployment" if workload == "deployments" else "StatefulSet"
+    controller = resource(
+        kind,
+        name,
+        namespace,
+        spec={
+            "replicas": 1,
+            "selector": {"matchLabels": labels},
+            "template": template,
+            **(
+                {"strategy": {"type": "Recreate"}}
+                if kind == "Deployment"
+                else {"serviceName": name}
+            ),
+        },
+    )
+    controller["apiVersion"] = "apps/v1"
+    controller["metadata"]["labels"] = labels
+    return controller
+
+
+def prove_routine_admission(target: Target, reconciler: list[str]) -> None:
+    for workload in ("deployments", "statefulsets"):
+        controller = routine_controller(target, workload, name="delegation-routine-control")
+        expected = ("admission", f"{target.consumer}-demo-routine-{workload}")
+        create(target, controller, reconciler)
+        altered = deepcopy(controller)
+        altered["spec"]["replicas"] = 2
+        denied(target, altered, reconciler, expected)
+        altered = deepcopy(controller)
+        altered["spec"]["template"]["spec"]["containers"][0]["resources"]["limits"]["memory"] = (
+            "513Mi"
+        )
+        denied(target, altered, reconciler, expected)
+        ordinary = deepcopy(controller)
+        ordinary["spec"]["template"]["spec"]["volumes"] = [
+            {
+                "name": "data",
+                "persistentVolumeClaim": {"claimName": ROUTINE_CLAIM_PREFIX + "fixture"},
+            }
+        ]
+        create(target, ordinary, reconciler)
+        for field, replacement in (
+            ("serviceAccountName", "credential-operator"),
+            ("automountServiceAccountToken", True),
+            ("imagePullSecrets", [{"name": "credential-operator"}]),
+            ("volumes", [{"name": "credentials", "secret": {"secretName": "operator"}}]),
+            (
+                "volumes",
+                [
+                    {
+                        "name": "credentials",
+                        "projected": {"sources": [{"serviceAccountToken": {"path": "token"}}]},
+                    }
+                ],
+            ),
+            (
+                "volumes",
+                [{"name": "data", "persistentVolumeClaim": {"claimName": "operator-data"}}],
+            ),
+        ):
+            altered = deepcopy(controller)
+            altered["spec"]["template"]["spec"][field] = replacement
+            denied(target, altered, reconciler, expected)
+        for field, value in (
+            (
+                "env",
+                [
+                    {
+                        "name": "KEY",
+                        "valueFrom": {"secretKeyRef": {"name": "operator", "key": "key"}},
+                    }
+                ],
+            ),
+            ("envFrom", [{"secretRef": {"name": "operator"}}]),
+        ):
+            altered = deepcopy(controller)
+            altered["spec"]["template"]["spec"]["containers"][0][field] = value
+            denied(target, altered, reconciler, expected)
+
+
+def prove_operator_authority(target: Target, reconciler: list[str]) -> None:
+    namespace = namespaces(target)[1]
+    database = cluster(target, namespace)
+    create(target, database, [])
+    denied(target, database, reconciler, ("authorization", "forbidden"))
+    protected = routine_controller(target, "deployments", name="delegation-operator-control")
+    protected["metadata"].pop("labels")
+    protected["spec"]["replicas"] = 0
+    protected["spec"]["template"]["spec"]["containers"][0]["envFrom"] = [
+        {"secretRef": {"name": "operator-placeholder"}}
+    ]
+    created = create(target, protected, [], dry_run=False)
+    try:
+        for verb, extra in (
+            (
+                "patch",
+                [
+                    "--type=merge",
+                    "-p",
+                    json.dumps(
+                        {
+                            "metadata": {"labels": {ROUTINE_LABEL: "true"}},
+                            "spec": {
+                                "template": routine_controller(
+                                    target, "deployments", name=created["metadata"]["name"]
+                                )["spec"]["template"]
+                            },
+                        }
+                    ),
+                ],
+            ),
+            ("delete", []),
+        ):
+            try:
+                kube(
+                    target,
+                    [
+                        *reconciler,
+                        "-n",
+                        created["metadata"]["namespace"],
+                        verb,
+                        "deployment",
+                        created["metadata"]["name"],
+                        "--dry-run=server",
+                        *extra,
+                    ],
+                )
+            except CommandFailure as error:
+                if error.denial != ("admission", f"{target.consumer}-demo-routine-deployments"):
+                    raise ValueError(
+                        "Native operator fixture rejection did not come from admission"
+                    ) from None
+            else:
+                raise ValueError("Demo reconciler could change a credential-operator controller")
+    finally:
+        uid_delete(target, created)
+
+
+def prove(target: Target, operation: Operation, foreign: str) -> dict:
     ops = operations_namespace(target)
     actor = as_account(ops, operation.launcher)
     reconciler = as_account(ops, RECONCILER)
@@ -227,6 +418,13 @@ def prove(target, operation: Operation, foreign: str) -> dict:
         (reconciler, "create", "configmaps", foreign, False),
         (reconciler, "create", "jobs.batch", ns, False),
         (reconciler, "create", "pods", ns, False),
+        (reconciler, "get", "secrets", ns, False),
+        (reconciler, "create", "secrets", ns, False),
+        (reconciler, "patch", "secrets", ns, False),
+        (reconciler, "get", "clusters.postgresql.cnpg.io", namespaces(target)[1], True),
+        (reconciler, "create", "clusters.postgresql.cnpg.io", namespaces(target)[1], False),
+        (reconciler, "patch", "clusters.postgresql.cnpg.io", namespaces(target)[1], False),
+        (as_account(namespaces(target)[0], ROUTINE_RUNTIME), "get", "secrets", ns, False),
         (reconciler, "create", "serviceaccounts/token", ops, False),
         (reconciler, "update", "podtemplates", ns, False),
         (reconciler, "delete", "persistentvolumeclaims", ns, False),
@@ -237,6 +435,10 @@ def prove(target, operation: Operation, foreign: str) -> dict:
     # The positive is the exact same principal, namespace and API entry point
     # as the altered attempts. Any compile/defaulting mismatch fails the gate.
     create(target, operation.job(), actor)
+    assert_unrelated_jobs(target, operation, foreign)
+    assert_job_marker_required(target, operation, actor)
+    prove_routine_admission(target, reconciler)
+    prove_operator_authority(target, reconciler)
     for field, replacement in {
         "serviceAccountName": "default",
         "automountServiceAccountToken": True,
@@ -284,6 +486,7 @@ def prove(target, operation: Operation, foreign: str) -> dict:
             "selector": {"probe": "isolated"},
         },
     )
+    service["metadata"]["labels"] = {ROUTINE_LABEL: "true"}
     create(target, service, reconciler)
     exposed = deepcopy(service)
     exposed["spec"]["type"] = "NodePort"
@@ -301,14 +504,16 @@ def prove(target, operation: Operation, foreign: str) -> dict:
         type="kubernetes.io/service-account-token",
     )
     token["metadata"]["annotations"] = {"kubernetes.io/service-account.name": operation.runtime}
-    denied(target, token, reconciler, ("admission", f"{target.consumer}-demo-secret"))
+    denied(target, token, reconciler, ("authorization", "forbidden"))
+    denied(target, token, [], ("admission", f"{target.consumer}-demo-secret"))
     return {
-        "jobAdmission": "approved and altered attempts exercised",
+        "jobAdmission": "approved, altered and unrelated attempts exercised",
+        "routineControllerAdmission": "ordinary work admitted and credential references refused",
         "storageQuota": prove_storage(target, reconciler),
     }
 
 
-def run_job(target, operation: Operation) -> dict:
+def run_job(target: Target, operation: Operation) -> dict:
     ns = operation.namespace
     actor = as_account(operations_namespace(target), operation.launcher)
     job = create(target, operation.job(), actor, dry_run=False)

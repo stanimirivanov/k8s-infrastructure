@@ -27,11 +27,46 @@ Prepare the three workload namespaces with the exact consumer label
 `k8s-infrastructure.io/consumer` and Pod Security Admission enforcement
 `baseline` at `v1.35`. The provider binds `demo-reconciler` from the separate
 `<consumer>-demo-operations` namespace into those exact workload namespaces.
-The reconciler's Role grants a reviewed set of namespaced workload and service
-kinds. Database control resources are confined to the data namespace. Service
-admission limits this identity to private ClusterIP Services. Namespace creation,
-cluster API/RBAC changes and direct routine Job creation belong to separate
-authority.
+The reconciler manages routine-owned ConfigMaps and private ClusterIP
+Services in the three workload namespaces. It can create retained claims
+named `demo-ordinary-*` and observe Pods and events. It manages routine-owned
+Deployments and StatefulSets in apps and demo-support and can observe
+CloudNativePG Clusters in data. Routine ConfigMaps, Services and workload
+controllers must carry `k8s-infrastructure.io/demo-routine: "true"`. Keep the
+label off operator-owned objects and their templates.
+
+Routine controllers select Pods carrying that label and use the dedicated
+`demo-routine-runtime` ServiceAccount with
+`automountServiceAccountToken: false`. Each has one bounded container and up
+to one replica on the owned worker. Changes to Deployments use `Recreate`.
+StatefulSets mount separately requested claims instead of creating them from
+claim templates. Allowed volumes are emptyDir, ConfigMap, downwardAPI and
+routine claims. Admission refuses Secret env references, Secret/image-pull
+credentials and projected tokens. The reconciler cannot update or delete an
+operator-owned controller by adding the routine label. Local quotas bound
+the controller and Pod inventory, CPU and memory in apps and demo-support.
+The quotas account for operator Pods in those namespaces too. The reviewed
+consumer workflow still serializes shared worker phases and accounts for
+initializer and replacement overlap.
+
+The consumer's separately authorized credential operator owns namespaced
+Secret writes and credential-bearing controller writes in apps and
+demo-support, along with CloudNativePG Cluster writes and database credential
+references in data. Use the scoped deployment workflows for
+[database and bootstrap](https://github.com/stanimirivanov/fleetiq-deploy/issues/96),
+[administrative Jobs](https://github.com/stanimirivanov/fleetiq-deploy/issues/100)
+and [retained simulator Jobs](https://github.com/stanimirivanov/fleetiq-deploy/issues/104).
+The [issuer](https://github.com/stanimirivanov/fleetiq-deploy/issues/102),
+[receiver](https://github.com/stanimirivanov/fleetiq-deploy/issues/107) and
+[RustFS](https://github.com/stanimirivanov/fleetiq-deploy/issues/108) workflows
+own their support-service credentials.
+Those workflows supply the reviewed manifests and own their scoped operator
+permissions. This provider profile grants the routine reconciler neither
+Secret access nor CloudNativePG mutation. Keep credential material and
+credential-bearing inputs in operator-owned Secrets and claims outside the
+`demo-ordinary-` prefix. Use Secret references in visible specs. Keep
+credential-bearing configuration outside routine-owned objects. Namespace
+creation and cluster API or RBAC changes remain provider operations.
 
 ## Approve an operation
 
@@ -81,6 +116,9 @@ runtime account carries no API grants or mounted API token. The Job has one
 completion, no controller retry budget, an explicit deadline and worker
 placement. The application namespace keeps simulator Jobs with ingestion. The
 data namespace can host a separately reviewed administrative operation.
+The deployment operator reviews and stages any Secret and ConfigMap references
+before approval. Stage immutable operator-owned inputs for attempts that
+consume credentials or execute commands from configuration.
 
 ## Configure and inspect
 
@@ -98,9 +136,16 @@ uv run --locked --offline python -m scripts.minimal_delegation configure \
 After separate approval for the exact target, repeat with
 `--confirm-target example-local --execute`. Omit `--operation` to select the
 base namespace delegation. The provider installs quota and admission controls
-before enabling the corresponding RoleBindings. Run `health` with the same
-target and operation inputs to inspect the installed objects. `health` uses
-the same explicit target confirmation for live reads.
+and exercises their admission behavior before enabling the corresponding
+RoleBindings. The named provider lock serializes configure calls. Configure
+checks all three workload namespaces for another attempt grant or an active
+or incomplete owned Job. Repeating an attempt with an existing Job checks the
+bound Job and leaves its grant withdrawn if already withdrawn. An exact
+same-name lookalike is refused if the identity or reviewed envelope differs.
+The provider records completed phases and the last observed grant in a
+private `<target>.delegation-configure-*.json` receipt. If configure is interrupted,
+inspect the exact grants and the receipt before retrying. Run `health` with
+the same inputs and explicit target confirmation for live inventory.
 
 ## Disposable qualification and evidence
 
@@ -121,8 +166,11 @@ uv run --locked --offline python -m scripts.minimal_delegation qualify \
 ```
 
 The gate checks positive and forbidden API operations as the exact scoped
-identities. It submits one neutral Job as the launcher and verifies its
-terminal success and exact Pod owner. Each workload namespace opts into `local-retained`
+identities. It tests ordinary controllers, refused controller credential
+paths, denied reconciler access to Secrets and operator-side CNPG admission.
+It also dry-runs unrelated Jobs in the reviewed and a foreign namespace.
+It submits one neutral Job as the launcher and verifies its terminal success
+and exact Pod owner. Each workload namespace opts into `local-retained`
 Filesystem RWO claims of whole 1–4Gi, with at most four and 8Gi requested per
 namespace. The quotas measure requested storage. The installed filesystem
 probe binds one neutral 1Gi application claim, verifies its Retain PV identity
@@ -143,13 +191,27 @@ credentials outside Git. Whole-target cleanup uses the separately confirmed
 
 ## Withdrawal and retained state
 
-Verify that the exact attempt is unused or that its Job is terminal and its
-evidence has been collected. Withdraw that attempt's RoleBinding from the
-workload namespace using provider authority. Select the name shown as
-`launcher` in the preview, and verify the binding’s UID, subject and ownership
-labels first. Keep the admission policy and template while any authorized
-execution or cleanup is pending. Keep shared APIs, namespaces, Jobs under
-inspection and all retained PVCs/PVs. Use a new reviewed attempt for subsequent
-operations. A replacement Pod test establishes local persistence on the same
-worker. Loss of that worker or the kind cluster remains a separate recovery
-condition.
+The consumer's controlled deployment operator inspects the exact Job status
+and owned Pods under its separately scoped read access. It captures operation
+identity, selected input and artifact fingerprints, exit status and
+application results in its private receipt. Give downstream consumers the
+sanitized receipt. The launcher has named Job and PodTemplate reads and does
+not have Pod logs, exec or cleanup access.
+
+Verify the exact attempt is unused or wait for its Job to reach a terminal
+condition with all Pods accounted for and its receipt collected. The provider
+then withdraws the attempt RoleBinding. Select the `launcher` name from the
+preview and verify the binding UID, subject and ownership labels. Under
+provider authority, remove or disable the attempt's named parameterized
+ValidatingAdmissionPolicyBinding before deleting its PodTemplate parameter.
+The namespace and attempt marker constrain missing-parameter denial to
+the reviewed attempt. Keep shared admission policies and namespace state.
+Remove the attempt's remaining controller policy and ServiceAccounts only
+after outstanding execution is accounted for.
+
+The deployment operator can then delete the exact owned Job and its Pods with
+UID-scoped cleanup. Retain historical receipts and use a fresh reviewed Job
+name and digest for another attempt after teardown. Preserve retained
+PVCs/PVs and any Jobs whose evidence is pending. A replacement Pod test
+establishes local persistence on the same worker. Loss of that worker or the
+kind cluster remains a separate recovery condition.
