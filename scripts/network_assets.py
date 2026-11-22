@@ -16,7 +16,8 @@ from urllib.request import urlopen
 
 import yaml
 
-from .consumer_profile import LABEL, Target
+from . import network_resources
+from .consumer_profile import LABEL, MINIMAL_PROFILE, Target
 from .local_kind import ROOT
 
 DIRECTORY = ROOT / "clusters/local-kind/isolated-network-local"
@@ -155,6 +156,8 @@ def labels(target: Target) -> dict[str, str]:
     reviewed["values"] = yaml.safe_load(
         (DIRECTORY / "cilium-values.yaml").read_text(encoding="utf-8")
     )
+    if target.profile == MINIMAL_PROFILE:
+        reviewed["boundedResources"] = network_resources.selection()
     digest = hashlib.sha256(json.dumps(reviewed, sort_keys=True).encode()).hexdigest()[:32]
     return {
         "app.kubernetes.io/managed-by": OWNER,
@@ -244,11 +247,15 @@ def render(target: Target, chart: bytes, crds: list[dict]) -> tuple[list[dict], 
         f"{operator['repository']}-generic:{operator['tag']}@{operator['genericDigest']}",
         f"{envoy['repository']}:{envoy['tag']}@{envoy['digest']}",
     }
-    validate_rendered(documents, images)
+    if target.profile == MINIMAL_PROFILE:
+        network_resources.configure(target, network_resources.controllers(documents))
+    validate_rendered(documents, images, minimal=target.profile == MINIMAL_PROFILE)
+    if target.profile == MINIMAL_PROFILE:
+        network_resources.rendered_bounds(target, documents)
     return shared, documents
 
 
-def validate_rendered(documents: list[dict], images: set[str]) -> None:
+def validate_rendered(documents: list[dict], images: set[str], *, minimal: bool = False) -> None:
     """Assert functional security controls in the actual upstream render."""
     by_name = {(item["kind"], item["metadata"]["name"]): item for item in documents}
     config = by_name["ConfigMap", "cilium-config"]["data"]
@@ -268,9 +275,9 @@ def validate_rendered(documents: list[dict], images: set[str]) -> None:
             "limits": {"cpu": "500m", "memory": "384Mi"},
         },
     }
-    controllers = [item for item in documents if item["kind"] in {"Deployment", "DaemonSet"}]
-    if {item["metadata"]["name"] for item in controllers} != set(budgets) or len(controllers) != 3:
-        raise ValueError("Unexpected controller overhead requires review")
+    if minimal:
+        budgets = network_resources.MAIN
+    network_resources.controllers(documents)
     if by_name["Deployment", "cilium-operator"]["spec"]["replicas"] != 1:
         raise ValueError("Local network profile requires exactly one operator")
     for key, expected in {

@@ -9,7 +9,7 @@ import ssl
 import time
 from urllib.parse import quote
 
-from .consumer_profile import Target
+from .consumer_profile import MINIMAL_PROFILE, Target
 from .kubernetes import kube
 from .network_assets import selection
 from .network_fixtures import namespaces, policies, routes, workloads
@@ -169,7 +169,10 @@ def one_header(headers: dict, name: str) -> str:
 
 def tls(target: Target, hostname: str) -> dict:
     validate_hostname(hostname)
-    port = require_profile(target)
+    if target.profile == MINIMAL_PROFILE and target.https_port is not None:
+        port = target.https_port
+    else:
+        port = require_profile(target)
     a, b = namespaces(target)
     ca, secret = fixture_certificate(a, hostname)
     kube(target, ["create", "-f", "-"], [secret])

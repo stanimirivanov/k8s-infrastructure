@@ -9,7 +9,7 @@ from copy import deepcopy
 from typing import Any
 
 from . import consumer_lifecycle, consumer_runtime
-from .consumer_profile import NETWORK_PROFILES, Target
+from .consumer_profile import MINIMAL_PROFILE, NETWORK_PROFILES, Target
 from .kubernetes import contains, fingerprint, kube, reference
 from .network_assets import MANAGER, download, labels, render, selection
 
@@ -76,17 +76,32 @@ def install(target: Target) -> None:
     """Only called after the exact new-profile node IDs and incarnation are journaled."""
     require_profile(target)
     consumer_lifecycle.owned(target, require_ready=False)
+    require_fresh_cni(target)
+    shared, documents = render(target, *download())
+    install_apis(target, shared, documents)
+    apply_objects(target, [item for item in documents if item["kind"] != "Namespace"])
+    observe(target, shared, documents)
+
+
+def require_fresh_cni(target: Target) -> None:
     daemonsets = kube(
         target,
         ["-n", "kube-system", "get", "daemonsets", "-o", "jsonpath={.items[*].metadata.name}"],
     )
     if {"kindnet", "kube-proxy", "calico-node", "kube-flannel-ds"} & set(daemonsets.split()):
         raise ValueError("Existing CNI or kube-proxy detected; no in-place network replacement")
-    shared, documents = render(target, *download())
+
+
+def install_apis(
+    target: Target, shared: list[dict], documents: list[dict], *, fresh: bool = False
+) -> None:
+    """Use existing ownership and schema preflight before any network writes."""
     # GatewayClass cannot be queried before its API exists. Preflight every
     # built-in object and shared schema before the first mutation.
     builtins = [item for item in documents if item["kind"] != "GatewayClass"]
     found = inventory(target, [*shared, *builtins])
+    if fresh and found:
+        raise ValueError("Existing network resources prevent cold Cilium qualification")
     classes = [item for item in documents if item["kind"] == "GatewayClass"]
     class_api = next(
         item
@@ -114,8 +129,6 @@ def install(target: Target) -> None:
     # Preflight the new API before creating any class, even on first install.
     inventory(target, classes)
     apply_objects(target, [item for item in documents if item["kind"] == "Namespace"])
-    apply_objects(target, [item for item in documents if item["kind"] != "Namespace"])
-    observe(target, shared, documents)
 
 
 def verify_pod_template(expected: dict, actual: dict) -> None:
@@ -231,17 +244,7 @@ def observe(target: Target, shared: list[dict], documents: list[dict]) -> dict[s
                 )
         if item["kind"] in {"Deployment", "DaemonSet"}:
             verify_pod_template(item, actual)
-            kube(
-                target,
-                [
-                    "-n",
-                    item["metadata"].get("namespace", "kube-system"),
-                    "rollout",
-                    "status",
-                    f"{item['kind'].lower()}/{item['metadata']['name']}",
-                    "--timeout=300s",
-                ],
-            )
+            wait_controller(target, item)
     kube(target, ["wait", "--for=condition=Accepted", "gatewayclass/cilium", "--timeout=90s"])
     return {
         "profile": target.profile,
@@ -256,7 +259,17 @@ def observe(target: Target, shared: list[dict], documents: list[dict]) -> dict[s
         "controllerReadiness": "observed",
         "trafficAndTLS": "requires separate qualify action",
         "trust": "consumer-owned certificate Secret; explicit public CA bundle; no automatic host trust",
-        "resourceEnvelope": {"controllerPods": 5, "requestsCPU": "350m", "requestsMemory": "768Mi"},
+        **(
+            {
+                "resourceEnvelope": {
+                    "controllerPods": 5,
+                    "requestsCPU": "350m",
+                    "requestsMemory": "768Mi",
+                }
+            }
+            if target.profile != MINIMAL_PROFILE
+            else {}
+        ),
         "notQualified": [
             "consumer product",
             "browser/OS trust installation",
@@ -280,3 +293,17 @@ def resume(target: Target) -> dict:
     consumer_runtime.verify_nodes(consumer_runtime.node_identity(target), profile=target.profile)
     install(target)
     return consumer_lifecycle.finish_creation(target, record)
+
+
+def wait_controller(target: Target, item: dict) -> None:
+    kube(
+        target,
+        [
+            "-n",
+            item["metadata"].get("namespace", "kube-system"),
+            "rollout",
+            "status",
+            f"{item['kind'].lower()}/{item['metadata']['name']}",
+            "--timeout=300s",
+        ],
+    )
