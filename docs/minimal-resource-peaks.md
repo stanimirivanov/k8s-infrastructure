@@ -33,7 +33,12 @@ record its cost. The [host admission guide](host-admission.md) owns the
 
 Preview the selection offline. Specify `--https-port` only when the bootstrap
 used a listener. The example selects a 30-second window with three seconds
-between planned observations.
+between planned observations. Choose a duration of 10–120 seconds and an
+interval of 2–10 seconds that divides the duration evenly. The collector
+samples at the start and at each scheduled interval through the endpoint.
+Preflight and final identity checks each have a 90-second limit. Sampling is
+bounded by the selected duration plus 20 seconds. A sample that takes longer
+than its interval makes the collection incomplete.
 
 ```sh
 uv run --locked --offline python -m scripts.resource_peaks collect \
@@ -54,12 +59,14 @@ uv run --locked --offline python -m scripts.resource_peaks collect \
   --confirm-target qual-resource-01-local --execute
 ```
 
-Choose a fresh receipt name for every attempt. The collector appends private
-JSON lines for the start, available observations and result. Wait for the
-result before using a receipt. A missing result after interruption is
-incomplete evidence. Preserve the prefix for diagnosis and use a new path for
-another attempt. Stop a running collector with `Ctrl+C`. Collection requires
-read access and leaves workload limits and state as it found them.
+Choose a fresh `.jsonl` name in the target's private `.local` directory for
+every attempt. The collector appends private `start`, `window`, `sample` and
+`result` records. The window binds source, host, cluster incarnation and
+physical stores. Each sample records monotonic offsets so the observed window
+can be reconstructed. A missing result after interruption or a result state
+of `incomplete` blocks capacity claims. Preserve the prefix for diagnosis and
+use a new path for another attempt. Stop a running collector with `Ctrl+C`.
+Collection reads the target and leaves its workloads and limits unchanged.
 
 ## Read the evidence
 
@@ -76,11 +83,13 @@ not report it in its local counter. Keep node and container measurements
 separate. Node counts already include their descendants.
 [Linux cgroup v2 CPU interface](https://docs.kernel.org/admin-guide/cgroup-v2.html#cpu-interface-files)
 
-Keep init instances and restartable sidecars in lifecycle accounting. Sum
-concurrent observations for overlap. Lifetime high-water marks from different
-containers can occur at different times. If a short-lived container appears
-only after termination, record that counter gap and use an authorized rerun
-for complete evidence. [Kubernetes init and sidecar lifecycle](https://kubernetes.io/docs/concepts/workloads/pods/sidecar-containers/#sidecar-containers-and-pod-lifecycle)
+Keep init instances and restartable sidecars in lifecycle accounting. The
+receipt lists same-frame, same-node co-observations and the sampled node
+memory for those frames. Container lifetime high-water marks can occur at
+different times. A short-lived container can appear only after termination
+or disappear between scans. Check the receipt against the expected workload
+inventory and rerun an authorized window when coverage is incomplete.
+[Kubernetes init and sidecar lifecycle](https://kubernetes.io/docs/concepts/workloads/pods/sidecar-containers/#sidecar-containers-and-pod-lifecycle)
 
 Track physical store identity and free space independently from requested
 storage. A local filesystem reading includes other users of that store and
@@ -130,6 +139,9 @@ and CPU counters between the bracketing reads. Point values such as
 `memory.current` and `MemAvailable` can change between reads. Filesystem
 availability is the available block count multiplied by the fundamental
 block size. Use the same physical store, even if more than one account is
-assigned to it. Compare the tooling cgroup by the same method. A limit
-assertion or sampled reading alone does not qualify a peak or establish a
-complete installation result.
+assigned to it. Compare the tooling cgroup by the same method. Divide CPU
+usage microseconds by the observed interval in microseconds to obtain average
+cores over those endpoints. The tooling cgroup peak accounts for the collector
+and any other processes in that admitted group. Installed comparison requires
+complete relevant observations, counter and identity agreement, and the
+reviewed resource envelope.
