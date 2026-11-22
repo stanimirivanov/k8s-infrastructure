@@ -273,3 +273,32 @@ class DockerProtocolTests(unittest.TestCase):
             self.assertRaises(FileExistsError),
         ):
             adapter.prepare(self.target, "owner-nonce", directory)
+
+    def test_worker_creation_uses_eight_gib_without_a_published_listener(self):
+        import json
+
+        from scripts import bounded_docker as adapter
+
+        worker = self.target.name + "-worker"
+        args = [
+            part.replace(self.name, worker).replace("role=control-plane", "role=worker")
+            for part in self.args
+        ]
+        args.remove("--publish=127.0.0.1:34567:6443/tcp")
+        args = args[:-3] + [self.image]
+        node = {
+            **self.node,
+            "name": "/" + worker,
+            "role": "worker",
+            "memory": 8589934592,
+            "swap": 8589934592,
+        }
+
+        def docker(command):
+            if command[0] == "create":
+                self.assertEqual(command[command.index("--memory") + 1], "8589934592")
+                self.assertFalse(any(part.startswith("--publish") for part in command))
+            return json.dumps(node) if command[0] == "inspect" else self.node["id"]
+
+        adapter.intercept(args, adapter.policy(self.target, "owner-nonce", self.root), docker)
+        self.assertEqual(adapter.read_journals(self.root)[0]["caps"]["memoryBytes"], 8589934592)
