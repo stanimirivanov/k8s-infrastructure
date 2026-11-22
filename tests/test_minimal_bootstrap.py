@@ -41,6 +41,29 @@ class AdmissionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "alias"):
             bootstrap.verify_stores(value, observed, {})
 
+    def test_network_pin_inventory_change_refuses_prior_artifact_before_provider_access(self):
+        from tempfile import TemporaryDirectory
+        from unittest.mock import patch
+
+        from tests.test_host_admission import request
+
+        target = Target("qual-demo", "default", Path("/tmp"), "minimal-demo", 18443)
+        relative = Path("clusters/local-kind/isolated-network-local/releases.json")
+        with TemporaryDirectory() as root, patch.object(bootstrap, "ROOT", Path(root)):
+            inventory = Path(root) / relative
+            inventory.parent.mkdir(parents=True)
+            inventory.write_bytes((Path(__file__).resolve().parents[1] / relative).read_bytes())
+            (Path(root) / "uv.lock").touch()
+            value = request()
+            value.update(target=target.name, artifactDigest=bootstrap.source_digest())
+            inventory.write_bytes(inventory.read_bytes() + b"\n")
+            with (
+                patch.object(bootstrap.state, "load") as load,
+                self.assertRaisesRegex(ValueError, "artifact"),
+            ):
+                bootstrap.network_bootstrap(target, value, "boot")
+            load.assert_not_called()
+
     def test_reservation_needs_full_35gib_plus_filesystem_floor(self):
         from scripts import host_admission
         from tests.test_host_admission import observation, request
@@ -136,15 +159,18 @@ class BootstrapTests(unittest.TestCase):
             self.assertEqual(command.call_args.args[1][3:5], ["image", "inspect"])
 
     def test_preview_is_offline_and_unqualified(self):
+        from tempfile import TemporaryDirectory
         from unittest.mock import patch
 
-        target = SimpleNamespace(
-            name="qual-demo-local", profile="minimal-demo", consumer="qual-demo"
-        )
-        with patch("subprocess.Popen", side_effect=AssertionError("must be offline")):
+        with (
+            TemporaryDirectory() as root,
+            patch("subprocess.Popen", side_effect=AssertionError("must be offline")),
+        ):
+            target = Target("qual-demo", "default", Path(root), "minimal-demo", 18443)
             result = bootstrap.preview(target)
         self.assertFalse(result["installedAcceptance"])
         self.assertEqual(result["stage"], "pre-cilium")
+        self.assertEqual(result["loopbackHttpsPort"], 18443)
 
     def test_environment_discards_ambient_provider_overrides(self):
         from unittest.mock import patch
@@ -208,6 +234,180 @@ class BootstrapTests(unittest.TestCase):
         ):
             with self.assertRaises(ValueError):
                 bootstrap.create(target, {}, "host")
+
+
+class NetworkContinuationTests(unittest.TestCase):
+    def test_continuation_credits_owned_cgroups_and_reserves_only_future_stage_disk(self):
+        from contextlib import ExitStack
+        from tempfile import TemporaryDirectory
+        from unittest.mock import patch
+
+        from scripts import consumer_state
+        from scripts.consumer_profile import identity
+        from tests.test_host_admission import observation, request
+
+        with TemporaryDirectory() as root, ExitStack() as stack:
+            target = Target("qual-demo", "default", Path(root), "minimal-demo", 18443)
+            owner = consumer_state.reserve(target, "unix:///run/docker.sock")
+            value = request()
+            value.update(target=target.name, artifactDigest=bootstrap.source_digest())
+            observed = observation(value)
+            owner.update(phase="provisioned", incarnation="cluster-uid")
+            journals = [
+                {
+                    "target": target.name,
+                    "nonce": owner["nonce"],
+                    "name": f"{target.name}-{role}",
+                    "role": role,
+                    "id": letter * 64,
+                    "phase": "started",
+                }
+                for role, letter in (("control-plane", "a"), ("worker", "b"))
+            ]
+            owner["nodeIds"] = {item["name"]: item["id"] for item in journals}
+            consumer_state.save(target, owner)
+            peaks = {
+                item["name"]: {"cgroupIdentity": item["id"], "startedAt": "first-start"}
+                for item in journals
+            }
+            paths = {name: Path(f"/sys/fs/cgroup/{name}") for name in peaks}
+            bootstrap.write_receipt(
+                target,
+                {
+                    **identity(target),
+                    "nonce": owner["nonce"],
+                    "stage": "pre-cilium",
+                    "phase": "pre-cilium-allocatable",
+                    "coldBootstrapQualified": True,
+                    "artifactDigest": value["artifactDigest"],
+                    "admission": bootstrap.admission.evaluate(
+                        value, observed, host_id=observed["hostId"], now=1001
+                    ),
+                    "allocatable": {
+                        "cluster": target.name,
+                        "incarnation": owner["incarnation"],
+                        "nodes": {
+                            role: {
+                                "schedulerEnvelope": {
+                                    "cpuMillicores": 1750,
+                                    "memoryBytes": memory * 1024**2,
+                                }
+                            }
+                            for role, memory in (("control-plane", 3484), ("worker", 7580))
+                        },
+                    },
+                    "kernelEvidence": peaks,
+                    "nodes": journals,
+                    "memoryAccountIdentities": {},
+                },
+            )
+
+            available_gib = 22
+
+            def observe(current, *, expected_host_id):
+                result = observation(current)
+                result["memAvailableBytes"] = 18 * bootstrap.admission.GIB
+                for account in result["disk"].values():
+                    account.update(
+                        availableBytes=available_gib * bootstrap.admission.GIB,
+                        residentBytes=bootstrap.admission.GIB,
+                    )
+                self.assertEqual(expected_host_id, observed["hostId"])
+                node_accounts = [item for item in current["memory"] if item["kind"] == "workload"]
+                self.assertEqual(
+                    {item["cgroup"] for item in node_accounts}, set(map(str, paths.values()))
+                )
+                for item in journals:
+                    result["memory"][f"bounded-{item['role']}"] = {
+                        "residentBytes": bootstrap.admission.GIB,
+                        "cgroupId": item["id"],
+                    }
+                return result
+
+            for name, result in [
+                ("host.host_id", observed["hostId"]),
+                ("_node_metrics", (peaks, paths)),
+                ("physical_engine", {}),
+                ("tooling_metrics", []),
+                ("time.time", 1001),
+            ]:
+                stack.enter_context(patch(f"scripts.minimal_bootstrap.{name}", return_value=result))
+            stack.enter_context(
+                patch("scripts.minimal_bootstrap.host.observe", side_effect=observe)
+            )
+            stack.enter_context(
+                patch("scripts.bounded_docker.read_journals", return_value=journals)
+            )
+            stack.enter_context(patch("scripts.consumer_lifecycle.owned", return_value=owner))
+            result, retained = bootstrap.network_bootstrap(target, value, observed["hostId"])
+            self.assertEqual(retained, journals)
+            self.assertEqual(
+                result["networkAdmission"]["memoryRemainingBytes"], 5 * bootstrap.admission.GIB
+            )
+            self.assertEqual(
+                result["networkAdmission"]["filesystems"],
+                [
+                    {
+                        "filesystemId": "physical-store",
+                        "incrementalBytes": 12 * bootstrap.admission.GIB,
+                        "remainingBytes": 10 * bootstrap.admission.GIB,
+                    }
+                ],
+            )
+            available_gib = 21
+            with self.assertRaisesRegex(ValueError, "Fresh network host admission refused"):
+                bootstrap.network_bootstrap(target, value, observed["hostId"])
+
+    def test_cold_bootstrap_receipt_must_bind_exact_source_and_request_before_provider_access(self):
+        from tempfile import TemporaryDirectory
+        from unittest.mock import patch
+
+        from scripts import consumer_state
+        from scripts.consumer_profile import identity
+        from tests.test_host_admission import request
+
+        with TemporaryDirectory() as root:
+            target = Target("qual-demo", "default", Path(root), "minimal-demo", 18443)
+            owner = consumer_state.reserve(target, "unix:///run/docker.sock")
+            owner["phase"] = "provisioned"
+            consumer_state.save(target, owner)
+            value = request()
+            value.update(target=target.name, artifactDigest=bootstrap.source_digest())
+            bootstrap.write_receipt(
+                target,
+                {
+                    **identity(target),
+                    "nonce": owner["nonce"],
+                    "stage": "pre-cilium",
+                    "phase": "pre-cilium-allocatable",
+                    "coldBootstrapQualified": True,
+                    "artifactDigest": value["artifactDigest"],
+                    "admission": {"admitted": True, "hostId": "boot", "requestDigest": "drift"},
+                },
+            )
+            with (
+                patch.object(bootstrap.runtime, "command") as command,
+                self.assertRaisesRegex(ValueError, "bootstrap receipt"),
+            ):
+                bootstrap.network_bootstrap(target, value, "boot")
+            command.assert_not_called()
+
+    def test_network_operation_and_removal_cannot_overlap_for_the_same_target(self):
+        from tempfile import TemporaryDirectory
+        from unittest.mock import patch
+
+        from scripts import consumer_state
+
+        with TemporaryDirectory() as root:
+            target = Target("qual-demo", "default", Path(root), "minimal-demo", 18443)
+            consumer_state.reserve(target, "unix:///run/docker.sock")
+            with (
+                bootstrap.network_operation(target),
+                patch.object(bootstrap.runtime, "command") as command,
+                self.assertRaisesRegex(ValueError, "target lock"),
+            ):
+                bootstrap.down(target, target.name)
+            command.assert_not_called()
 
 
 class CreationTests(unittest.TestCase):

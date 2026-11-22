@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .consumer_profile import LABEL, Target
+from .consumer_profile import LABEL, MINIMAL_PROFILE, Target
 from .network_assets import selection
 
 
@@ -25,9 +25,9 @@ def namespaces(target: Target) -> tuple[str, str]:
     return f"{target.consumer}-net-a", f"{target.consumer}-net-b"
 
 
-def workloads(target: Target) -> list[dict]:
+def workloads(target: Target, *, images: dict | None = None) -> list[dict]:
     a, b = namespaces(target)
-    images = selection()["probes"]
+    images = selection()["probes"] if images is None else images
     documents = []
     for namespace, identity, role in [
         (a, f"{target.consumer}-a", "worker"),
@@ -52,6 +52,8 @@ def workloads(target: Target) -> list[dict]:
                     "capabilities": {"drop": ["ALL"]},
                 },
             }
+            if target.profile == MINIMAL_PROFILE:
+                container["imagePullPolicy"] = "Never"
             if name == "client":
                 container["command"] = ["sleep", "3600"]
             else:

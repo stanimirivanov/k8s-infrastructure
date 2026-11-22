@@ -63,11 +63,10 @@ the exact generated cluster name (`<consumer>-local`) and `artifactDigest` to:
 uv run --locked --offline python -m scripts.minimal_bootstrap source-digest
 ```
 
-This digest hashes the actual Python scripts, kind profiles and dependency lock,
-including uncommitted changes; it is not a claim that the source has been
-reviewed or published. Retain the reviewed Git revision/publication separately
-alongside this receipt. Any executable source change requires regenerating the
-request. The receipt binds profile digest, node digest, tooling versions,
+This digest hashes the actual Python scripts, kind profiles, networking release
+inventory and dependency lock, including uncommitted changes. Retain the reviewed
+Git revision or release alongside this receipt. Source or networking pin changes
+require regenerating the request. The receipt binds profile digest, node digest, tooling versions,
 request/admission digest, boot identity, target, owner nonce and immutable IDs.
 
 Reserve exactly 12GiB as uncredited `workload` memory for the absent nodes. Keep
@@ -114,6 +113,25 @@ the physical host admission guide explains the same boot identity. `create`
 uses identical admitted creation and evidence collection but does not mark a
 named cold-bootstrap qualification. `qualify` requires a `qual-` consumer.
 Neither path installs Cilium, kube-proxy, Argo CD, consumer workloads or ingress.
+
+For a disposable target intended for network qualification, pass the reviewed
+`--https-port 18443` at cold bootstrap. This maps `127.0.0.1:18443` to port 8443
+on the worker. The port is bound into the owner record and verified against
+Docker's stopped container before the first start. Specify the same port for
+subsequent network qualification and explicit removal. Omitting the option
+creates the pre-Cilium target without an HTTPS mapping.
+
+Selecting the listener also lays down the bounded foundation needed by the
+network probe. The stopped-node caps still come first. After Docker starts the
+control plane, the adapter writes the pinned kubeadm patches before handing
+control back to kind. The four static Pods retain their combined 650m CPU
+requests with 1500m CPU and 2048Mi memory limits. Two CoreDNS replicas and a
+single local-path provisioner run on the worker with a combined 100m CPU
+request, 500m CPU limit and 256Mi memory limit. Their configurations, Service
+and StorageClass behavior are retained. The network gate does not admit volume
+provisioning helper Pods or PVC activity during its disposable run. These
+subdivisions use the existing system reservations and still require installed
+qualification.
 
 Creation uses a shared 900-second deadline, including read-only provider commands.
 Kind receives at most 600 seconds and allocatable reconciliation at most 280

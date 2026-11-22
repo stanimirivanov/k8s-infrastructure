@@ -9,7 +9,8 @@ from urllib.error import URLError
 
 import yaml
 
-from .consumer_profile import NETWORK_PROFILES, Target, configuration
+from . import bootstrap_failure
+from .consumer_profile import MINIMAL_PROFILE, NETWORK_PROFILES, Target, configuration
 from .network_assets import download, render, selection
 from .network_tls import validate_hostname
 
@@ -19,12 +20,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "action", choices=("asset-check", "apply", "health", "handoff", "qualify", "remove")
     )
-    parser.add_argument("--profile", choices=NETWORK_PROFILES)
+    parser.add_argument("--profile", choices=(*NETWORK_PROFILES, MINIMAL_PROFILE))
     parser.add_argument("--consumer")
     parser.add_argument("--docker-context")
     parser.add_argument("--state-root", type=Path)
     parser.add_argument("--https-port", type=int)
     parser.add_argument("--hostname")
+    parser.add_argument("--request", type=Path)
+    parser.add_argument("--host-id")
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--confirm-delete")
     args = parser.parse_args(argv)
@@ -32,14 +35,34 @@ def main(argv: list[str] | None = None) -> int:
         if args.action == "asset-check":
             import tempfile
 
+            assets = download()
             with tempfile.TemporaryDirectory(prefix="network-assets-") as directory:
-                target = Target(
-                    "validation", "local-engine", Path(directory), "isolated-network-local", 18443
-                )
-                shared, documents = render(target, *download())
-            print(
-                f"Verified pinned networking assets and Helm render: {len(shared)} APIs, {len(documents)} resources; no cluster access."
-            )
+                for profile in (*NETWORK_PROFILES, MINIMAL_PROFILE):
+                    target = Target(
+                        "qual-validation", "local-engine", Path(directory), profile, 18443
+                    )
+                    shared, documents = render(target, *assets)
+                    if profile == MINIMAL_PROFILE:
+                        from . import network_resources as resources
+                        from .network_fixtures import workloads
+
+                        print(
+                            json.dumps(
+                                {
+                                    "minimalDemoRequiredImages": resources.required_images(
+                                        resources.controllers(documents), workloads(target)
+                                    ),
+                                    "minimalDemoResourceEnvelope": resources.rendered_bounds(
+                                        target, documents
+                                    ),
+                                },
+                                sort_keys=True,
+                            )
+                        )
+                    print(
+                        f"Verified pinned networking assets and Helm render for {profile}: "
+                        f"{len(shared)} APIs, {len(documents)} resources; no cluster access."
+                    )
             return 0
         if any(
             value is None
@@ -58,6 +81,30 @@ def main(argv: list[str] | None = None) -> int:
             args.consumer, args.docker_context, args.state_root, args.profile, args.https_port
         )
         hostname = validate_hostname(args.hostname or f"{target.consumer}.localhost")
+        if target.profile == MINIMAL_PROFILE:
+            if args.action != "qualify" or not target.consumer.startswith("qual-"):
+                raise ValueError(
+                    "Minimal-demo only supports dedicated cold networking qualification on a qual- target"
+                )
+            if args.execute:
+                if args.request is None or not args.host_id:
+                    raise ValueError(
+                        "Minimal-demo requires the original admission request and current host ID"
+                    )
+                from .consumer_state import read_bounded
+                from .minimal_network import qualify
+
+                print(
+                    json.dumps(
+                        qualify(
+                            target, hostname, json.loads(read_bounded(args.request)), args.host_id
+                        ),
+                        indent=2,
+                    )
+                )
+                return 0
+        elif args.request is not None or args.host_id is not None:
+            raise ValueError("Host admission inputs are only supported for minimal-demo")
         if not args.execute:
             result = {
                 "action": args.action,
@@ -68,7 +115,11 @@ def main(argv: list[str] | None = None) -> int:
                 "kindConfiguration": configuration(target),
                 "origin": f"https://{hostname}:{target.https_port}",
                 "assets": selection(),
-                "mutations": "Create only fresh-profile CNI/Gateway resources; apply explicitly recovers this profile's partial bootstrap. Qualify creates neutral namespaces, policies, TLS leaf and routes. Removal destroys only the confirmed whole target; no in-place CNI uninstall or trust-store change.",
+                "mutations": (
+                    "Verify admitted capped pre-Cilium nodes, stage Cilium, then create disposable bounded probe fixtures. Retain receipt and fixtures; remove through minimal_bootstrap down."
+                    if target.profile == MINIMAL_PROFILE
+                    else "Create only fresh-profile CNI/Gateway resources; apply explicitly recovers this profile's partial bootstrap. Qualify creates neutral namespaces, policies, TLS leaf and routes. Removal destroys only the confirmed whole target; no in-place CNI uninstall or trust-store change."
+                ),
             }
         else:
             from . import network_runtime as runtime
@@ -92,6 +143,15 @@ def main(argv: list[str] | None = None) -> int:
                 }
         print(json.dumps(result, indent=2))
         return 0
+    except bootstrap_failure.Failure as error:
+        print(
+            json.dumps(
+                {
+                    "failure": error.evidence,
+                    "receipt": "Check the selected target's private network qualification receipt if reserved.",
+                }
+            )
+        )
     except ValueError as error:
         print(
             "Networking input/response parsing failed; private details withheld."

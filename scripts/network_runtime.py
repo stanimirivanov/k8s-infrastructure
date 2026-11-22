@@ -9,9 +9,18 @@ from copy import deepcopy
 from typing import Any
 
 from . import consumer_lifecycle, consumer_runtime
-from .consumer_profile import NETWORK_PROFILES, Target
+from .consumer_profile import MINIMAL_PROFILE, NETWORK_PROFILES, Target
 from .kubernetes import contains, fingerprint, kube, reference
-from .network_assets import MANAGER, download, labels, render, selection
+from .network_assets import (
+    MANAGER,
+    SELECTION_LABEL,
+    download,
+    labels,
+    ownership_labels,
+    render,
+    selection,
+)
+from .node_capacity import quantity
 
 
 def require_profile(target: Target) -> int:
@@ -48,9 +57,14 @@ def inventory(target: Target, documents: list[dict]) -> dict[tuple, dict]:
         actual = found.get(reference(item))
         if actual is None:
             continue
+        reviewed_labels = (
+            ownership_labels(target, item["metadata"]["labels"][SELECTION_LABEL])
+            if target.profile == MINIMAL_PROFILE
+            else labels(target)
+        )
         if actual["metadata"].get("deletionTimestamp") or any(
             actual["metadata"].get("labels", {}).get(key) != value
-            for key, value in labels(target).items()
+            for key, value in reviewed_labels.items()
         ):
             raise ValueError(
                 "Foreign, deleting or incompatible network resource; no adoption or forced upgrade"
@@ -76,17 +90,32 @@ def install(target: Target) -> None:
     """Only called after the exact new-profile node IDs and incarnation are journaled."""
     require_profile(target)
     consumer_lifecycle.owned(target, require_ready=False)
+    require_fresh_cni(target)
+    shared, documents = render(target, *download())
+    install_apis(target, shared, documents)
+    apply_objects(target, [item for item in documents if item["kind"] != "Namespace"])
+    observe(target, shared, documents)
+
+
+def require_fresh_cni(target: Target) -> None:
     daemonsets = kube(
         target,
         ["-n", "kube-system", "get", "daemonsets", "-o", "jsonpath={.items[*].metadata.name}"],
     )
     if {"kindnet", "kube-proxy", "calico-node", "kube-flannel-ds"} & set(daemonsets.split()):
         raise ValueError("Existing CNI or kube-proxy detected; no in-place network replacement")
-    shared, documents = render(target, *download())
+
+
+def install_apis(
+    target: Target, shared: list[dict], documents: list[dict], *, fresh: bool = False
+) -> None:
+    """Use existing ownership and schema preflight before any network writes."""
     # GatewayClass cannot be queried before its API exists. Preflight every
     # built-in object and shared schema before the first mutation.
     builtins = [item for item in documents if item["kind"] != "GatewayClass"]
     found = inventory(target, [*shared, *builtins])
+    if fresh and found:
+        raise ValueError("Existing network resources prevent cold Cilium qualification")
     classes = [item for item in documents if item["kind"] == "GatewayClass"]
     class_api = next(
         item
@@ -114,8 +143,6 @@ def install(target: Target) -> None:
     # Preflight the new API before creating any class, even on first install.
     inventory(target, classes)
     apply_objects(target, [item for item in documents if item["kind"] == "Namespace"])
-    apply_objects(target, [item for item in documents if item["kind"] != "Namespace"])
-    observe(target, shared, documents)
 
 
 def verify_pod_template(expected: dict, actual: dict) -> None:
@@ -154,12 +181,12 @@ def verify_pod_template(expected: dict, actual: dict) -> None:
                 raise ValueError("Network container security context differs")
 
 
-def comparable_spec(item: dict) -> dict:
+def comparable_spec(item: dict, *, minimal: bool = False) -> dict:
     """Normalize only observed API serialization of controller pod fields.
 
     Kubernetes canonicalizes whole CPU quantities to strings and omits false
-    mount flags, zero probe delays and null template annotations. Preserve the
-    original manifests and all other fields so actual changes still fail.
+    mount flags, zero probe delays and null template annotations. Minimal
+    budgets compare exact millicores and bytes after API canonicalization.
     """
     spec = deepcopy(item["spec"])
     if item["kind"] in {"Deployment", "DaemonSet"}:
@@ -170,7 +197,10 @@ def comparable_spec(item: dict) -> dict:
         for container in [*pod["containers"], *pod.get("initContainers", [])]:
             for budget in container.get("resources", {}).values():
                 cpu = budget.get("cpu")
-                if type(cpu) is int:
+                if minimal:
+                    for resource in {"cpu", "memory"} & budget.keys():
+                        budget[resource] = quantity(str(budget[resource]), cpu=resource == "cpu")
+                elif type(cpu) is int:
                     budget["cpu"] = str(cpu)
                 elif (
                     isinstance(cpu, str)
@@ -195,10 +225,14 @@ def observe(target: Target, shared: list[dict], documents: list[dict]) -> dict[s
             raise ValueError("Network resource missing; no readiness pass")
         for key in ("spec", "rules", "roleRef", "subjects", "data"):
             expected_value = (
-                comparable_spec(item) if key == "spec" and key in item else item.get(key)
+                comparable_spec(item, minimal=target.profile == MINIMAL_PROFILE)
+                if key == "spec" and key in item
+                else item.get(key)
             )
             actual_value = (
-                comparable_spec(actual) if key == "spec" and key in actual else actual.get(key)
+                comparable_spec(actual, minimal=target.profile == MINIMAL_PROFILE)
+                if key == "spec" and key in actual
+                else actual.get(key)
             )
             if key in item and not contains(expected_value, actual_value):
                 raise ValueError(f"Network {item['kind']} {item['metadata']['name']} {key} drift")
@@ -231,17 +265,7 @@ def observe(target: Target, shared: list[dict], documents: list[dict]) -> dict[s
                 )
         if item["kind"] in {"Deployment", "DaemonSet"}:
             verify_pod_template(item, actual)
-            kube(
-                target,
-                [
-                    "-n",
-                    item["metadata"].get("namespace", "kube-system"),
-                    "rollout",
-                    "status",
-                    f"{item['kind'].lower()}/{item['metadata']['name']}",
-                    "--timeout=300s",
-                ],
-            )
+            wait_controller(target, item)
     kube(target, ["wait", "--for=condition=Accepted", "gatewayclass/cilium", "--timeout=90s"])
     return {
         "profile": target.profile,
@@ -256,7 +280,17 @@ def observe(target: Target, shared: list[dict], documents: list[dict]) -> dict[s
         "controllerReadiness": "observed",
         "trafficAndTLS": "requires separate qualify action",
         "trust": "consumer-owned certificate Secret; explicit public CA bundle; no automatic host trust",
-        "resourceEnvelope": {"controllerPods": 5, "requestsCPU": "350m", "requestsMemory": "768Mi"},
+        **(
+            {
+                "resourceEnvelope": {
+                    "controllerPods": 5,
+                    "requestsCPU": "350m",
+                    "requestsMemory": "768Mi",
+                }
+            }
+            if target.profile != MINIMAL_PROFILE
+            else {}
+        ),
         "notQualified": [
             "consumer product",
             "browser/OS trust installation",
@@ -280,3 +314,37 @@ def resume(target: Target) -> dict:
     consumer_runtime.verify_nodes(consumer_runtime.node_identity(target), profile=target.profile)
     install(target)
     return consumer_lifecycle.finish_creation(target, record)
+
+
+def wait_controller(target: Target, item: dict) -> None:
+    name = item["metadata"]["name"]
+    namespace = item["metadata"].get("namespace", "kube-system")
+    if item["kind"] == "DaemonSet" and item["spec"]["updateStrategy"]["type"] == "OnDelete":
+        # kubectl rollout status only supports RollingUpdate DaemonSets.
+        deadline = time.monotonic() + 300
+        while time.monotonic() < deadline:
+            live = json.loads(
+                kube(target, ["-n", namespace, "get", "daemonset", name, "-o", "json"])
+            )
+            status = live.get("status", {})
+            if (
+                status.get("observedGeneration") == live["metadata"]["generation"]
+                and all(
+                    status.get(key) == 2
+                    for key in (
+                        "desiredNumberScheduled",
+                        "currentNumberScheduled",
+                        "numberReady",
+                        "numberAvailable",
+                        "updatedNumberScheduled",
+                    )
+                )
+                and status.get("numberMisscheduled", 0) == 0
+            ):
+                return
+            time.sleep(2)
+        raise TimeoutError(f"Cilium DaemonSet {name} did not reach exactly two available Pods")
+    kube(
+        target,
+        ["-n", namespace, "rollout", "status", f"{item['kind'].lower()}/{name}", "--timeout=300s"],
+    )
