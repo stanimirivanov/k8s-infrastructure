@@ -51,8 +51,9 @@ def mount_points() -> list[Path]:
     return [path for path, _ in mount_records()]
 
 
-def physical_filesystem(path: Path) -> None:
-    candidates = [(mount, kind) for mount, kind in mount_records() if path.is_relative_to(mount)]
+def physical_filesystem(path: Path, *, mounts: list[tuple[Path, str]] | None = None) -> None:
+    records = mount_records() if mounts is None else mounts
+    candidates = [(mount, kind) for mount, kind in records if path.is_relative_to(mount)]
     if not candidates or max(candidates, key=lambda item: len(item[0].parts))[1] not in {
         "ext4",
     }:
