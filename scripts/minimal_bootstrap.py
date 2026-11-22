@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import fcntl
 import hashlib
 import json
 import os
@@ -351,6 +350,8 @@ def artifact_path(target: Target, suffix: str) -> Path:
 @contextmanager
 def network_operation(target: Target) -> Iterator[None]:
     """Serialize continuation and removal on the owned local target."""
+    import fcntl
+
     state.load(target)
     path = artifact_path(target, "network.lock")
     descriptor = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)

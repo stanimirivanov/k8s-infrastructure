@@ -122,6 +122,18 @@ Docker's stopped container before the first start. Specify the same port for
 subsequent network qualification and explicit removal. Omitting the option
 creates the pre-Cilium target without an HTTPS mapping.
 
+Selecting the listener also lays down the bounded foundation needed by the
+network probe. The stopped-node caps still come first. After Docker starts the
+control plane, the adapter writes the pinned kubeadm patches before handing
+control back to kind. The four static Pods retain their combined 650m CPU
+requests with 1500m CPU and 2048Mi memory limits. Two CoreDNS replicas and a
+single local-path provisioner run on the worker with a combined 100m CPU
+request, 500m CPU limit and 256Mi memory limit. Their configurations, Service
+and StorageClass behavior are retained. The network gate does not admit volume
+provisioning helper Pods or PVC activity during its disposable run. These
+subdivisions use the existing system reservations and still require installed
+qualification.
+
 Creation uses a shared 900-second deadline, including read-only provider commands.
 Kind receives at most 600 seconds and allocatable reconciliation at most 280
 seconds, each reduced to the remaining operation budget. The 30-second host
