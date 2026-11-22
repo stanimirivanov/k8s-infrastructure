@@ -114,6 +114,44 @@ class MinimalArgoAssetTests(unittest.TestCase):
         )
         self.assertEqual(scope["resourceRules"][0]["operations"], ["CREATE"])
 
+    def test_gitops_fence_limits_writes_to_top_level_argo_intent_in_its_namespace(self):
+        delegation = Delegation("qual-argo", ("qual-argo-apps",), ("release",))
+        documents = minimal_argo_fence.documents_for(delegation)
+        policy = next(
+            item
+            for item in documents
+            if item["kind"] == "ValidatingAdmissionPolicy"
+            and item["metadata"]["name"] == "qual-argo-argo-restore-gitops"
+        )
+        scope = policy["spec"]["matchConstraints"]
+        self.assertEqual(
+            {"kubernetes.io/metadata.name": delegation.gitops},
+            scope["namespaceSelector"]["matchLabels"],
+        )
+        self.assertEqual(
+            [
+                {
+                    "apiGroups": ["argoproj.io"],
+                    "apiVersions": ["v1alpha1"],
+                    "operations": ["CREATE", "UPDATE", "DELETE"],
+                    "resources": ["applications", "applicationsets"],
+                }
+            ],
+            scope["resourceRules"],
+        )
+        denied = CommandFailure(
+            "private details withheld", denial=("admission", "qual-argo-argo-restore-gitops")
+        )
+        with TemporaryDirectory() as directory:
+            target = Target("qual-argo", "default", Path(directory), MINIMAL_PROFILE, 18443)
+            with patch.object(minimal_argo_fence, "kube", side_effect=[denied, denied]) as kube:
+                minimal_argo_fence.confirm_gitops_frozen(target, delegation)
+        probes = [call.args[2][0] for call in kube.call_args_list]
+        self.assertEqual(["Application", "ApplicationSet"], [item["kind"] for item in probes])
+        for call in kube.call_args_list:
+            self.assertIn("--dry-run=server", call.args[1])
+            self.assertEqual(delegation.gitops, call.args[2][0]["metadata"]["namespace"])
+
     def test_fence_patch_checks_exact_identity_and_observes_the_native_decision(self):
         delegation = Delegation("qual-argo", ("qual-argo-apps",), ("release",))
         with TemporaryDirectory() as directory:

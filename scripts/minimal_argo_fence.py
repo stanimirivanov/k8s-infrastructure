@@ -1,4 +1,4 @@
-"""Fence new Workflow submissions in the exact minimal-demo release namespace."""
+"""Fence Workflow submissions and GitOps desired-state writes during restoration."""
 
 from __future__ import annotations
 
@@ -20,56 +20,72 @@ def policy_name(delegation: Delegation) -> str:
     return f"{delegation.consumer}-argo-lifecycle-fence"
 
 
+def gitops_policy_name(delegation: Delegation) -> str:
+    return f"{delegation.consumer}-argo-restore-gitops"
+
+
 def documents_for(delegation: Delegation) -> list[dict]:
-    name = policy_name(delegation)
-    return stamp(
-        [
-            resource("ConfigMap", FENCE_CONFIG, delegation.controllers, data={"mode": "closed"}),
-            resource(
-                "ValidatingAdmissionPolicy",
-                name,
-                None,
-                spec={
-                    "failurePolicy": "Fail",
-                    "paramKind": {"apiVersion": "v1", "kind": "ConfigMap"},
-                    "matchConstraints": {
-                        "namespaceSelector": {
-                            "matchLabels": {"kubernetes.io/metadata.name": delegation.managed}
+    documents = [
+        resource("ConfigMap", FENCE_CONFIG, delegation.controllers, data={"mode": "closed"})
+    ]
+    for name, namespace, operations, resources, allowed in (
+        (policy_name(delegation), delegation.managed, ["CREATE"], ["workflows"], ["open"]),
+        (
+            gitops_policy_name(delegation),
+            delegation.gitops,
+            ["CREATE", "UPDATE", "DELETE"],
+            ["applications", "applicationsets"],
+            ["closed", "open"],
+        ),
+    ):
+        documents.extend(
+            [
+                resource(
+                    "ValidatingAdmissionPolicy",
+                    name,
+                    None,
+                    spec={
+                        "failurePolicy": "Fail",
+                        "paramKind": {"apiVersion": "v1", "kind": "ConfigMap"},
+                        "matchConstraints": {
+                            "namespaceSelector": {
+                                "matchLabels": {"kubernetes.io/metadata.name": namespace}
+                            },
+                            "resourceRules": [
+                                {
+                                    "apiGroups": ["argoproj.io"],
+                                    "apiVersions": ["v1alpha1"],
+                                    "operations": operations,
+                                    "resources": resources,
+                                }
+                            ],
                         },
-                        "resourceRules": [
+                        "validations": [
                             {
-                                "apiGroups": ["argoproj.io"],
-                                "apiVersions": ["v1alpha1"],
-                                "operations": ["CREATE"],
-                                "resources": ["workflows"],
+                                "expression": "params != null && has(params.data) && 'mode' in params.data && params.data['mode'] in "
+                                + json.dumps(allowed),
+                                "message": "Minimal-demo Argo lifecycle has fenced this operation.",
                             }
                         ],
                     },
-                    "validations": [
-                        {
-                            "expression": "params != null && has(params.data) && 'mode' in params.data && params.data['mode'] == 'open'",
-                            "message": "Minimal-demo Argo lifecycle has closed Workflow submission.",
-                        }
-                    ],
-                },
-            ),
-            resource(
-                "ValidatingAdmissionPolicyBinding",
-                name,
-                None,
-                spec={
-                    "policyName": name,
-                    "validationActions": ["Deny", "Audit"],
-                    "paramRef": {
-                        "name": FENCE_CONFIG,
-                        "namespace": delegation.controllers,
-                        "parameterNotFoundAction": "Deny",
+                ),
+                resource(
+                    "ValidatingAdmissionPolicyBinding",
+                    name,
+                    None,
+                    spec={
+                        "policyName": name,
+                        "validationActions": ["Deny", "Audit"],
+                        "paramRef": {
+                            "name": FENCE_CONFIG,
+                            "namespace": delegation.controllers,
+                            "parameterNotFoundAction": "Deny",
+                        },
                     },
-                },
-            ),
-        ],
-        delegation,
-    )
+                ),
+            ]
+        )
+    return stamp(documents, delegation)
 
 
 def read_fence(target: Target, delegation: Delegation) -> dict:
@@ -86,7 +102,7 @@ def read_fence(target: Target, delegation: Delegation) -> dict:
             data = actual.get("data", {})
             if (
                 set(data) != {"mode"}
-                or data["mode"] not in {"open", "closed"}
+                or data["mode"] not in {"open", "closed", "restoring"}
                 or actual.get("immutable")
                 or actual.get("binaryData")
             ):
@@ -103,7 +119,7 @@ def read_fence(target: Target, delegation: Delegation) -> dict:
 
 
 def is_closed(target: Target, delegation: Delegation) -> bool:
-    return read_fence(target, delegation)["data"]["mode"] == "closed"
+    return read_fence(target, delegation)["data"]["mode"] != "open"
 
 
 def confirm_admission(target: Target, delegation: Delegation, closed: bool) -> None:
@@ -138,30 +154,75 @@ def confirm_admission(target: Target, delegation: Delegation, closed: bool) -> N
         "-",
     ]
     expected = ("admission", policy_name(delegation))
+    await_admission(target, command, workflow, expected, closed)
+
+
+def confirm_gitops_frozen(target: Target, delegation: Delegation) -> None:
+    application_spec = {
+        "project": "default",
+        "source": {"repoURL": "https://example.invalid/fence-probe", "path": "."},
+        "destination": {"server": "https://kubernetes.default.svc"},
+    }
+    for kind, spec in (
+        ("Application", application_spec),
+        (
+            "ApplicationSet",
+            {
+                "generators": [{"list": {"elements": [{"name": "probe"}]}}],
+                "template": {"metadata": {"name": "probe"}, "spec": application_spec},
+            },
+        ),
+    ):
+        probe = resource(
+            kind,
+            f"argo-fence-probe-{secrets.token_hex(8)}",
+            delegation.gitops,
+            apiVersion="argoproj.io/v1alpha1",
+            spec=spec,
+        )
+        await_admission(
+            target,
+            ["create", "--dry-run=server", "-f", "-"],
+            probe,
+            ("admission", gitops_policy_name(delegation)),
+            True,
+        )
+
+
+def await_admission(
+    target: Target, command: list[str], document: dict, expected: tuple[str, str], denied: bool
+) -> None:
     deadline = time.monotonic() + ACTIVATION_SECONDS
     while True:
         try:
-            kube(target, command, [workflow], request_timeout=3)
+            kube(target, command, [document], request_timeout=3)
         except CommandFailure as error:
             if error.denial != expected:
                 raise
-            if closed:
+            if denied:
                 return
         else:
-            if not closed:
+            if not denied:
                 return
         if time.monotonic() >= deadline:
-            raise TimeoutError("Argo Workflow fence admission did not reach requested mode")
+            raise TimeoutError("Argo lifecycle fence admission did not reach requested mode")
         time.sleep(0.25)
 
 
 def set_closed(
-    target: Target, delegation: Delegation, closed: bool, *, expected_uid: str | None = None
+    target: Target,
+    delegation: Delegation,
+    closed: bool,
+    *,
+    expected_uid: str | None = None,
+    freeze_gitops: bool = False,
 ) -> None:
     before = read_fence(target, delegation)
     if expected_uid is not None and before["metadata"]["uid"] != expected_uid:
         raise ValueError("Argo lifecycle Workflow fence UID differs from receipt")
-    mode = "closed" if closed else "open"
+    if freeze_gitops and not closed:
+        raise ValueError("Workflow submission must stay closed while restoring GitOps")
+    mode = "restoring" if freeze_gitops else "closed" if closed else "open"
     prior = before["data"]["mode"]
     if prior != mode:
         metadata = before["metadata"]
@@ -189,6 +250,8 @@ def set_closed(
             ],
         )
     confirm_admission(target, delegation, closed)
+    if freeze_gitops:
+        confirm_gitops_frozen(target, delegation)
     after = read_fence(target, delegation)
     if after["metadata"]["uid"] != before["metadata"]["uid"] or after["data"]["mode"] != mode:
         raise ValueError("Argo lifecycle Workflow fence identity or mode changed")

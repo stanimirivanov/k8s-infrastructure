@@ -59,21 +59,29 @@ def verify_ownership(expected: dict, actual: dict) -> None:
         raise ValueError("Foreign or incompatible Argo resource; no adoption or forced conflict")
 
 
-def namespaces_delegated(target: Target, delegation: Delegation) -> None:
+def namespaces_delegated(target: Target, delegation: Delegation) -> dict[str, str]:
     """Consumer bootstrap owns namespaces; provider only binds explicitly granted roles."""
+    identities = {}
     for namespace in (*delegation.workload_namespaces, delegation.managed):
         value = json.loads(kube(target, ["get", "namespace", namespace, "-o", "json"]))
         metadata = value.get("metadata", {})
-        if metadata.get("name") != namespace or any(
-            metadata.get("labels", {}).get(key) != expected
-            for key, expected in {
-                LABEL: delegation.consumer,
-                "app.kubernetes.io/managed-by": delegation.consumer,
-            }.items()
+        if (
+            metadata.get("name") != namespace
+            or metadata.get("deletionTimestamp")
+            or not metadata.get("uid")
+            or any(
+                metadata.get("labels", {}).get(key) != expected
+                for key, expected in {
+                    LABEL: delegation.consumer,
+                    "app.kubernetes.io/managed-by": delegation.consumer,
+                }.items()
+            )
         ):
             raise ValueError(
                 "Missing consumer-owned namespace delegation; provider will not create/adopt it"
             )
+        identities[namespace] = metadata["uid"]
+    return identities
 
 
 def inventory(

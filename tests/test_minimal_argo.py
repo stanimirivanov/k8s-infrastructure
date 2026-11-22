@@ -6,6 +6,7 @@ import json
 import tempfile
 import unittest
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -132,6 +133,117 @@ class MinimalArgoTests(unittest.TestCase):
                 self.assertEqual(1, len(result_entry["pods"]))
                 self.assertNotEqual(previous[name], result_entry["pods"])
 
+    def test_resume_freezes_gitops_before_compatibility_check(self):
+        with LifecycleFixture() as fixture:
+            fixture.started()
+            fixture.invoke("suspend")
+            original = fixture.fence
+
+            def fence(target, delegation, closed, *, expected_uid, freeze_gitops=False):
+                if freeze_gitops:
+                    fixture.applications = [{"spec": {"syncPolicy": {"automated": {}}}}]
+                original(target, delegation, closed, expected_uid=expected_uid)
+
+            with patch.object(minimal_argo.minimal_argo_fence, "set_closed", side_effect=fence):
+                before = list(fixture.patches)
+                with self.assertRaisesRegex(ValueError, "automated sync"):
+                    fixture.invoke("resume")
+                self.assertEqual(before, fixture.patches)
+
+    def test_restoring_admission_retry_recloses_and_rechecks_changed_applications(self):
+        with LifecycleFixture() as fixture:
+            fixture.started()
+            fixture.invoke("suspend")
+            original = fixture.fence
+
+            def interrupt_after_open(
+                target, delegation, closed, *, expected_uid, freeze_gitops=False
+            ):
+                original(target, delegation, closed, expected_uid=expected_uid)
+                if not closed:
+                    raise TimeoutError("simulated lost admission observation")
+
+            with (
+                patch.object(
+                    minimal_argo.minimal_argo_fence, "set_closed", side_effect=interrupt_after_open
+                ),
+                self.assertRaises(TimeoutError),
+            ):
+                fixture.invoke("resume")
+            self.assertEqual("restoring-admission", fixture.read()["phase"])
+            self.assertFalse(fixture.fences_closed)
+            fixture.application_sets = [{"metadata": {"name": "unexpected"}}]
+            before = list(fixture.patches)
+            with self.assertRaisesRegex(ValueError, "ApplicationSet"):
+                fixture.invoke("resume")
+            self.assertEqual(before, fixture.patches)
+            self.assertTrue(fixture.fences_closed)
+            self.assertEqual("restoring-admission", fixture.read()["phase"])
+
+    def test_resume_rejects_out_of_order_replicas_after_interrupted_startup(self):
+        with LifecycleFixture() as fixture:
+            fixture.started()
+            fixture.invoke("suspend")
+            fixture.keep_pending = True
+            wait = fixture.stop_on_wait()
+            with self.assertRaisesRegex(ValueError, "simulated deadline"):
+                fixture.invoke("resume")
+            wait.side_effect = None
+            fixture.keep_pending = False
+            fixture.workloads["argocd-application-controller"]["spec"]["replicas"] = 1
+            before = list(fixture.patches)
+            with self.assertRaisesRegex(ValueError, "outside the recorded restoration"):
+                fixture.invoke("resume")
+            self.assertEqual(before, fixture.patches)
+
+    def test_resume_refuses_drifted_governing_support(self):
+        from scripts.kubernetes import reference
+
+        with LifecycleFixture() as fixture:
+            fixture.started()
+            fixture.invoke("suspend")
+            resource = {
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {"name": "argocd-cm", "namespace": fixture.delegation.gitops},
+            }
+            wanted = {
+                **resource,
+                "metadata": {**resource["metadata"], "uid": "map"},
+                "data": {"application.resourceTrackingMethod": "label"},
+            }
+            receipt = fixture.read()
+            receipt["governingSupport"] = [
+                {
+                    "resource": resource,
+                    "uid": "map",
+                    "digest": minimal_argo.governing_digest(wanted),
+                }
+            ]
+            fixture.receipt.write_text(json.dumps(receipt))
+            live = {**wanted, "data": {"application.resourceTrackingMethod": "annotation"}}
+            before = list(fixture.patches)
+            with (
+                patch.object(
+                    minimal_argo.delegated_argo_runtime,
+                    "read_resources",
+                    return_value={reference(live): live},
+                ),
+                self.assertRaisesRegex(ValueError, "governing support drifted"),
+            ):
+                fixture.invoke("resume")
+            self.assertEqual(before, fixture.patches)
+
+    def test_resume_refuses_legacy_workload_grant(self):
+        with LifecycleFixture() as fixture:
+            fixture.started()
+            fixture.invoke("suspend")
+            fixture.legacy_roles = [{"metadata": {"name": "delegated-argocd"}}]
+            before = list(fixture.patches)
+            with self.assertRaisesRegex(ValueError, "legacy"):
+                fixture.invoke("resume")
+            self.assertEqual(before, fixture.patches)
+
     def test_resume_blocks_unaccounted_or_over_budget_worker_before_scaling(self):
         with LifecycleFixture() as fixture:
             fixture.started()
@@ -169,7 +281,7 @@ class MinimalArgoTests(unittest.TestCase):
 
     def test_qualification_refuses_another_incarnation_and_binds_complete_cycle_evidence(self):
         with LifecycleFixture() as fixture:
-            fixture.started()
+            fixture.started(initializer=True)
             fixture.invoke("suspend")
             fixture.invoke("resume")
             history = fixture.read()["history"]
@@ -180,7 +292,17 @@ class MinimalArgoTests(unittest.TestCase):
             with (
                 patch(
                     "scripts.minimal_argo.resource_peaks.bind",
-                    return_value=SimpleNamespace(provenance=provenance),
+                    return_value=SimpleNamespace(
+                        provenance=provenance,
+                        initial_tooling={
+                            "tooling": {
+                                "cgroupIdentity": "tooling-metric",
+                                "lifetimeMemoryPeakBytes": 1000,
+                                "cpuLimitMillicores": 500,
+                                "memoryLimitBytes": 10000,
+                            }
+                        },
+                    ),
                 ),
                 patch("scripts.minimal_argo.check_failure_events"),
             ):
@@ -190,8 +312,53 @@ class MinimalArgoTests(unittest.TestCase):
                 peak = fixture.peak_receipt(history, provenance)
                 result = fixture.invoke("qualify", request={}, host_id="host", peak_receipt=peak)
             self.assertEqual("qualified", result["phase"])
-            self.assertTrue((fixture.target.directory / result["qualificationEvidence"]).is_file())
+            self.assertEqual("unavailable", result["initializerNativePeakCoverage"])
+            evidence = json.loads(
+                (fixture.target.directory / result["qualificationEvidence"]).read_text()
+            )
+            self.assertEqual(9, evidence["coveredRestoredContainers"])
+            self.assertEqual("unavailable", evidence["initializerNativePeaks"][0]["state"])
+            installed = evidence["lifecycle"]["restoredInitializers"][0]
+            self.assertEqual("secret-init", installed["containerName"])
+            self.assertEqual("384Mi", installed["resources"]["limits"]["memory"])
+            self.assertEqual(0, installed["exitCode"])
             self.assertFalse(result["installedAcceptance"])
+
+    def test_peak_receipt_refuses_truncated_cadence_and_inconsistent_native_summary(self):
+        from scripts import minimal_argo_qualification
+
+        with LifecycleFixture() as fixture:
+            fixture.started()
+            fixture.invoke("suspend")
+            fixture.invoke("resume")
+            history = fixture.read()["history"]
+            path = fixture.peak_receipt(history, {})
+            records = [json.loads(line) for line in path.read_text().splitlines()]
+            bad_records = records[:2] + records[3:]
+            path.write_text("".join(json.dumps(item) + "\n" for item in bad_records))
+            with self.assertRaisesRegex(ValueError, "sampling sequence"):
+                minimal_argo_qualification.peak_records(fixture.target, path, {})
+            records[-1]["failure"] = {"category": "timeout"}
+            path.write_text("".join(json.dumps(item) + "\n" for item in records))
+            with self.assertRaisesRegex(ValueError, "sampling sequence"):
+                minimal_argo_qualification.peak_records(fixture.target, path, {})
+            del records[-1]["failure"]
+            records[-1]["nodes"][fixture.target.name + "-worker"]["lifetimeMemoryPeakBytes"] += 1
+            path.write_text("".join(json.dumps(item) + "\n" for item in records))
+            with self.assertRaisesRegex(ValueError, "native summary"):
+                minimal_argo_qualification.peak_records(fixture.target, path, {})
+
+    def test_peak_receipt_rejects_an_oversized_first_line(self):
+        from scripts import minimal_argo_qualification
+
+        with LifecycleFixture() as fixture:
+            path = fixture.target.directory / "large.jsonl"
+            path.write_bytes(b" " * 4096 + b"\n")
+            with (
+                patch.object(minimal_argo.resource_peaks, "MAX_RECEIPT_BYTES", 256),
+                self.assertRaisesRegex(ValueError, "byte bound"),
+            ):
+                minimal_argo_qualification.peak_records(fixture.target, path, {})
 
     def test_dormant_install_records_prior_intent_before_restoration(self):
         with LifecycleFixture() as fixture:
@@ -208,6 +375,17 @@ class MinimalArgoTests(unittest.TestCase):
                     all(item["spec"]["replicas"] == 0 for item in fixture.workloads.values())
                 )
                 fixture.fail_create = None
+                already_created = set(fixture.workloads)
+                with (
+                    patch.object(
+                        minimal_argo.minimal_argo_fence,
+                        "read_fence",
+                        return_value={"metadata": {"uid": "replaced-fence"}},
+                    ),
+                    self.assertRaisesRegex(ValueError, "different UID"),
+                ):
+                    fixture.invoke("install")
+                self.assertEqual(already_created, set(fixture.workloads))
                 result = fixture.invoke("install")
             self.assertEqual("suspended", result["phase"])
             self.assertEqual({name: 1 for name in CONTROLLERS}, fixture.read()["restoreReplicas"])
@@ -252,11 +430,13 @@ class LifecycleFixture(contextlib.ExitStack):
         self.workflows = []
         self.applications = []
         self.application_sets = []
+        self.legacy_roles = []
         self.fences_closed = False
         self.enter_context(
             patch("scripts.minimal_argo.minimal_argo_fence.set_closed", side_effect=self.fence)
         )
         self.worker_pods = []
+        self.pod_start_times = {}
         self.receipt = root / ".local/qual-argo-local.argo-lifecycle.json"
         self.enter_context(
             patch("scripts.minimal_argo.bootstrap.network_operation", contextlib.nullcontext)
@@ -291,6 +471,18 @@ class LifecycleFixture(contextlib.ExitStack):
         )
         self.enter_context(patch("scripts.minimal_argo.runtime.verify_nodes"))
         self.enter_context(patch("scripts.minimal_argo.staged_images"))
+        self.enter_context(
+            patch(
+                "scripts.minimal_argo.delegated_argo_runtime.namespaces_delegated", return_value={}
+            )
+        )
+        self.enter_context(patch("scripts.minimal_argo.delegated_argo_runtime.verify_admission"))
+        self.enter_context(
+            patch(
+                "scripts.minimal_argo.minimal_argo_fence.read_fence",
+                return_value={"metadata": {"uid": "fence-uid"}},
+            )
+        )
 
     def install_assets(self, documents):
         from scripts.kubernetes import reference
@@ -299,7 +491,6 @@ class LifecycleFixture(contextlib.ExitStack):
         mocks: tuple[tuple[str, dict[str, Any]], ...] = (
             ("delegated_argo_config.download_assets", {"return_value": {}}),
             ("render", {"return_value": ([], documents)}),
-            ("delegated_argo_runtime.namespaces_delegated", {}),
             ("delegated_argo_runtime.verify_admission", {}),
             (
                 "delegated_argo_runtime.inventory",
@@ -315,7 +506,7 @@ class LifecycleFixture(contextlib.ExitStack):
             stack.enter_context(patch("scripts.minimal_argo." + name, **kwargs))
         return stack
 
-    def fence(self, target, delegation, closed, *, expected_uid):
+    def fence(self, target, delegation, closed, *, expected_uid, freeze_gitops=False):
         if expected_uid != "fence-uid":
             raise AssertionError("Wrong fence identity")
         self.fences_closed = closed
@@ -327,7 +518,7 @@ class LifecycleFixture(contextlib.ExitStack):
     def read(self):
         return json.loads(self.receipt.read_text())
 
-    def started(self):
+    def started(self, *, initializer=False):
         from scripts.delegated_argo_config import labels
         from scripts.host_admission import digest
 
@@ -355,6 +546,20 @@ class LifecycleFixture(contextlib.ExitStack):
                     },
                 }
             }
+            if initializer and name == "argocd-redis":
+                template["spec"]["initContainers"] = [
+                    {
+                        "name": "secret-init",
+                        "image": minimal_argo.minimal_argo_assets.selection()[
+                            minimal_argo.minimal_argo_assets.ARGO
+                        ],
+                        "imagePullPolicy": "Never",
+                        "resources": {
+                            "requests": {"cpu": "50m", "memory": "384Mi"},
+                            "limits": {"cpu": "500m", "memory": "384Mi"},
+                        },
+                    }
+                ]
             self.workloads[name] = {
                 "apiVersion": "apps/v1",
                 "kind": kind,
@@ -384,6 +589,8 @@ class LifecycleFixture(contextlib.ExitStack):
             "history": {},
             "installation": "installation",
             "fenceUID": "fence-uid",
+            "governingSupport": [],
+            "consumerNamespaces": {},
         }
         self.receipt.write_text(json.dumps(value))
         self.receipt.chmod(0o600)
@@ -392,38 +599,52 @@ class LifecycleFixture(contextlib.ExitStack):
         return minimal_argo.operate(self.target, self.delegation, action, 20, **kwargs)
 
     def peak_receipt(self, history, provenance):
+        from scripts import resource_peaks
+
         record_id = str(uuid.uuid4())
-        start = history["suspendStartedAtUnixNs"] - 10_000
-        end = history["resumeCompletedAtUnixNs"] - start + 10_000
+        second = resource_peaks.SECOND
+        start = history["suspendStartedAtUnixNs"] - second
         node_ids = {
             self.target.name + "-worker": {"cgroupIdentity": "worker-metric"},
             self.target.name + "-control-plane": {"cgroupIdentity": "control-metric"},
         }
+        tooling_id = "tooling-metric"
+        account = {"memoryLimitBytes": 10000, "cpuLimitMillicores": 500}
+        filesystem = "store-filesystem"
         before = []
         after = []
-        attempts = {}
         for name in CONTROLLERS:
             namespace = self.workloads[name]["metadata"]["namespace"]
             base = {
                 "namespace": namespace,
                 "node": self.target.name + "-worker",
+                "podName": name + "-pod",
                 "containerName": name,
                 "kind": "app",
                 "state": "running",
                 "counterState": "observed",
                 "restartCount": 0,
+                "restartableInit": False,
+                "finishedAtNs": None,
             }
             old = history["previousPods"][name][0]
             new = history["restoredPods"][name][0]
-            before.append({**base, "podUid": old, "containerId": name + "-old"})
-            after.append({**base, "podUid": new, "containerId": name + "-new"})
-            attempts[name + "-new"] = {
-                **base,
-                "podUid": new,
-                "state": "observed",
-                "lifetimeMemoryPeakBytes": 1000,
-                "startedAtNs": history["resumeStartedAtUnixNs"],
-            }
+            before.append(
+                {
+                    **base,
+                    "podUid": old,
+                    "containerId": name + "-old",
+                    "startedAtNs": start - second,
+                }
+            )
+            after.append(
+                {
+                    **base,
+                    "podUid": new,
+                    "containerId": name + "-new",
+                    "startedAtNs": history["resumeStartedAtUnixNs"],
+                }
+            )
         common = {
             "schema": "resource-peaks.v1",
             "collectionId": record_id,
@@ -431,50 +652,69 @@ class LifecycleFixture(contextlib.ExitStack):
             "profile": self.target.profile,
             "installedAcceptance": False,
         }
+
+        def counters(identity, elapsed):
+            return {
+                "cgroupIdentity": identity,
+                "elapsedNs": elapsed,
+                "memoryCurrentBytes": 800,
+                "lifetimeMemoryPeakBytes": 1000,
+                "cpu": {label: elapsed for label in resource_peaks.CPU_FIELDS.values()},
+            }
+
         samples = [
             {
                 "record": "sample",
-                "index": 0,
-                "startedElapsedNs": 0,
-                "finishedElapsedNs": 1,
-                "containers": before,
-            },
-            {
-                "record": "sample",
-                "index": 1,
-                "startedElapsedNs": end - 1,
-                "finishedElapsedNs": end,
-                "containers": after,
-            },
+                "index": index,
+                "startedElapsedNs": elapsed,
+                "finishedElapsedNs": elapsed + 1,
+                "containers": [
+                    {
+                        **row,
+                        "counters": {**counters(row["containerId"], elapsed), "populated": True},
+                    }
+                    for row in (before if index == 0 else after)
+                ],
+                "nodes": {
+                    name: counters(metric["cgroupIdentity"], elapsed)
+                    for name, metric in node_ids.items()
+                },
+                "tooling": {"tooling": {**counters(tooling_id, elapsed), **account}},
+                "host": {"memAvailableBytes": 8 * resource_peaks.GIB, "elapsedNs": elapsed},
+                "diskElapsedNs": elapsed,
+                "filesystems": {
+                    filesystem: {"availableBytes": 11 * resource_peaks.GIB, "usedBytes": 1}
+                },
+                "initOverlap": [],
+            }
+            for index, elapsed in enumerate(range(0, 11 * second, 2 * second))
         ]
         peak = {
             "record": "result",
-            "sampleCount": 2,
-            "windowEndElapsedNs": end,
-            "state": "incomplete",
-            "nodes": {
-                node: {
-                    "state": "observed",
-                    "cgroupIdentity": metric["cgroupIdentity"],
-                    "lifetimeMemoryPeakBytes": 1000,
-                }
-                for node, metric in node_ids.items()
-            },
-            "tooling": {"tooling": {"state": "observed"}},
+            **resource_peaks.summarize(samples, 2, window_start_ns=start),
+            "windowEndElapsedNs": samples[-1]["finishedElapsedNs"],
+            "collectorToolingChargeElapsedFrom": "first-tooling-observation",
             "collectorToolingCharge": {
                 "tooling": {
-                    "state": "observed",
-                    "lifetimeMemoryPeakBytes": 1000,
-                    "memoryLimitBytes": 10000,
+                    **resource_peaks.summarize_cgroup(
+                        [counters(tooling_id, 0), counters(tooling_id, 12 * second)],
+                        max_gap_ns=14 * second,
+                    ),
+                    **account,
                 }
             },
-            "containers": attempts,
-            "sampledPressure": {"memoryFloorBreached": False, "diskFloorBreachedFilesystemIds": []},
-            "runtimeAttribution": {"state": "incomplete"},
         }
         records = [
-            {"record": "start"},
-            {"record": "window", **provenance, "windowStartUnixNs": start, "nodes": node_ids},
+            {"record": "start", "createdAtUnixNs": start - 1},
+            {
+                "record": "window",
+                **provenance,
+                "windowStartUnixNs": start,
+                "nodes": node_ids,
+                "stores": {"account/test": {"filesystemId": filesystem}},
+                "requestedDurationSeconds": 10,
+                "intervalSeconds": 2,
+            },
             *samples,
             peak,
         ]
@@ -486,11 +726,26 @@ class LifecycleFixture(contextlib.ExitStack):
     def pod(self, item):
         name = item["metadata"]["name"]
         kind = item["kind"]
+        uid = f"{name}-pod-{item['metadata']['generation']}"
+        started = self.pod_start_times.setdefault(
+            uid, datetime.now(UTC).isoformat().replace("+00:00", "Z")
+        )
+        init_status = [
+            {
+                "name": container["name"],
+                "restartCount": 0,
+                "containerID": "containerd://" + "a" * 64,
+                "state": {
+                    "terminated": {"exitCode": 0, "startedAt": started, "finishedAt": started}
+                },
+            }
+            for container in item["spec"]["template"]["spec"].get("initContainers", [])
+        ]
         return {
             "metadata": {
                 "name": name + "-pod",
                 "namespace": item["metadata"]["namespace"],
-                "uid": f"{name}-pod-{item['metadata']['generation']}",
+                "uid": uid,
                 "ownerReferences": [
                     {
                         "kind": kind if kind == "StatefulSet" else "ReplicaSet",
@@ -505,6 +760,7 @@ class LifecycleFixture(contextlib.ExitStack):
             "status": {
                 "phase": "Pending" if self.keep_pending else "Running",
                 "conditions": [] if self.keep_pending else [{"type": "Ready", "status": "True"}],
+                "initContainerStatuses": init_status,
                 "containerStatuses": [
                     {"name": name, "ready": True, "restartCount": 0, "state": {"running": {}}}
                 ],
@@ -601,6 +857,8 @@ class LifecycleFixture(contextlib.ExitStack):
             items = self.workflows
         elif resource == "applications.argoproj.io":
             items = self.applications
+        elif resource == "roles,rolebindings":
+            items = self.legacy_roles
         elif resource == "applicationsets.argoproj.io":
             items = self.application_sets
         else:

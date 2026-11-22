@@ -72,8 +72,8 @@ every operation. Choose a shared deadline with `--timeout-seconds` from 10 to
 |:--|:--|
 | `install` | Establish owned provider assets at zero replicas and observe the closed Workflow admission fence. |
 | `status` | Compare live owned workload and Pod identities with the private lifecycle receipt. |
-| `suspend` | Require terminal Workflows, close new Workflow admission and recheck, then observe each owned Pod disappear. |
-| `resume` | Check compatible Argo application state and worker headroom, restore the recorded replicas one component at a time, and observe actual Pod readiness before reopening new Workflow admission. |
+| `suspend` | Close new Workflow admission and freeze GitOps intent changes while observing each owned Pod disappear. Require terminal Workflows throughout. |
+| `resume` | Verify governing support, close new Workflow admission, and observe a native freeze on GitOps intent changes. Check compatible desired state and worker headroom, then restore and observe the recorded replicas before reopening admission. |
 
 Use `Succeeded`, `Failed` or `Error` as terminal Workflow phases. A missing
 phase, pending approval or ongoing execution prevents suspension. Close new
@@ -82,6 +82,13 @@ owned Pods and controller generations. A desired replica count alone supplies
 insufficient evidence. Resume rejects active operations, enabled automated
 sync and ApplicationSet state requiring separate review. Keep that state
 paused or resolve it through the reviewed deployment workflow before retrying.
+One provider-owned ConfigMap controls two native admission policies. The
+`restoring` mode keeps Workflow creation closed in the release namespace
+and denies top-level Application and ApplicationSet creation, updates and
+deletion in the selected GitOps namespace. Server-side dry runs check both
+kinds. The fully dormant `closed` mode permits reviewed GitOps corrections
+while Workflow creation stays closed. The `open` mode returns both scopes to
+their normal admission policies.
 
 ## Recovery
 
@@ -89,11 +96,20 @@ Keep `<target>.argo-lifecycle.json` in the target's private `.local` directory.
 Its phase and exact controller UIDs bind the same source, assets and target to
 the interrupted operation. If a deadline or interruption occurs, inspect
 `status` using the original selection and compare the receipt with the
-currently observed Pods. Repeat the pending operation with exact confirmation
-after resolving the reported prerequisite. A partial resume can be suspended
-again when Workflows remain terminal. An identity change requires explicit
-review. Keep provider secrets, release state, shared APIs and consumer
-resources in place while recovering.
+currently observed Pods. Resume checks the live governing ConfigMaps, RBAC,
+admission policies and bindings, and namespace ownership against the recorded
+UIDs and approved configuration. Install and every resume refuse a legacy
+`delegated-argocd` Role or RoleBinding in the selected workload namespaces.
+Resolve those grants through their owning workflow. Repeat the pending
+operation with exact confirmation after resolving the reported prerequisite.
+If GitOps state requires correction after a partial resume, explicitly
+suspend again while Workflows are terminal, wait for the observed
+`suspended` phase, then make the reviewed correction and retry. Recovery from
+`restoring-admission` reestablishes the freeze and checks the recorded
+Application identities and specs, terminal Workflows, current worker headroom
+and restored Pods before releasing the fence. An identity change requires
+explicit review. Keep provider secrets, release state, shared APIs and
+consumer resources in place while recovering.
 
 ## Disposable lifecycle and peak qualification
 
@@ -102,8 +118,7 @@ initial explicit resume. Run the [resource peak collector](minimal-resource-peak
 in its admitted tooling cgroup before another suspend/resume cycle. Use the
 same original admission request, source and host boot digest. One bounded
 choice for a 10-minute cycle uses `--duration-seconds 600 --interval-seconds 10`.
-Use a shorter interval or a neutral controlled phase when the reviewed startup
-can finish between samples. Confirm the collection window covers both operations
+Confirm the collection window covers both operations
 and retain its private JSONL receipt. Record actual controller termination and
 restoration with separately approved `suspend` and `resume` invocations.
 
@@ -119,7 +134,21 @@ uv run --locked --offline python -m scripts.minimal_argo qualify \
   --confirm-target qual-argo-01-local --execute
 ```
 
-Qualification requires receipt identity agreement, witnessed lifecycle and
-startup coverage, native peaks and tooling evidence from that window. Missing
-init observations, pressure or stale target evidence block qualification.
-Keep the private qualification receipt with the lifecycle and peak receipts.
+Qualification checks the complete requested sampling cadence and recomputes
+native summaries from the raw measurements. It requires witnessed controller
+termination and restoration, installed initializer completion with admitted
+resource bounds, native worker and control-plane lifetime memory peaks and
+interval CPU counters, measured tooling charge, sampled host and store
+pressure within the reviewed floors, and native evidence for each restored
+steady container. The raw collector can report unrelated attribution gaps or
+missing native records for the intentionally terminated old Pods.
+
+A short initializer can finish and lose its runtime cgroup between scans.
+The scoped `qualified` lifecycle result retains the installed init completion
+and exact bounds, and reports missing per-init native peaks and the actual
+sampled overlap status separately. Unavailable or partial initializer peak
+coverage supplies no numerical per-init peak evidence. Missing installed init
+completion, incomplete relevant native evidence, breached pressure floors or
+stale target evidence blocks the scoped result. All receipts carry
+`installedAcceptance: false`. Keep the private qualification receipt with
+the lifecycle and peak receipts.

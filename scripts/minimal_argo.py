@@ -23,6 +23,7 @@ from . import (
     minimal_argo_assets,
     minimal_argo_fence,
     minimal_argo_qualification,
+    peak_observation,
     resource_peaks,
 )
 from . import consumer_runtime as runtime
@@ -38,6 +39,14 @@ from .network_resources import EXTRA_MEMORY, ROLE, SYSTEM, normalized, pod_bound
 
 SCHEMA = "minimal-argo-lifecycle.v1"
 ACTIONS = ("install", "suspend", "resume", "status", "qualify")
+GOVERNING_KINDS = {
+    "Namespace",
+    "ConfigMap",
+    "Role",
+    "RoleBinding",
+    "ValidatingAdmissionPolicy",
+    "ValidatingAdmissionPolicyBinding",
+}
 INSTALLATION = "k8s-infrastructure.io/argo-lifecycle-installation"
 
 
@@ -214,6 +223,50 @@ def pod_ready(target: Target, workload: dict, pod: dict) -> bool:
     return True
 
 
+def restored_initializers(
+    target: Target, pods: dict[str, list[dict]], restored: dict
+) -> list[dict]:
+    initializers = []
+    for name, items in pods.items():
+        if [pod["metadata"]["uid"] for pod in items] != restored[name]:
+            raise ValueError("Argo Pods changed while recording installed initializers")
+        for pod in items:
+            statuses = {
+                item["name"]: item for item in pod["status"].get("initContainerStatuses", [])
+            }
+            for init in pod["spec"].get("initContainers", []):
+                status = statuses[init["name"]]
+                terminated = status.get("state", {}).get("terminated", {})
+                attempt = peak_observation.attempt(
+                    {"terminated": terminated}, status.get("containerID")
+                )
+                if (
+                    pod["spec"].get("nodeName") != f"{target.name}-worker"
+                    or init.get("restartPolicy") == "Always"
+                    or status.get("restartCount") != 0
+                    or terminated.get("exitCode") != 0
+                    or attempt["startedAtNs"] is None
+                    or attempt["finishedAtNs"] is None
+                ):
+                    raise ValueError(
+                        "Restored Argo initializer has no successful installed lifecycle"
+                    )
+                initializers.append(
+                    {
+                        "controller": name,
+                        "namespace": pod["metadata"]["namespace"],
+                        "node": pod["spec"]["nodeName"],
+                        "podUid": pod["metadata"]["uid"],
+                        "containerName": init["name"],
+                        "image": init["image"],
+                        "resources": init["resources"],
+                        "exitCode": terminated["exitCode"],
+                        **attempt,
+                    }
+                )
+    return sorted(initializers, key=lambda row: (row["controller"], row["containerName"]))
+
+
 def checked_pod(template: dict, admitted: dict) -> dict:
     if (
         admitted.get("nodeSelector") != template["nodeSelector"]
@@ -387,7 +440,13 @@ def suspend(target: Target, delegation: Delegation, receipt: dict) -> dict:
             history={"suspendStartedAtUnixNs": time.time_ns(), "previousPods": before},
         )
         save_receipt(receipt_path(target), receipt)
-    minimal_argo_fence.set_closed(target, delegation, True, expected_uid=receipt["fenceUID"])
+    minimal_argo_fence.set_closed(
+        target,
+        delegation,
+        True,
+        expected_uid=receipt["fenceUID"],
+        freeze_gitops=phase != "suspended",
+    )
     if phase != "suspended":
         for name in reversed(list(minimal_argo_assets.controller_names(delegation))):
             terminal_workflows(target, delegation)
@@ -396,16 +455,19 @@ def suspend(target: Target, delegation: Delegation, receipt: dict) -> dict:
             scale(target, current[name], 0)
     stopped = wait(target, delegation, receipt, dict.fromkeys(live, 0))
     terminal_workflows(target, delegation)
+    if phase != "suspended":
+        minimal_argo_fence.set_closed(target, delegation, True, expected_uid=receipt["fenceUID"])
     receipt["phase"] = "suspended"
     receipt["history"].setdefault("suspendCompletedAtUnixNs", time.time_ns())
     save_receipt(receipt_path(target), receipt)
     return summary(target, receipt, stopped)
 
 
-def reviewed_applications(target: Target, delegation: Delegation) -> None:
+def reviewed_applications(target: Target, delegation: Delegation) -> str:
     # ApplicationSets can rewrite generated Application intent at controller start.
     if resources(target, delegation.gitops, "applicationsets.argoproj.io"):
         raise ValueError("ApplicationSet reconciliation requires a separately reviewed phase")
+    reviewed = {}
     for item in resources(target, delegation.gitops, "applications.argoproj.io"):
         automated = item.get("spec", {}).get("syncPolicy", {}).get("automated")
         if automated is not None and automated.get("enabled") is not False:
@@ -418,6 +480,11 @@ def reviewed_applications(target: Target, delegation: Delegation) -> None:
             and operation.get("phase") not in {"Succeeded", "Failed", "Error"}
         ):
             raise ValueError("Application operation or deletion remains in progress")
+        uid = item["metadata"].get("uid")
+        if not uid or uid in reviewed:
+            raise ValueError("Application inventory lacks unique identities")
+        reviewed[uid] = item["spec"]
+    return digest(reviewed)
 
 
 def live_worker_pods(target: Target) -> list[dict]:
@@ -494,28 +561,65 @@ def resume(target: Target, delegation: Delegation, receipt: dict) -> dict:
         type(count) is not int or count not in (0, 1) for count in intent.values()
     ):
         raise ValueError("Argo recovery receipt does not identify the exact prior replicas")
+    verify_governing_support(target, delegation, receipt)
     if phase == "running":
         return summary(target, receipt, wait(target, delegation, receipt, intent))
+    minimal_argo_fence.set_closed(
+        target, delegation, True, expected_uid=receipt["fenceUID"], freeze_gitops=True
+    )
+    applications = reviewed_applications(target, delegation)
+    terminal_workflows(target, delegation)
     if phase != "restoring-admission":
-        restore_controllers(target, delegation, receipt, live)
+        restore_controllers(target, delegation, receipt, live, applications)
     restored = wait(target, delegation, receipt, intent)
+    current = inventory(target, delegation, receipt)
+    pods = controller_pods(target, delegation, current)
+    if observation(target, current, pods) != restored:
+        raise ValueError("Argo Pods changed after the recorded restoration")
+    if receipt["history"]["restoredInitializers"] != restored_initializers(
+        target, pods, receipt["history"]["restoredPods"]
+    ):
+        raise ValueError("Installed Argo initializer evidence changed after restoration")
     if receipt["history"]["restoredPods"] != {
         name: item["pods"] for name, item in restored.items()
     }:
         raise ValueError("Argo Pods changed after the recorded restoration")
-    if all(intent[name] for name in ("argo-server", "workflow-controller")):
-        minimal_argo_fence.set_closed(target, delegation, False, expected_uid=receipt["fenceUID"])
+    verify_governing_support(target, delegation, receipt)
+    check_worker_fit(target)
+    check_restore_preconditions(target, delegation, receipt["applicationDigest"])
+    minimal_argo_fence.set_closed(
+        target,
+        delegation,
+        not all(intent[name] for name in ("argo-server", "workflow-controller")),
+        expected_uid=receipt["fenceUID"],
+    )
     receipt["phase"] = "running"
     receipt["history"]["resumeCompletedAtUnixNs"] = time.time_ns()
     save_receipt(receipt_path(target), receipt)
     return summary(target, receipt, restored)
 
 
-def restore_controllers(target: Target, delegation: Delegation, receipt: dict, live: dict) -> None:
+def check_restore_preconditions(target: Target, delegation: Delegation, applications: str) -> None:
+    if reviewed_applications(target, delegation) != applications:
+        raise ValueError("Application desired state changed during fenced Argo restoration")
+    terminal_workflows(target, delegation)
+
+
+def check_replica_checkpoint(
+    live: dict, completed: dict, pending: str | None, intent: dict
+) -> None:
+    for name, workload in live.items():
+        replicas = workload["spec"]["replicas"]
+        allowed = {0, intent[name]} if name == pending else {completed.get(name, 0)}
+        if replicas not in allowed:
+            raise ValueError("Argo replica intent changed outside the recorded restoration")
+
+
+def restore_controllers(
+    target: Target, delegation: Delegation, receipt: dict, live: dict, applications: str
+) -> None:
     phase = receipt["phase"]
     intent = receipt["restoreReplicas"]
-    reviewed_applications(target, delegation)
-    terminal_workflows(target, delegation)
     nodes = runtime.node_identity(target)
     runtime.verify_nodes(nodes, profile=target.profile)
     worker = nodes[f"{target.name}-worker"]
@@ -524,12 +628,17 @@ def restore_controllers(target: Target, delegation: Delegation, receipt: dict, l
         [{**worker, "name": f"{target.name}-worker"}],
         {"worker": list(minimal_argo_assets.required_images())},
     )
-    minimal_argo_fence.set_closed(target, delegation, True, expected_uid=receipt["fenceUID"])
     if phase == "suspended":
         wait(target, delegation, receipt, dict.fromkeys(live, 0))
-        receipt.update(phase="resuming", startupPending=None, startupCompleted=[])
+        receipt.update(
+            phase="resuming",
+            startupPending=None,
+            startupCompleted=[],
+            applicationDigest=applications,
+        )
         receipt["history"]["resumeStartedAtUnixNs"] = time.time_ns()
         save_receipt(receipt_path(target), receipt)
+    check_restore_preconditions(target, delegation, receipt["applicationDigest"])
     order = list(minimal_argo_assets.controller_names(delegation))
     recorded = receipt["startupCompleted"]
     if recorded != order[: len(recorded)] or receipt["startupPending"] not in [
@@ -542,24 +651,19 @@ def restore_controllers(target: Target, delegation: Delegation, receipt: dict, l
         wait(target, delegation, receipt, completed)
     for name in order[len(recorded) :]:
         live = inventory(target, delegation, receipt)
-        if any(live[key]["spec"]["replicas"] != count for key, count in completed.items()):
-            raise ValueError("An already restored Argo controller changed before startup completed")
+        check_replica_checkpoint(live, completed, receipt["startupPending"], intent)
         workload = live[name]
-        if workload["spec"]["replicas"] > intent[name] or (
-            workload["spec"]["replicas"] and receipt["startupPending"] != name
-        ):
-            raise ValueError("Argo replica intent changed outside the recorded restoration")
         if workload["spec"]["replicas"] < intent[name]:
             wait(target, delegation, receipt, {**completed, name: 0})
-            reviewed_applications(target, delegation)
-            terminal_workflows(target, delegation)
+            check_restore_preconditions(target, delegation, receipt["applicationDigest"])
             check_worker_fit(target, admit_pod(target, workload))
             receipt["startupPending"] = name
             save_receipt(receipt_path(target), receipt)
-            current = inventory(target, delegation, receipt)[name]
-            if current["spec"]["replicas"] != 0:
+            current = inventory(target, delegation, receipt)
+            check_replica_checkpoint(current, completed, name, intent)
+            if current[name]["spec"]["replicas"] != 0:
                 raise ValueError("Argo replica intent changed before the startup patch")
-            scale(target, current, intent[name])
+            scale(target, current[name], intent[name])
         completed[name] = intent[name]
         wait(target, delegation, receipt, completed)
         receipt["startupPending"] = None
@@ -567,8 +671,16 @@ def restore_controllers(target: Target, delegation: Delegation, receipt: dict, l
         save_receipt(receipt_path(target), receipt)
     check_worker_fit(target)
     restored = wait(target, delegation, receipt, intent)
+    current = inventory(target, delegation, receipt)
+    pods = controller_pods(target, delegation, current)
+    if observation(target, current, pods) != restored:
+        raise ValueError("Argo Pods changed before recording restoration")
+    restored_uids = {name: item["pods"] for name, item in restored.items()}
+    receipt["history"].update(
+        restoredPods=restored_uids,
+        restoredInitializers=restored_initializers(target, pods, restored_uids),
+    )
     receipt["phase"] = "restoring-admission"
-    receipt["history"]["restoredPods"] = {name: item["pods"] for name, item in restored.items()}
     save_receipt(receipt_path(target), receipt)
 
 
@@ -586,17 +698,93 @@ def check_installed_document(expected: dict, actual: dict) -> None:
     for key in ("spec", "data", "rules", "subjects", "roleRef"):
         if key in expected and not contains(expected[key], actual.get(key)):
             raise ValueError("Existing Argo specification differs from the reviewed installation")
-    if expected["kind"] == "ConfigMap" and expected.get("data", {}) != actual.get("data", {}):
+    if expected["kind"] == "ConfigMap" and (
+        any(expected.get(key, {}) != actual.get(key, {}) for key in ("data", "binaryData"))
+        or expected.get("immutable", False) != actual.get("immutable", False)
+    ):
         raise ValueError("Existing Argo configuration differs from the reviewed installation")
+
+
+def refuse_legacy_grants(target: Target, delegation: Delegation) -> None:
+    for namespace in delegation.workload_namespaces:
+        if any(
+            item["metadata"]["name"] == "delegated-argocd"
+            for item in resources(target, namespace, "roles,rolebindings")
+        ):
+            raise ValueError("Remove the reviewed legacy delegated-argocd grant before proceeding")
+
+
+def governing_digest(item: dict) -> str:
+    body = {key: value for key, value in item.items() if key not in {"metadata", "status"}}
+    if reference(item)[:2] == ("ConfigMap", minimal_argo_fence.FENCE_CONFIG):
+        body.pop("data", None)
+    return digest({"body": body, "labels": item["metadata"].get("labels", {})})
+
+
+def governing_anchors(target: Target, support: list[dict]) -> list[dict]:
+    documents = [item for item in support if item["kind"] in GOVERNING_KINDS]
+    found = delegated_argo_runtime.read_resources(target, documents)
+    anchors = []
+    for item in documents:
+        actual = found.get(reference(item))
+        if actual is None or not actual["metadata"].get("uid"):
+            raise ValueError("Reviewed Argo governing support is missing")
+        check_installed_document(item, actual)
+        anchors.append(
+            {
+                "resource": {
+                    "apiVersion": item["apiVersion"],
+                    "kind": item["kind"],
+                    "metadata": {
+                        key: value
+                        for key, value in item["metadata"].items()
+                        if key in {"name", "namespace"}
+                    },
+                },
+                "uid": actual["metadata"]["uid"],
+                "digest": governing_digest(actual),
+            }
+        )
+    return anchors
+
+
+def verify_governing_support(target: Target, delegation: Delegation, receipt: dict) -> None:
+    refuse_legacy_grants(target, delegation)
+    namespaces = delegated_argo_runtime.namespaces_delegated(target, delegation)
+    if receipt["consumerNamespaces"] != namespaces:
+        raise ValueError("Consumer namespace UIDs differ from Argo lifecycle receipt")
+    anchors = receipt["governingSupport"]
+    documents = [anchor["resource"] for anchor in anchors]
+    if any(item["kind"] not in GOVERNING_KINDS for item in documents):
+        raise ValueError("Invalid Argo governing support receipt")
+    found = delegated_argo_runtime.read_resources(target, documents)
+    for anchor in anchors:
+        actual = found.get(reference(anchor["resource"]))
+        if (
+            actual is None
+            or actual["metadata"].get("uid") != anchor["uid"]
+            or actual["metadata"].get("deletionTimestamp")
+            or governing_digest(actual) != anchor["digest"]
+        ):
+            raise ValueError("Argo governing support drifted from the lifecycle receipt")
+    if minimal_argo_fence.read_fence(target, delegation)["metadata"]["uid"] != receipt["fenceUID"]:
+        raise ValueError("Recorded Argo lifecycle fence is missing or has a different UID")
+    delegated_argo_runtime.verify_admission(target, documents)
 
 
 def prepare(target: Target, delegation: Delegation, receipt: dict) -> dict:
     if receipt.get("phase") == "suspended" and "resumeStartedAtUnixNs" not in receipt["history"]:
+        verify_governing_support(target, delegation, receipt)
         return suspend(target, delegation, receipt)
     if receipt.get("phase") not in {None, "installing"}:
         raise ValueError("Argo already prepared; use an explicit lifecycle action")
     runtime.read_readiness(target)
-    delegated_argo_runtime.namespaces_delegated(target, delegation)
+    refuse_legacy_grants(target, delegation)
+    namespaces = delegated_argo_runtime.namespaces_delegated(target, delegation)
+    if "fenceUID" in receipt:
+        verify_governing_support(target, delegation, receipt)
+    elif receipt.get("consumerNamespaces", namespaces) != namespaces:
+        raise ValueError("Consumer namespace UIDs differ from Argo lifecycle receipt")
     shared, documents = render(
         delegation, delegated_argo_config.download_assets(), minimal=True, networking=True
     )
@@ -609,6 +797,7 @@ def prepare(target: Target, delegation: Delegation, receipt: dict) -> dict:
             phase="installing",
             installation=str(uuid4()),
             controllers={},
+            consumerNamespaces=namespaces,
             restoreReplicas={
                 item["metadata"]["name"]: item["spec"]["replicas"] for item in workloads
             },
@@ -666,7 +855,10 @@ def prepare(target: Target, delegation: Delegation, receipt: dict) -> dict:
     fence_uid = minimal_argo_fence.read_fence(target, delegation)["metadata"]["uid"]
     if receipt.get("fenceUID", fence_uid) != fence_uid:
         raise ValueError("Argo Workflow fence identity changed during dormant installation")
-    receipt["fenceUID"] = fence_uid
+    anchors = governing_anchors(target, support)
+    if receipt.get("governingSupport", anchors) != anchors:
+        raise ValueError("Argo governing support changed during dormant installation")
+    receipt.update(fenceUID=fence_uid, governingSupport=anchors)
     save_receipt(receipt_path(target), receipt)
     minimal_argo_fence.set_closed(target, delegation, True, expected_uid=fence_uid)
     for item in dormant:
@@ -715,7 +907,8 @@ def qualify(
     if not target.consumer.startswith("qual-") or receipt["phase"] != "running":
         raise ValueError("Argo qualification requires a running disposable qual- target")
     current = inventory(target, delegation, receipt)
-    current_pods = observation(target, current, controller_pods(target, delegation, current))
+    pods = controller_pods(target, delegation, current)
+    current_pods = observation(target, current, pods)
     history = receipt["history"]
     if (
         not {
@@ -725,12 +918,17 @@ def qualify(
             "resumeCompletedAtUnixNs",
             "previousPods",
             "restoredPods",
+            "restoredInitializers",
         }
         <= history.keys()
         or any(not state["observed"] for state in current_pods.values())
         or history["restoredPods"] != {name: entry["pods"] for name, entry in current_pods.items()}
     ):
         raise ValueError("Require an observed suspend/resume cycle with the same restored Pods")
+    if history["restoredInitializers"] != restored_initializers(
+        target, pods, history["restoredPods"]
+    ):
+        raise ValueError("Installed Argo initializer evidence differs from the observed cycle")
     validated_path = Path(os.path.abspath(path))
     if validated_path.parent != target.directory or validated_path.suffix != ".jsonl":
         raise ValueError("Use an existing private peak receipt in the exact target directory")
@@ -741,10 +939,15 @@ def qualify(
     window, samples, peak, checksum = minimal_argo_qualification.peak_records(
         target, validated_path, measurement.provenance
     )
-    evidence = minimal_argo_qualification.assess(target, history, current, window, samples, peak)
+    evidence = minimal_argo_qualification.assess(
+        target, history, current, window, samples, peak, measurement.initial_tooling
+    )
     check_failure_events(target)
     final = inventory(target, delegation, receipt)
-    if current_pods != observation(target, final, controller_pods(target, delegation, final)):
+    final_pods = controller_pods(target, delegation, final)
+    if current_pods != observation(target, final, final_pods) or history[
+        "restoredInitializers"
+    ] != restored_initializers(target, final_pods, history["restoredPods"]):
         raise ValueError("Argo controller Pods changed while qualifying the observed cycle")
     phase = "incomplete" if evidence["reasons"] else "qualified"
     output = target.directory / f"{target.name}.argo-qualification.{window['collectionId']}.json"
@@ -774,6 +977,7 @@ def qualify(
         "incarnation": receipt["incarnation"],
         "qualificationEvidence": output.name,
         "reasons": evidence["reasons"],
+        "initializerNativePeakCoverage": evidence["initializerNativePeakCoverage"],
         "installedAcceptance": False,
     }
 
