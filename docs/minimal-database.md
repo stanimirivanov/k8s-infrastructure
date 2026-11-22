@@ -78,8 +78,11 @@ The gate uses the pinned cert-manager, CNPG and Barman resources. It observes
 controller startup on the worker, waits for the reviewed Barman issuer and
 client/server certificates, and exercises CNPG admission with a server dry-run.
 It creates a new self-signed certificate after replacing the cert-manager
-controller to confirm that issuance resumes. The probe creates no PostgreSQL
-instance, PVC or Barman backup.
+controller to confirm that issuance resumes. After replacing the CA injector,
+it verifies injection of the public API server CA into a fresh webhook
+configuration with an empty rule list. The provider's admission rules remain
+in effect throughout. The probe creates no PostgreSQL instance, PVC or Barman
+backup.
 
 Replacement proceeds one controller at a time. The old Pod must terminate
 before the replacement starts. Server dry-run and live Pod inspection check the
@@ -96,8 +99,7 @@ private `.local` directory. Use its last completed phase and sanitized failure
 details to distinguish an identity or host admission refusal, missing image,
 controller readiness failure, certificate failure or replacement failure. A
 failure during replacement can leave the selected Deployment scaled to zero.
-Keep
-the detailed state and kubeconfig private. A failed smaller allocation blocks
+Keep the detailed state and kubeconfig private. A failed smaller allocation blocks
 qualification. Use a newly admitted disposable target after reviewing a fix.
 
 Removal requires separate authorization and exact confirmation. This command
