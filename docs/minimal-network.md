@@ -117,7 +117,8 @@ physical CPU cap.
 The gate applies common APIs and supporting resources, then waits for both
 agents and witnessed initializer completion before starting Envoy. The Kubernetes
 host-scope IPAM agent consumes `Node.spec.podCIDRs` from Kubernetes. The pinned
-agent serves xDS and checks the external Envoy version asynchronously. Next the
+agent serves xDS and checks the external Envoy version asynchronously. Envoy
+requires same-node agent affinity. Next the
 gate starts the worker operator, then verifies GatewayClass and foundation
 readiness before creating four bounded neutral Pods. No automatic DaemonSet
 rollout is enabled. The operator uses `Recreate`. The resource report checks

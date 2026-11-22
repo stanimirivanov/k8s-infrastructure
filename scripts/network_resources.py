@@ -144,6 +144,7 @@ def configure(target: Target, controllers: dict[str, dict]) -> None:
         for c in initial:
             c["resources"] = selection()["init"][c["name"]]
         pod["nodeSelector"] = {
+            **pod.get("nodeSelector", {}),
             LABEL: target.consumer,
             **({ROLE: "worker"} if name == "cilium-operator" else {}),
         }
@@ -151,7 +152,6 @@ def configure(target: Target, controllers: dict[str, dict]) -> None:
             spec["strategy"] = {"type": "Recreate"}
         else:
             spec["updateStrategy"] = {"type": "OnDelete"}
-        pod["automountServiceAccountToken"] = True
 
 
 def stage_fit(
