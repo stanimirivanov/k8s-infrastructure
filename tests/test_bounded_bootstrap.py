@@ -9,6 +9,62 @@ from scripts.node_capacity import envelope
 
 
 class ProfileTests(unittest.TestCase):
+    def test_node_observation_reads_docker_scope_above_systemd_init(self):
+        from unittest.mock import patch
+
+        from scripts import minimal_bootstrap as bootstrap
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = Target("qual-cold", "default", root, "minimal-demo")
+            node_id = "a" * 64
+            node = f"{target.name}-control-plane"
+            memory = 4 * 1024**3
+            scope = root / "system.slice" / f"docker-{node_id}.scope"
+            (scope / "init.scope").mkdir(parents=True)
+            for name, data in {
+                "cpu.max": "200000 100000\n",
+                "memory.max": str(memory),
+                "memory.swap.max": "0",
+                "pids.max": "2048",
+                "memory.peak": "65536",
+                "memory.events": "oom 0\noom_kill 0\n",
+                "cpu.stat": "usage_usec 1234\n",
+            }.items():
+                (scope / name).write_text(data, encoding="utf-8")
+            read_text = Path.read_text
+            journal = {
+                "id": node_id,
+                "name": node,
+                "role": "control-plane",
+                "startRequestedAt": 1_000_000_000,
+                "startCompletedAt": 1_000_000_000,
+            }
+
+            def read(path: Path, *args, **kwargs) -> str:
+                if path == Path("/proc/123/cgroup"):
+                    return f"0::/{scope.relative_to(root)}/init.scope\n"
+                return read_text(path, *args, **kwargs)
+
+            with (
+                patch.object(bootstrap.host, "CGROUP_ROOT", root),
+                patch.object(Path, "read_text", read),
+                patch.object(bootstrap.runtime, "inspect_node", return_value={"swap": memory}),
+                patch.object(bootstrap.runtime, "verify_nodes"),
+                patch.object(
+                    bootstrap.runtime,
+                    "command",
+                    return_value='{"running":true,"restarts":0,"pid":123,"startedAt":"1970-01-01T00:00:01Z"}',
+                ),
+            ):
+                evidence = bootstrap.node_metrics(target, [journal])[node]
+            self.assertEqual(evidence["memoryPeakBytes"], 65536)
+            self.assertEqual(evidence["cpuStat"], {"usage_usec": 1234})
+            self.assertEqual(
+                evidence["cgroupIdentity"],
+                bootstrap.admission.digest([scope.stat().st_dev, scope.stat().st_ino]),
+            )
+
     def test_minimal_https_listener_is_opt_in_loopback_and_bound_to_owner(self):
         import yaml
 

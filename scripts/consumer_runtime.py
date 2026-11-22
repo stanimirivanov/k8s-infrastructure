@@ -200,8 +200,9 @@ def verify_listener(target: Target, node: dict) -> None:
             raise ValueError("Network profile API listener is not exclusively loopback")
 
 
-def verify_context(target: Target) -> None:
-    expected = yaml.safe_load(command(target, ["kind", "get", "kubeconfig", "--name", target.name]))
+def verify_context(target: Target) -> str:
+    configuration = command(target, ["kind", "get", "kubeconfig", "--name", target.name])
+    expected = yaml.safe_load(configuration)
     actual = yaml.safe_load(read_bounded(target.path("kubeconfig")))
     if (
         not isinstance(expected, dict)
@@ -210,6 +211,7 @@ def verify_context(target: Target) -> None:
         or actual != expected
     ):
         raise ValueError("Dedicated consumer kubeconfig does not match the exact kind target")
+    return configuration
 
 
 def incarnation(target: Target) -> str:

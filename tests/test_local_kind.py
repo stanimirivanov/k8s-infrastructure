@@ -1,11 +1,13 @@
 import io
 import json
 import os
+import select
+import signal
 import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stdout, suppress
 from pathlib import Path
 from unittest.mock import patch
 
@@ -124,6 +126,53 @@ class ClusterTests(unittest.TestCase):
             run(["kubectl"])
 
         terminate.assert_called_once_with(process)
+
+    @unittest.skipUnless(sys.platform == "linux", "native Linux process group boundary")
+    def test_caller_interruption_terminates_the_owned_process_group(self):
+        fixture = """
+import os
+import signal
+import sys
+import time
+from pathlib import Path
+sys.stdin.buffer.read(1)
+child = os.fork()
+if not child:
+    time.sleep(5)
+    sys.exit(0)
+Path(sys.argv[1]).write_text(f"{os.getpid()} {child}")
+os.kill(os.getppid(), signal.SIGUSR1)
+time.sleep(0.2)
+"""
+        for interruption in (TimeoutError, KeyboardInterrupt):
+            with (
+                self.subTest(interruption=interruption),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                ready = Path(directory) / "ready"
+
+                def interrupted(_number, _frame, error=interruption):
+                    raise error
+
+                previous = signal.signal(signal.SIGUSR1, interrupted)
+                try:
+                    with redirect_stdout(io.StringIO()), self.assertRaises(interruption):
+                        run([sys.executable, "-c", fixture, str(ready)], input_data=b"x")
+                    _, child = map(int, ready.read_text().split())
+                    try:
+                        descriptor = os.pidfd_open(child)
+                    except ProcessLookupError:
+                        continue
+                    try:
+                        self.assertTrue(select.select([descriptor], [], [], 1)[0])
+                    finally:
+                        os.close(descriptor)
+                finally:
+                    signal.signal(signal.SIGUSR1, previous)
+                    if ready.exists():
+                        leader, _ = map(int, ready.read_text().split())
+                        with suppress(ProcessLookupError):
+                            os.killpg(leader, signal.SIGKILL)
 
     def test_invalid_stdout_fails_without_false_completion(self):
         captured = io.StringIO()

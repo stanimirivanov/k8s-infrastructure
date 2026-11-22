@@ -131,24 +131,28 @@ def run(
         env={**environment, "KIND_EXPERIMENTAL_PROVIDER": "docker"},
         start_new_session=True,
     ) as process:
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                terminate(process)
-                raise CommandFailure(
-                    f"{label} timed out after {timeout}s; inspect the local target", timed_out=True
-                )
-            try:
-                stdout, stderr = process.communicate(
-                    input=input_data,
-                    timeout=min(PROGRESS_INTERVAL, remaining),
-                )
-                break
-            except subprocess.TimeoutExpired:
-                # communicate() retains pending input; never submit credentials twice.
-                input_data = None
-                elapsed = int(time.monotonic() - started)
-                print(f"Still running {label} command ({elapsed}s elapsed)...", flush=True)
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise CommandFailure(
+                        f"{label} timed out after {timeout}s; inspect the local target",
+                        timed_out=True,
+                    )
+                try:
+                    stdout, stderr = process.communicate(
+                        input=input_data,
+                        timeout=min(PROGRESS_INTERVAL, remaining),
+                    )
+                    break
+                except subprocess.TimeoutExpired:
+                    # communicate() retains pending input; never submit credentials twice.
+                    input_data = None
+                    elapsed = int(time.monotonic() - started)
+                    print(f"Still running {label} command ({elapsed}s elapsed)...", flush=True)
+        except BaseException:
+            terminate(process)
+            raise
     if process.returncode:
         # Never echo a kubeconfig or captured authentication data.
         raise CommandFailure(
