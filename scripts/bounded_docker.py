@@ -211,6 +211,12 @@ def intercept(args: list[str], selection: dict, invoke: Callable[[list[str]], st
         invoke(["start", container_id])
     receipt.update(phase="started", startCompletedAt=time.time_ns())
     write_receipt(path, receipt)
+    if "httpsPort" in selection and node["role"] == "control-plane":
+        from .minimal_foundation import prepare_control_plane
+
+        # kind waits for this intercepted run to return before invoking kubeadm.
+        with failure.phase("bounded-foundation", "dependency-failure"):
+            prepare_control_plane(container_id, invoke)
     return container_id + "\n"
 
 

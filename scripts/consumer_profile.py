@@ -168,6 +168,10 @@ def configuration(target: Target) -> dict[str, Any]:
                 "protocol": "TCP",
             }
         ]
+        if target.profile == MINIMAL_PROFILE:
+            from .minimal_foundation import kubeadm_configuration
+
+            result["kubeadmConfigPatches"] = [kubeadm_configuration()]
     return result
 
 
