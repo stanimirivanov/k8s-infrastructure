@@ -13,7 +13,11 @@ from .kubernetes import reference as reference
 
 
 def render(
-    delegation: Delegation, assets: dict[str, list[dict]], *, networking: bool = False
+    delegation: Delegation,
+    assets: dict[str, list[dict]],
+    *,
+    networking: bool = False,
+    minimal: bool = False,
 ) -> tuple[list[dict], list[dict]]:
     """Never install the cluster-wide CD manifest; extract only its three CRDs."""
     shared = [
@@ -59,6 +63,22 @@ def render(
         delegation,
         next(item for item in shared if item["metadata"]["name"] == "workflows.argoproj.io"),
     )
+    if minimal:
+        from .minimal_argo_assets import bound_controllers
+        from .minimal_argo_fence import documents_for
+
+        # Minimal-demo workload authority is separately reviewed and must not
+        # inherit the legacy application controller's broad workload grant.
+        documents = [
+            item
+            for item in documents
+            if not (
+                item["kind"] in {"Role", "RoleBinding"}
+                and item["metadata"]["name"] == "delegated-argocd"
+            )
+        ]
+        bound_controllers(delegation, documents)
+        documents += documents_for(delegation)
     return shared, stamp(documents, delegation)
 
 

@@ -16,7 +16,8 @@ from .consumer_profile import Target
 from .consumer_state import read_bounded
 from .local_kind import ROOT
 
-SELECTION = ROOT / "clusters/local-kind/isolated-local/addons/argo/releases.json"
+SELECTION_PATH = Path("clusters/local-kind/isolated-local/addons/argo/releases.json")
+SELECTION = ROOT / SELECTION_PATH
 OWNER = "k8s-infrastructure"
 LABEL = "k8s-infrastructure.io/consumer"
 MAX_BYTES = 16 * 1024 * 1024

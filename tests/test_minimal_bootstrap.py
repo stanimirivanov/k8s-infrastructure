@@ -41,15 +41,16 @@ class AdmissionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "alias"):
             bootstrap.verify_stores(value, observed, {})
 
-    def test_network_or_database_pins_change_refuses_prior_artifact_before_provider_access(self):
+    def test_provider_pins_change_refuses_prior_artifact_before_provider_access(self):
         from tempfile import TemporaryDirectory
         from unittest.mock import patch
 
         from scripts.database_assets import RELEASE_PATH
+        from scripts.delegated_argo_config import SELECTION_PATH
         from tests.test_host_admission import request
 
         target = Target("qual-demo", "default", Path("/tmp"), "minimal-demo", 18443)
-        selections = (bootstrap.NETWORK_RELEASE_PATH, RELEASE_PATH)
+        selections = (bootstrap.NETWORK_RELEASE_PATH, RELEASE_PATH, SELECTION_PATH)
         for changed in selections:
             with self.subTest(changed=changed), TemporaryDirectory() as root:
                 with patch.object(bootstrap, "ROOT", Path(root)):

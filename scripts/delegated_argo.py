@@ -32,10 +32,10 @@ def main(argv: list[str] | None = None) -> int:
             from .delegated_argo_config import Delegation
             from .delegated_argo_render import render
 
-            render(
-                Delegation("validation", ("validation-apps",), ("reviewed-template",)),
-                download_assets(),
-            )
+            delegation = Delegation("validation", ("validation-apps",), ("reviewed-template",))
+            assets = download_assets()
+            render(delegation, assets)
+            render(delegation, assets, networking=True, minimal=True)
             print("Delegated Argo assets verified by SHA-256; no cluster access.")
             return 0
         if any(
