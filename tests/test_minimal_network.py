@@ -173,7 +173,7 @@ class MinimalNetworkTests(unittest.TestCase):
             {"name": name, "resources": network_resources.resources(100, 1000, memory, memory)}
             for name, memory in network_resources.INIT.items()
         ]
-        spec = {"containers": [app], "initContainers": initial}
+        spec: dict = {"containers": [app], "initContainers": initial}
         bounds = network_resources.pod_bounds(spec)
         self.assertEqual(list(bounds["containers"]), [app["name"], *network_resources.INIT])
         self.assertEqual(bounds["effectiveLimits"]["memory"], 1024 * 1024**2)
