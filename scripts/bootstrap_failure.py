@@ -7,6 +7,10 @@ from contextlib import contextmanager
 from .local_kind import CommandFailure
 
 
+class IdentityMismatch(ValueError):
+    """An exact target identity differs from its verified reference."""
+
+
 class Failure(ValueError):
     def __init__(self, evidence: dict) -> None:
         self.evidence = evidence
@@ -17,7 +21,9 @@ def evidence(error: BaseException, phase: str, category: str = "internal-defect"
     if isinstance(error, Failure):
         return error.evidence
     result = {"category": category, "phase": phase}
-    if isinstance(error, CommandFailure):
+    if isinstance(error, IdentityMismatch):
+        result["category"] = "identity-mismatch"
+    elif isinstance(error, CommandFailure):
         if error.timed_out:
             result.update(category="timeout", timedOut=True)
         else:

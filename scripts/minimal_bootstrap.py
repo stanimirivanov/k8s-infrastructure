@@ -34,7 +34,7 @@ def validate_request(target, request: dict, artifact_digest: str) -> None:
     """Bind the fresh admission to this artifact and the full enclosing node budget."""
     admission.validate(request)
     if request["target"] != target.name or request["artifactDigest"] != artifact_digest:
-        raise ValueError("Admission target/artifact mismatch")
+        raise failure.IdentityMismatch("Admission target/artifact mismatch")
     workloads = [item for item in request["memory"] if item["kind"] == "workload"]
     if sum(item["limitBytes"] for item in workloads) != 12 * admission.GIB or any(
         "cgroup" in item for item in workloads

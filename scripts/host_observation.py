@@ -123,6 +123,38 @@ def memory_observation(request: dict) -> dict:
     return result
 
 
+def allocated_disk_bytes(paths: list[Path]) -> dict[Path, int]:
+    """Measure native allocated bytes with the existing five-second disk-scan limit."""
+    # One GNU du invocation deduplicates hardlinks across roots. Separate scans
+    # would credit the same allocated blocks twice and could over-admit growth.
+    measured = subprocess.run(
+        [
+            "du",
+            "--summarize",
+            "--block-size=1",
+            "--one-file-system",
+            "--null",
+            "--",
+            *(str(path) for path in paths),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        timeout=5,
+        check=True,
+        text=True,
+    )
+    resident_by_path = {}
+    for record in measured.stdout.split("\0"):
+        if record:
+            size, name = record.split("\t", 1)
+            resident_by_path[Path(name)] = model.integer(int(size))
+    if set(resident_by_path) != set(paths):
+        raise model.Refusal(
+            "Incomplete or overlapping physical disk observations", code="invalid-observation"
+        )
+    return resident_by_path
+
+
 def collect(request: dict, expected_host_id: str) -> dict:
     model.validate(request)
     start = int(time.time())
@@ -152,33 +184,7 @@ def collect(request: dict, expected_host_id: str) -> dict:
         key = (before.st_dev, before.st_ino)
         roots.setdefault(key, path)
         accounts[item["id"]] = (path, key)
-    # One GNU du invocation deduplicates hardlinks across roots. Separate scans
-    # would credit the same allocated blocks twice and could over-admit growth.
-    measured = subprocess.run(
-        [
-            "du",
-            "--summarize",
-            "--block-size=1",
-            "--one-file-system",
-            "--null",
-            "--",
-            *(str(path) for path in roots.values()),
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        timeout=5,
-        check=True,
-        text=True,
-    )
-    resident_by_path = {}
-    for record in measured.stdout.split("\0"):
-        if record:
-            size, name = record.split("\t", 1)
-            resident_by_path[Path(name)] = model.integer(int(size))
-    if set(resident_by_path) != set(roots.values()):
-        raise model.Refusal(
-            "Incomplete or overlapping physical disk observations", code="invalid-observation"
-        )
+    resident_by_path = allocated_disk_bytes(list(roots.values()))
     for name, (path, key) in accounts.items():
         after = path.stat()
         if (after.st_dev, after.st_ino) != key:

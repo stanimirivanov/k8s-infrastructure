@@ -14,8 +14,10 @@ from pathlib import Path
 from . import consumer_runtime as runtime
 from . import host_observation as host
 from . import minimal_bootstrap as bootstrap
+from .bootstrap_failure import IdentityMismatch
 from .consumer_profile import Target
 from .host_admission import digest, integer
+from .local_kind import CommandFailure
 from .process_tree import terminate
 
 SECOND = 1_000_000_000
@@ -58,9 +60,13 @@ def attempt(state: dict, status_id: str | None) -> dict:
     if kind == "waiting":
         return {"state": "waiting", "containerId": None, "startedAtNs": None, "finishedAtNs": None}
     reference = value.get("containerID") or status_id
-    started = api_timestamp(value.get("startedAt"))
-    finished = api_timestamp(value.get("finishedAt")) if kind == "terminated" else None
-    if finished is not None and finished < started:
+    # Kubelet may synthesize a termination record with zero (JSON null) times.
+    started_at, finished_at = value.get("startedAt"), value.get("finishedAt")
+    started = api_timestamp(started_at) if kind == "running" or started_at is not None else None
+    finished = (
+        api_timestamp(finished_at) if kind == "terminated" and finished_at is not None else None
+    )
+    if started is not None and finished is not None and finished < started:
         raise ValueError("Kubernetes attempt ended before it started")
     return {
         "state": kind,
@@ -209,8 +215,9 @@ def api_get(target: Target, route: str, timeout: int, configuration: int) -> dic
                 output.extend(chunk)
                 if len(output) > API_LIMIT:
                     raise ValueError("Resource API response exceeds collection bound")
-            if process.wait(timeout=max(0, end - time.monotonic())):
-                raise ValueError("Resource API request unavailable")
+            code = process.wait(timeout=max(0, end - time.monotonic()))
+            if code:
+                raise CommandFailure("Resource API request unavailable", exit_code=code)
         except BaseException:
             terminate(process)
             raise
@@ -279,7 +286,7 @@ def physical_ids(paths: dict[str, Path], host_id: str) -> dict:
     mounts = host.mount_records()
     for label, path in paths.items():
         if path.resolve(strict=True) != path:
-            raise ValueError("Physical store path was redirected")
+            raise IdentityMismatch("Physical store path was redirected")
         host.physical_filesystem(path, mounts=mounts)
         info = path.stat()
         result[label] = {
@@ -292,7 +299,7 @@ def physical_ids(paths: dict[str, Path], host_id: str) -> dict:
 def observe_filesystems(paths: dict[str, Path], expected: dict, host_id: str) -> dict:
     """Use native block counters once per real filesystem and detect changed mounts."""
     if physical_ids(paths, host_id) != expected:
-        raise ValueError("Physical store identity changed")
+        raise IdentityMismatch("Physical store identity changed")
     result = {}
     for label, path in paths.items():
         key = expected[label]["filesystemId"]
@@ -305,12 +312,12 @@ def observe_filesystems(paths: dict[str, Path], expected: dict, host_id: str) ->
                 "availableBytes": value.f_bavail * value.f_frsize,
             }
     if physical_ids(paths, host_id) != expected:
-        raise ValueError("Physical store identity changed during observation")
+        raise IdentityMismatch("Physical store identity changed during observation")
     return result
 
 
 def verify_incarnation(target: Target, kubeconfig: str, expected: str, timeout: int = 5) -> None:
     observed = read_api(target, kubeconfig, "/api/v1/namespaces/kube-system", timeout=timeout)
     if observed.get("metadata", {}).get("uid") != expected:
-        raise ValueError("Cluster incarnation changed during collection")
+        raise IdentityMismatch("Cluster incarnation changed during collection")
     runtime.remaining_timeout()

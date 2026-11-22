@@ -33,12 +33,19 @@ record its cost. The [host admission guide](host-admission.md) owns the
 
 Preview the selection offline. Specify `--https-port` only when the bootstrap
 used a listener. The example selects a 30-second window with three seconds
-between planned observations. Choose a duration of 10–120 seconds and an
-interval of 2–10 seconds that divides the duration evenly. The collector
-samples at the start and at each scheduled interval through the endpoint.
-Preflight and final identity checks each have a 90-second limit. Sampling is
-bounded by the selected duration plus 20 seconds. A sample that takes longer
-than its interval makes the collection incomplete.
+between planned observations. Choose a duration of 10–1,800 seconds and an
+interval of 2–60 seconds that divides the duration evenly, with at most 61
+samples including both endpoints. For the ledger's 30-minute normal-operation
+window, use `--duration-seconds 1800 --interval-seconds 30`. Capture startup
+and init overlap in separate short windows with a shorter interval.
+
+Preflight and final identity checks each have a 90-second limit. Sampling,
+including sample writes, is bounded by the selected duration plus 20 seconds.
+A scan that takes longer than its interval makes the collection incomplete.
+State-root validation and receipt setup each have a 15-second limit. Setup
+includes the admission request read, preparation check and initial sync.
+The final result sync has a five-second limit. If that sync is interrupted,
+the collector allows up to five more seconds to restore the preceding prefix.
 
 ```sh
 uv run --locked --offline python -m scripts.resource_peaks collect \
@@ -60,13 +67,22 @@ uv run --locked --offline python -m scripts.resource_peaks collect \
 ```
 
 Choose a fresh `.jsonl` name in the target's private `.local` directory for
-every attempt. The collector appends private `start`, `window`, `sample` and
-`result` records. The window binds source, host, cluster incarnation and
-physical stores. Each sample records monotonic offsets so the observed window
-can be reconstructed. A missing result after interruption or a result state
-of `incomplete` blocks capacity claims. Preserve the prefix for diagnosis and
-use a new path for another attempt. Stop a running collector with `Ctrl+C`.
-Collection reads the target and leaves its workloads and limits unchanged.
+every attempt. Put `--state-root` inside the positive `preparation` account
+in the original admission request, or use that account as the state root.
+The account must contain `.local` on the same admitted native ext4 filesystem.
+Before opening the receipt, the collector checks the account's allocated disk
+usage and the store's available bytes. Allow 64 MiB for the capped receipt
+and 1 MiB for allocation overhead within the account and above the 10 GiB
+physical free-space floor. The start record identifies the charged account
+and filesystem. Include retained receipts in preparation usage for later runs.
+
+The collector appends private `start`, `window`, `sample` and `result` records.
+The window binds source, host, cluster incarnation and physical stores.
+Each sample records monotonic offsets. Require a successful invocation and a
+complete result before using the measurements for a capacity claim. Keep the
+available prefix for diagnosis after timeouts, interruptions, or an exhausted
+receipt budget. Use a new path for another attempt. Stop a running collector
+with `Ctrl+C`. Collection reads the target without changing workload limits.
 
 ## Read the evidence
 
@@ -87,8 +103,23 @@ Keep init instances and restartable sidecars in lifecycle accounting. The
 receipt lists same-frame, same-node co-observations and the sampled node
 memory for those frames. Container lifetime high-water marks can occur at
 different times. A short-lived container can appear only after termination
-or disappear between scans. Check the receipt against the expected workload
-inventory and rerun an authorized window when coverage is incomplete.
+or disappear between scans. An attempt whose cgroup is gone at its first
+known termination observation has an incomplete termination tail. The receipt
+can retain its sampled maximum, last observed lifetime peak and CPU delta
+for the explicitly recorded observed endpoints. Missing or unknown lifecycle
+timestamps are a coverage gap for that attempt. Check the receipt against the
+expected workload inventory and rerun an authorized window when coverage is
+incomplete.
+
+The receipt records unmatched native scopes in `unattributedRuntimeScopes`
+and reports their attribution and counter coverage in `runtimeAttribution`.
+These scopes can include Pod sandboxes and workload attempts absent from Pod
+status. The collector reports their counters when available and leaves their
+workload identity unresolved. Node counters include all descendants. The
+result's `state` describes the positively identified measurements and the
+tooling charge. Check `runtimeAttributionState` in stdout before relying on
+per-container coverage. Resolve attribution gaps before making an exhaustive
+capacity claim. The collector reports `installedAcceptance: false`.
 [Kubernetes init and sidecar lifecycle](https://kubernetes.io/docs/concepts/workloads/pods/sidecar-containers/#sidecar-containers-and-pod-lifecycle)
 
 Track physical store identity and free space independently from requested
@@ -142,6 +173,9 @@ block size. Use the same physical store, even if more than one account is
 assigned to it. Compare the tooling cgroup by the same method. Divide CPU
 usage microseconds by the observed interval in microseconds to obtain average
 cores over those endpoints. The tooling cgroup peak accounts for the collector
-and any other processes in that admitted group. Installed comparison requires
-complete relevant observations, counter and identity agreement, and the
-reviewed resource envelope.
+and any other processes in that admitted group. The tooling charge reports
+CPU deltas from the first tooling observation before receipt setup through the
+final identity checks. The enforced cgroup also covers the final receipt write.
+An incomplete tooling charge makes the result incomplete. Installed comparison
+requires complete relevant observations, counter and identity agreement, and
+the reviewed resource envelope.
