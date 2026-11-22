@@ -12,6 +12,8 @@
   kind node/cluster destruction, reserve disk space, or provide off-cluster backup.
 - Controller health, native persistence qualification and consumer backup/restore
   acceptance are different results. Never infer one from another.
+- Use the [minimal-demo database controller gate](minimal-database.md) for the
+  capped disposable profile.
 
 ## Ownership and supported inputs
 
@@ -35,8 +37,9 @@ objects. The upstream Barman Secret containing only the public `SIDECAR_IMAGE`
 setting becomes a ConfigMap; runtime certificates remain controller-generated
 Secrets and are never inventoried or exported.
 
-cert-manager's three controllers run on the control-plane node; CloudNativePG and
-the plugin run on the worker. Five single-replica controllers request 300m CPU and
+On the existing isolated network profiles, cert-manager's three controllers run
+on the control-plane node. CloudNativePG and the plugin run on the worker. Five
+single-replica controllers request 300m CPU and
 448Mi memory, in addition to networking and kind's existing components. Individual
 CPU/memory limits are explicit in the renderer. This fits the reviewed 4-CPU/8-GiB
 node-container envelope; it is not a production sizing or isolation claim.
