@@ -174,8 +174,9 @@ assigned to it. Compare the tooling cgroup by the same method. Divide CPU
 usage microseconds by the observed interval in microseconds to obtain average
 cores over those endpoints. The tooling cgroup peak accounts for the collector
 and any other processes in that admitted group. The tooling charge reports
-CPU deltas from the first tooling observation before receipt setup through the
-final identity checks. The enforced cgroup also covers the final receipt write.
+CPU deltas from the first tooling observation, before the disk scan and
+receipt creation, through the final identity checks. The enforced cgroup also
+covers the final receipt write.
 An incomplete tooling charge makes the result incomplete. Installed comparison
 requires complete relevant observations, counter and identity agreement, and
 the reviewed resource envelope.
