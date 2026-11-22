@@ -52,9 +52,9 @@ def render_namespaces(target: Target) -> list[dict]:
 
 def check_prerequisites(target: Target) -> None:
     desired = database_assets.storage_class(target)
-    actual = json.loads(
-        kube(target, ["get", "storageclass", desired["metadata"]["name"], "-o", "json"])
-    )
+    actual = database_runtime.inventory(target, [desired]).get(reference(desired))
+    if actual is None:
+        raise ValueError("Expected existing provider local-retained StorageClass")
     for field in ("provisioner", "reclaimPolicy", "volumeBindingMode", "allowVolumeExpansion"):
         if desired[field] != actual.get(field):
             raise ValueError("Expected provider local-retained provisioning and Retain semantics")
@@ -103,6 +103,10 @@ def canonical_template(template: dict) -> dict:
     for item in [*pod["containers"], *pod.get("initContainers", [])]:
         item.setdefault("terminationMessagePath", "/dev/termination-log")
         item.setdefault("terminationMessagePolicy", "File")
+        for env in item.get("env", []):
+            reference_value = env.get("valueFrom", {}).get("fieldRef")
+            if reference_value is not None:
+                reference_value.setdefault("apiVersion", "v1")
         for values in item["resources"].values():
             for key, value in values.items():
                 values[key] = quantity(value, cpu=key == "cpu")
@@ -194,15 +198,30 @@ def configure(target: Target, operation: Operation | None) -> None:
                 if str(error) != "Demo admission type checking pending":
                     raise
                 time.sleep(1)
+        if operation:
+            altered = operation.job()
+            altered["spec"]["template"]["spec"]["serviceAccountName"] = "default"
+            expected = ("admission", f"{target.consumer}-{operation.launcher}-job")
+            probe.denied(target, altered, [], expected)
+            probe.create(target, operation.job(), [])
+        supports = namespaces(target)[2]
+        service = resource(
+            "Service",
+            "delegation-admission-control",
+            supports,
+            spec={
+                "type": "NodePort",
+                "ports": [{"port": 443}],
+            },
+        )
+        probe.denied(target, service, [], ("admission", f"{target.consumer}-demo-service"))
+        volume = probe.claim(supports, "delegation-admission-control", "5Gi")
+        probe.denied(target, volume, [], ("admission", f"{target.consumer}-database-storage-pvc"))
         install_group(target, bindings)
         if operation:
             actor = probe.as_account(operations_namespace(target), operation.launcher)
             probe.create(target, operation.job(), actor)
-            altered = operation.job()
-            altered["spec"]["template"]["spec"]["serviceAccountName"] = "default"
-            probe.denied(
-                target, altered, actor, ("admission", f"{target.consumer}-{operation.launcher}-job")
-            )
+            probe.denied(target, altered, actor, expected)
     inspect(target, objects)
 
 
@@ -233,16 +252,38 @@ def qualification_operation(target: Target, image: str) -> Operation:
 
 
 def worker_headroom(target: Target, database: dict, network: dict) -> dict:
-    expected = {
-        *[item["uid"] for item in database["controllerPods"].values()],
-        *[item["uid"] for item in network["fixturePods"].values()],
-        *[item["uid"] for item in network["controllerPods"].values()],
-        *[item["uid"] for item in network["foundation"]["podInventory"]],
+    fixture_uids = {item["uid"] for item in network["fixturePods"].values()}
+    cilium = network["controllerPods"]
+    controllers = database["controllerPods"]
+    deployment_namespaces = {
+        "cert-manager": "cert-manager",
+        "cert-manager-cainjector": "cert-manager",
+        "cert-manager-webhook": "cert-manager",
+        "cnpg-controller-manager": "cnpg-system",
+        "barman-cloud": "cnpg-system",
     }
+    found = minimal_network.foundation(
+        target,
+        {key.split("/")[0] for key in cilium},
+        fixture_uids,
+        network["networkSelection"],
+        additional={
+            ("Deployment", key, deployment_namespaces[key]): item["deploymentUID"]
+            for key, item in controllers.items()
+        },
+    )
+    if found != network["foundation"]:
+        raise ValueError("Disposable foundation changed since the predecessor qualification")
+    expected = fixture_uids | {item["uid"] for item in [*controllers.values(), *cilium.values()]}
     pods = minimal_network.list_resources(target, "pods")
-    if {item["metadata"]["uid"] for item in pods} != expected or any(
-        item["metadata"].get("deletionTimestamp") or item["status"].get("phase") != "Running"
-        for item in pods
+    observed = {item["metadata"]["uid"] for item in pods}
+    if (
+        not expected <= observed
+        or len(observed - expected) != len(found["podInventory"])
+        or any(
+            item["metadata"].get("deletionTimestamp") or item["status"].get("phase") != "Running"
+            for item in pods
+        )
     ):
         raise ValueError("Resident Pod inventory changed since database qualification")
     worker = target.name + "-worker"
@@ -412,7 +453,7 @@ def preview(target: Target, action: str, operation: Operation | None) -> dict:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("configure", "health", "qualify"))
+    parser.add_argument("action", choices=("configure", "health", "qualify", "job"))
     parser.add_argument("--consumer", required=True)
     parser.add_argument("--docker-context", required=True)
     parser.add_argument("--state-root", required=True, type=Path)
@@ -436,7 +477,13 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError(
                 "Qualification uses a disposable qual- target and a built-in neutral attempt"
             )
-        if not args.execute:
+        if args.action == "job":
+            if args.execute or operation is None:
+                raise ValueError(
+                    "Job rendering requires a reviewed operation file and stays offline"
+                )
+            result = operation.job()
+        elif not args.execute:
             result = preview(target, args.action, operation)
         else:
             if args.confirm_target != target.name:

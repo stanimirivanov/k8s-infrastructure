@@ -177,13 +177,17 @@ def prove_storage(target, reconciler: list[str]) -> dict:
         ("admission", f"{target.consumer}-demo-volume"),
     )
     for ns, count, size, reason in ((data, 4, "1Gi", "count"), (support, 2, "4Gi", "aggregate")):
-        batch = [
-            create(
-                target, claim(ns, f"delegation-{reason}-{index}", size), reconciler, dry_run=False
-            )
-            for index in range(count)
-        ]
+        batch = []
         try:
+            for index in range(count):
+                batch.append(
+                    create(
+                        target,
+                        claim(ns, f"delegation-{reason}-{index}", size),
+                        reconciler,
+                        dry_run=False,
+                    )
+                )
             denied(
                 target,
                 claim(ns, f"delegation-{reason}-extra", "1Gi"),
@@ -278,6 +282,14 @@ def prove(target, operation: Operation, foreign: str) -> dict:
         reconciler,
         ("authorization", "forbidden"),
     )
+    token = resource(
+        "Secret",
+        "delegation-token-control",
+        ns,
+        type="kubernetes.io/service-account-token",
+    )
+    token["metadata"]["annotations"] = {"kubernetes.io/service-account.name": operation.runtime}
+    denied(target, token, reconciler, ("admission", f"{target.consumer}-demo-secret"))
     return {
         "jobAdmission": "approved and altered attempts exercised",
         "storageQuota": prove_storage(target, reconciler),

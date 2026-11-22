@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from . import database_policy, host_admission
 from .consumer_profile import LABEL, MINIMAL_PROFILE, Target
 from .delegated_argo_policy import binding, resource, rule
+from .network_resources import pod_bounds
 
 RECONCILER = "demo-reconciler"
 ATTEMPT_LABEL = "k8s-infrastructure.io/demo-attempt"
@@ -160,6 +161,7 @@ def load_operation(target: Target, value: dict) -> Operation:
             "seccompProfile": {"type": "RuntimeDefault"},
         },
     )
+    pod_bounds(pod)
     return operation
 
 
@@ -287,7 +289,9 @@ def job_policy(target: Target, operation: Operation) -> list[dict]:
         "batch",
         ["jobs"],
         ("CREATE",),
-        f"request.userInfo.username == '{username(operations_namespace(target), operation.launcher)}'",
+        f"request.userInfo.username == '{username(operations_namespace(target), operation.launcher)}'"
+        f" || (has(object.metadata.labels) && '{ATTEMPT_LABEL}' in object.metadata.labels"
+        f" && object.metadata.labels['{ATTEMPT_LABEL}'] == '{operation.launcher}')",
         [
             (
                 f"request.namespace == '{operation.namespace}' && object.metadata.name == '{operation.name}'",
@@ -351,12 +355,25 @@ def render(target: Target, operation: Operation | None = None) -> list[dict]:
         "",
         ["services"],
         OPERATIONS,
-        f"request.userInfo.username == '{username(ops, RECONCILER)}'",
+        f"request.namespace in {json.dumps(list(spaces))}",
         [
             (
                 "object.spec.type == 'ClusterIP' && !has(object.spec.externalIPs) && "
                 "!has(object.spec.externalName) && object.spec.ports.all(p, !has(p.nodePort) || p.nodePort == 0)",
                 "Demo desired state may expose only private ClusterIP Services",
+            )
+        ],
+    )
+    documents += policy(
+        f"{target.consumer}-demo-secret",
+        "",
+        ["secrets"],
+        OPERATIONS,
+        f"request.namespace in {json.dumps(list(spaces))}",
+        [
+            (
+                "object.type != 'kubernetes.io/service-account-token'",
+                "Demo namespaces use no legacy ServiceAccount token Secrets",
             )
         ],
     )
@@ -373,6 +390,23 @@ def render(target: Target, operation: Operation | None = None) -> list[dict]:
                 " && (!has(object.metadata.annotations) || object.metadata.annotations.all(k, k != 'volumeType' && k != 'volume.kubernetes.io/selected-node'))"
                 " && (!has(object.spec.volumeMode) || object.spec.volumeMode == 'Filesystem')",
                 "Demo claims require fresh node-local filesystem provisioning",
+            )
+        ],
+    )
+    documents += policy(
+        f"{target.consumer}-demo-placement",
+        "",
+        ["pods"],
+        ("CREATE",),
+        f"request.namespace in {json.dumps(list(spaces))}",
+        [
+            (
+                "!has(object.spec.volumes) || !object.spec.volumes.exists(v, has(v.persistentVolumeClaim))"
+                " || (!has(object.spec.nodeName) && has(object.spec.nodeSelector)"
+                f" && '{LABEL}' in object.spec.nodeSelector && object.spec.nodeSelector['{LABEL}'] == '{target.consumer}'"
+                " && 'k8s-infrastructure.io/role' in object.spec.nodeSelector"
+                " && object.spec.nodeSelector['k8s-infrastructure.io/role'] == 'worker')",
+                "Demo retained PVC consumers require the owned worker and scheduler binding",
             )
         ],
     )
