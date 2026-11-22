@@ -24,7 +24,14 @@ from . import network_resources as resources
 from . import network_runtime as network
 from .consumer_profile import MINIMAL_PROFILE, Target, identity, load_profile
 from .kubernetes import contains, kube, reference
-from .network_assets import download, labels, render, selection
+from .network_assets import (
+    RELEASE_FILE,
+    SELECTION_LABEL,
+    download_bounded,
+    ownership_labels,
+    render,
+    selection,
+)
 from .network_fixtures import workloads
 
 STATIC_PODS = ("etcd", "kube-apiserver", "kube-controller-manager", "kube-scheduler")
@@ -72,13 +79,18 @@ def owner_uid(item: dict) -> str | None:
     return next(iter(owners), None)
 
 
-def foundation(target: Target, installed: set[str], fixture_uids: set[str]) -> dict:
+def foundation(
+    target: Target, installed: set[str], fixture_uids: set[str], selection_digest: str
+) -> dict:
     """Inspect all Pod producers and residents before admitting another workload."""
+    if list_resources(target, "persistentvolumeclaims,persistentvolumes"):
+        raise ValueError("Existing persistent storage prevents disposable Cilium qualification")
     controllers = list_resources(
         target, "deployments,daemonsets,statefulsets,jobs,cronjobs,replicationcontrollers"
     )
     foundation_ids = set()
     network_ids = set()
+    network_labels = ownership_labels(target, selection_digest)
     for item in controllers:
         key = reference(item)
         meta = item["metadata"]
@@ -89,7 +101,7 @@ def foundation(target: Target, installed: set[str], fixture_uids: set[str]) -> d
         elif (
             key[1] in installed
             and key[2] == "kube-system"
-            and all(meta.get("labels", {}).get(k) == v for k, v in labels(target).items())
+            and all(meta.get("labels", {}).get(k) == v for k, v in network_labels.items())
         ):
             network_ids.add(meta["uid"])
         else:
@@ -226,7 +238,7 @@ def save_receipt(path: Path, evidence: dict) -> None:
         pending.unlink(missing_ok=True)
 
 
-def completed_containers(pod: dict, bounds: dict) -> dict:
+def completed_containers(pod: dict, bounds: dict, staged: dict) -> dict:
     """Require actual successful init terminations and ready unchanged container instances."""
     status = pod["status"]
     regular = {c["name"]: c for c in status.get("containerStatuses", [])}
@@ -257,12 +269,18 @@ def completed_containers(pod: dict, bounds: dict) -> dict:
             snapshot.get("restartCount") != 0
             or snapshot.get("lastState")
             or not re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", started)
-            or not re.fullmatch(r"(?:[a-zA-Z0-9./_:@-]+@)?sha256:[a-f0-9]{64}", image)
             or started < finished
         ):
             raise ValueError(
                 f"Incomplete, restarted or changed network container evidence for {name}"
             )
+        image_identity = re.sub(r"^(?:containerd|docker-pullable)://", "", image)
+        admitted = staged.get(c["image"], {})
+        if not image_identity or image_identity not in {
+            admitted.get("configDigest"),
+            admitted.get("repoDigest"),
+        }:
+            raise ValueError(f"Network container {name} did not run the staged image on its node")
         output[name] = {"imageID": image, "startedAt": started, "restartCount": 0}
         if phase == "terminated":
             finished = observed.get("finishedAt", "")
@@ -279,7 +297,85 @@ def completed_containers(pod: dict, bounds: dict) -> dict:
     return output
 
 
-def controller_pods(target: Target, controllers: dict[str, dict], accounted: dict) -> dict:
+TOKEN_MOUNT_PATH = "/var/run/secrets/kubernetes.io/serviceaccount"
+# The pinned Kubernetes ServiceAccount admission plugin adds this projection.
+TOKEN_PROJECTION = {
+    "defaultMode": 420,
+    "sources": [
+        {"serviceAccountToken": {"path": "token", "expirationSeconds": 3607}},
+        {"configMap": {"name": "kube-root-ca.crt", "items": [{"key": "ca.crt", "path": "ca.crt"}]}},
+        {
+            "downwardAPI": {
+                "items": [
+                    {
+                        "path": "namespace",
+                        "fieldRef": {"apiVersion": "v1", "fieldPath": "metadata.namespace"},
+                    }
+                ]
+            }
+        },
+    ],
+}
+
+
+def verify_pod_authority(template: dict, pod: dict) -> None:
+    defaults = {
+        "hostNetwork": False,
+        "hostPID": False,
+        "hostIPC": False,
+        "hostUsers": True,
+        "shareProcessNamespace": False,
+        "serviceAccountName": "default",
+        "automountServiceAccountToken": None,
+        "securityContext": {},
+        "imagePullSecrets": [],
+    }
+    if any(
+        template.get(key, default) != pod.get(key, default) for key, default in defaults.items()
+    ):
+        raise ValueError("Network Pod authority differs from the reviewed specification")
+
+    token_mount = None
+    volumes = []
+    for volume in pod.get("volumes", []):
+        name = volume["name"]
+        if (
+            template.get("automountServiceAccountToken") is True
+            and token_mount is None
+            and re.fullmatch(r"kube-api-access-[a-z0-9]{5}", name)
+            and volume == {"name": name, "projected": TOKEN_PROJECTION}
+        ):
+            token_mount = {"name": name, "mountPath": TOKEN_MOUNT_PATH, "readOnly": True}
+        else:
+            volumes.append(volume)
+    if not contains(template.get("volumes", []), volumes):
+        raise ValueError("Network Pod volume authority differs from the reviewed specification")
+
+    for group in ("containers", "initContainers"):
+        for expected, actual in zip(template.get(group, []), pod.get(group, []), strict=True):
+            wanted_mounts = expected.get("volumeMounts", [])
+            if token_mount and all(
+                mount["mountPath"] != TOKEN_MOUNT_PATH for mount in wanted_mounts
+            ):
+                wanted_mounts = [*wanted_mounts, token_mount]
+            mounts = [{"readOnly": False, **mount} for mount in actual.get("volumeMounts", [])]
+            if (
+                expected["name"] != actual["name"]
+                or expected.get("securityContext", {}) != actual.get("securityContext", {})
+                or mounts != [{"readOnly": False, **mount} for mount in wanted_mounts]
+                or any(
+                    not contains(expected.get(field, []), actual.get(field, []))
+                    for field in ("args", "command", "env", "envFrom", "volumeDevices")
+                )
+            ):
+                raise ValueError(
+                    "Network container authority differs from the reviewed specification"
+                )
+
+
+def controller_pods(
+    target: Target, controllers: dict[str, dict], accounted: dict, staged: dict
+) -> dict:
     """Tie Ready Pods to their admitted owner, fixed node and exact running resource bounds."""
     references = list(controllers.values())
     found = network.inventory(target, references)
@@ -287,7 +383,8 @@ def controller_pods(target: Target, controllers: dict[str, dict], accounted: dic
     for expected in references:
         actual = found.get(reference(expected))
         if actual is None or not contains(
-            network.comparable_spec(expected), network.comparable_spec(actual)
+            network.comparable_spec(expected, minimal=True),
+            network.comparable_spec(actual, minimal=True),
         ):
             raise ValueError("Admitted Cilium controller template drifted")
         network.verify_pod_template(expected, actual)
@@ -330,16 +427,17 @@ def controller_pods(target: Target, controllers: dict[str, dict], accounted: dic
             or resources.normalized(actual) != resources.normalized(accounted[controller])
         ):
             raise ValueError("Installed Cilium Pod resources, placement or image selection drifted")
+        verify_pod_authority(template, spec)
         evidence[key] = {
             "uid": pod["metadata"]["uid"],
-            "containerEvidence": completed_containers(pod, actual),
+            "containerEvidence": completed_containers(pod, actual, staged[node]),
         }
     if len(evidence) != count_expected:
         raise ValueError("Cilium rollout did not create exactly the expected placed Pods")
     return evidence
 
 
-def fixture_pods(target: Target, documents: list[dict]) -> dict:
+def fixture_pods(target: Target, documents: list[dict], staged: dict) -> dict:
     expected = {reference(item): item for item in documents if item["kind"] == "Pod"}
     output = {}
     for item in list_resources(target, "pods"):
@@ -361,9 +459,10 @@ def fixture_pods(target: Target, documents: list[dict]) -> dict:
             or resources.normalized(bounds) != resources.normalized(resources.pod_bounds(template))
         ):
             raise ValueError("Installed fixture Pod drifted from the reviewed bounded manifest")
+        verify_pod_authority(template, spec)
         output[f"{key[2]}/{key[1]}"] = {
             "uid": item["metadata"]["uid"],
-            "containerEvidence": completed_containers(item, bounds),
+            "containerEvidence": completed_containers(item, bounds, staged[spec["nodeName"]]),
         }
     if len(output) != len(expected):
         raise ValueError("Incomplete network fixture placement or lifecycle evidence")
@@ -373,7 +472,7 @@ def fixture_pods(target: Target, documents: list[dict]) -> dict:
 def guarded_foundation(
     target: Target, receipt: dict, installed: set[str], fixture_uids: set[str]
 ) -> None:
-    report = foundation(target, installed, fixture_uids)
+    report = foundation(target, installed, fixture_uids, receipt["networkSelection"])
     receipt["foundation"] = report
     check_foundation_bounds(report["systemRequestsByRole"], report["systemLimitsByRole"])
 
@@ -405,20 +504,28 @@ def record_peaks(
 
 def install(
     target: Target, journals: list[dict], receipt: dict, path: Path, headroom: Callable[[], None]
-) -> tuple[dict, dict]:
+) -> tuple[dict, dict, list[dict]]:
     with failure.phase("network-assets", "missing-prerequisite"):
-        shared, documents = render(target, *download())
+        raw_pins = RELEASE_FILE.read_bytes()
+        if minimal_bootstrap.source_digest(network_release=raw_pins) != receipt["artifactDigest"]:
+            raise ValueError(
+                "Network release inventory or executable source changed after admission"
+            )
+        pins = selection(raw_pins)
+        chart, crds = download_bounded(raw_pins, timeout=runtime.remaining_timeout(180))
+        shared, documents = render(
+            target, chart, crds, release=pins, timeout=runtime.remaining_timeout(60)
+        )
+        fixtures = workloads(target, images=pins["probes"])
         bounds = resources.rendered_bounds(target, documents)
         controllers = resources.controllers(documents)
-        receipt["networkSelection"] = labels(target)["k8s-infrastructure.io/network-selection"]
-        pins = selection()
-        receipt["artifactPins"] = {
-            key: pins[key] for key in ("cilium", "ciliumCRDs", "gateway", "probes")
-        }
+        receipt["networkSelection"] = controllers["cilium"]["metadata"]["labels"][SELECTION_LABEL]
+        receipt["artifactPins"] = pins
         receipt["resourceEnvelope"] = bounds
     with failure.phase("image-admission", "missing-prerequisite"):
         headroom()
-        receipt["cachedImages"] = cached_images(target, journals, controllers)
+        staged = cached_images(target, journals, controllers, fixtures)
+        receipt["cachedImages"] = staged
     with failure.phase("foundation-admission", "resource-admission-refused"):
         network.require_fresh_cni(target)
         guarded_foundation(target, receipt, set(), set())
@@ -441,13 +548,16 @@ def install(
         with failure.phase(f"startup-{name}", "resource-admission-refused"):
             headroom()
             guarded_foundation(target, receipt, set(installed), set())
-            if installed and controller_pods(target, installed, bounds["pods"]) != pod_evidence:
+            if (
+                installed
+                and controller_pods(target, installed, bounds["pods"], staged) != pod_evidence
+            ):
                 raise ValueError("Previous Cilium instance changed before the next startup stage")
             item = controllers[name]
             network.apply_objects(target, [item])
             network.wait_controller(target, item)
             installed[name] = item
-            following = controller_pods(target, installed, bounds["pods"])
+            following = controller_pods(target, installed, bounds["pods"], staged)
             if any(following.get(key) != value for key, value in pod_evidence.items()):
                 raise ValueError("Previous Cilium instance changed during startup")
             pod_evidence = following
@@ -477,7 +587,7 @@ def install(
                 "--timeout=60s",
             ],
         )
-    return controllers, bounds["pods"]
+    return controllers, bounds["pods"], fixtures
 
 
 def qualify(target: Target, hostname: str, request: dict, expected_host_id: str) -> dict:
@@ -579,10 +689,10 @@ def run_qualification(
     path: Path,
     headroom: Callable[[], None],
 ) -> None:
-    controllers, accounted = install(target, journals, receipt, path, headroom)
+    controllers, accounted, documents = install(target, journals, receipt, path, headroom)
+    staged = receipt["cachedImages"]
     with failure.phase("fixture-admission", "resource-admission-refused"):
         headroom()
-        documents = workloads(target)
         fixture_bounds: dict[str, list[dict]] = {role: [] for role in resources.ROLES}
         for item in documents:
             if item["kind"] == "Pod":
@@ -600,10 +710,10 @@ def run_qualification(
             },
         }
         guarded_foundation(target, receipt, set(controllers), set())
-        if controller_pods(target, controllers, accounted) != receipt["controllerPods"]:
+        if controller_pods(target, controllers, accounted, staged) != receipt["controllerPods"]:
             raise ValueError("Cilium instance changed before traffic fixture admission")
-        network_qualification.create_fixtures(target)
-        fixtures = fixture_pods(target, documents)
+        network_qualification.create_fixtures(target, documents=documents)
+        fixtures = fixture_pods(target, documents, staged)
         receipt["fixturePods"] = fixtures
         receipt["lastCompletedPhase"] = "fixture-admission"
         save_receipt(path, receipt)
@@ -622,8 +732,8 @@ def run_qualification(
             target, receipt, set(controllers), {item["uid"] for item in fixtures.values()}
         )
         if (
-            controller_pods(target, controllers, accounted) != receipt["controllerPods"]
-            or fixture_pods(target, documents) != fixtures
+            controller_pods(target, controllers, accounted, staged) != receipt["controllerPods"]
+            or fixture_pods(target, documents, staged) != fixtures
         ):
             raise ValueError(
                 "Controller or fixture changed during allowed/denied traffic qualification"
@@ -639,9 +749,11 @@ def run_qualification(
         )
 
 
-def cached_images(target: Target, journals: list[dict], controllers: dict[str, dict]) -> dict:
+def cached_images(
+    target: Target, journals: list[dict], controllers: dict[str, dict], fixtures: list[dict]
+) -> dict:
     """Identify preloaded immutable image content on each verified node before any CNI writes."""
-    images = resources.required_images(controllers, workloads(target))
+    images = resources.required_images(controllers, fixtures)
     evidence = {}
     for journal in journals:
         node = journal["name"]

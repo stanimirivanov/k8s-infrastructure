@@ -289,6 +289,35 @@ class NetworkTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             network_runtime.verify_pod_template(expected, actual)
 
+    def test_minimal_controller_accepts_canonical_installer_memory(self):
+        expected: dict = {
+            "kind": "DaemonSet",
+            "spec": {
+                "template": {
+                    "spec": {
+                        "containers": [],
+                        "initContainers": [
+                            {
+                                "name": "install-cni-binaries",
+                                "resources": {
+                                    "requests": {"memory": "1024Mi", "cpu": "100m"},
+                                    "limits": {"memory": "1024Mi", "cpu": "1000m"},
+                                },
+                            }
+                        ],
+                    }
+                }
+            },
+        }
+        actual = copy.deepcopy(expected)
+        budget = actual["spec"]["template"]["spec"]["initContainers"][0]["resources"]
+        budget["requests"]["memory"] = "1Gi"
+        budget["limits"] = {"memory": "1Gi", "cpu": "1"}
+        wanted = network_runtime.comparable_spec(expected, minimal=True)
+        self.assertTrue(contains(wanted, network_runtime.comparable_spec(actual, minimal=True)))
+        budget["limits"]["memory"] = "1G"
+        self.assertFalse(contains(wanted, network_runtime.comparable_spec(actual, minimal=True)))
+
     def test_native_controller_serialization_preserves_drift_detection(self):
         expected: dict = {
             "kind": "DaemonSet",

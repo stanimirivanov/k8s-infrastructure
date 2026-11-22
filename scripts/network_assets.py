@@ -9,6 +9,7 @@ import io
 import json
 import re
 import subprocess
+import sys
 import tarfile
 import tempfile
 from pathlib import Path
@@ -21,8 +22,10 @@ from .consumer_profile import LABEL, MINIMAL_PROFILE, Target
 from .local_kind import ROOT
 
 DIRECTORY = ROOT / "clusters/local-kind/isolated-network-local"
+RELEASE_FILE = DIRECTORY / "releases.json"
 OWNER = "k8s-infrastructure"
 MANAGER = "k8s-infrastructure-network"
+SELECTION_LABEL = "k8s-infrastructure.io/network-selection"
 GATEWAY_CRDS = {
     f"{name}.gateway.networking.k8s.io"
     for name in (
@@ -37,9 +40,9 @@ GATEWAY_CRDS = {
 }
 
 
-def selection() -> dict:
+def selection(data: bytes | None = None) -> dict:
     """Admit only reviewed official release URLs, bounded inventory and image digests."""
-    value = json.loads((DIRECTORY / "releases.json").read_text(encoding="utf-8"))
+    value = json.loads(RELEASE_FILE.read_bytes() if data is None else data)
     if (
         set(value) != {"cilium", "gateway", "ciliumCRDs", "probes"}
         or len(value["ciliumCRDs"]) != 22
@@ -125,9 +128,9 @@ def verified(data: bytes, asset: dict) -> bytes:
     return data
 
 
-def download() -> tuple[bytes, list[dict]]:
+def download(*, release: dict | None = None) -> tuple[bytes, list[dict]]:
     """Separate network gate: every archive/manifest is checked before parsing/execution."""
-    release = selection()
+    release = selection() if release is None else release
     assets = [release["cilium"], release["gateway"], *release["ciliumCRDs"]]
 
     def fetch(asset: dict) -> bytes:
@@ -150,8 +153,22 @@ def download() -> tuple[bytes, list[dict]]:
     return data[0], [*selected, *cilium]
 
 
-def labels(target: Target) -> dict[str, str]:
-    release = selection()
+def download_bounded(data: bytes, *, timeout: int) -> tuple[bytes, list[dict]]:
+    """Put a wall-clock bound on the worker, including blocking HTTP reads."""
+    with tempfile.TemporaryDirectory(prefix="network-download-") as directory:
+        path = Path(directory)
+        subprocess.run(
+            [sys.executable, "-m", "scripts.network_assets", directory],
+            input=data,
+            capture_output=True,
+            timeout=timeout,
+            check=True,
+        )
+        return (path / "chart.tgz").read_bytes(), json.loads((path / "crds.json").read_bytes())
+
+
+def labels(target: Target, *, release: dict | None = None) -> dict[str, str]:
+    release = selection() if release is None else release
     reviewed = {key: value for key, value in release.items() if key != "probes"}
     reviewed["values"] = yaml.safe_load(
         (DIRECTORY / "cilium-values.yaml").read_text(encoding="utf-8")
@@ -159,17 +176,29 @@ def labels(target: Target) -> dict[str, str]:
     if target.profile == MINIMAL_PROFILE:
         reviewed["boundedResources"] = network_resources.selection()
     digest = hashlib.sha256(json.dumps(reviewed, sort_keys=True).encode()).hexdigest()[:32]
+    return ownership_labels(target, digest)
+
+
+def ownership_labels(target: Target, digest: str) -> dict[str, str]:
     return {
         "app.kubernetes.io/managed-by": OWNER,
         "k8s-infrastructure.io/capability": "network",
         LABEL: target.consumer,
-        "k8s-infrastructure.io/network-selection": digest,
+        SELECTION_LABEL: digest,
     }
 
 
-def render(target: Target, chart: bytes, crds: list[dict]) -> tuple[list[dict], list[dict]]:
+def render(
+    target: Target,
+    chart: bytes,
+    crds: list[dict],
+    *,
+    release: dict | None = None,
+    timeout: int = 60,
+) -> tuple[list[dict], list[dict]]:
     """Use upstream Helm templates; no custom operator or Helm release Secret state."""
-    verified(chart, selection()["cilium"])
+    release = selection() if release is None else release
+    verified(chart, release["cilium"])
     values = values_configuration()
     values["k8sServiceHost"] = f"{target.name}-control-plane"
     values["nodeSelector"] = {LABEL: target.consumer}
@@ -195,7 +224,7 @@ def render(target: Target, chart: bytes, crds: list[dict]) -> tuple[list[dict], 
                 str(path / "values.yaml"),
             ],
             capture_output=True,
-            timeout=60,
+            timeout=timeout,
             check=False,
         )
         if result.returncode:
@@ -227,8 +256,9 @@ def render(target: Target, chart: bytes, crds: list[dict]) -> tuple[list[dict], 
             rules.append(rule)
         item["rules"] = rules
     shared = copy.deepcopy(crds)
+    ownership_labels = labels(target, release=release)
     for item in [*shared, *documents]:
-        item["metadata"].setdefault("labels", {}).update(labels(target))
+        item["metadata"].setdefault("labels", {}).update(ownership_labels)
     with tarfile.open(fileobj=io.BytesIO(chart)) as archive:
         member = archive.getmember("cilium/values.yaml")
         if not member.isfile() or member.size > 1024 * 1024:
@@ -320,3 +350,14 @@ def validate_rendered(documents: list[dict], images: set[str], *, minimal: bool 
         != "io.cilium/gateway-controller"
     ):
         raise ValueError("Unexpected Gateway implementation")
+
+
+def download_worker(path: Path) -> None:
+    """Exchange the bounded download through the parent-owned private directory."""
+    chart, crds = download(release=selection(sys.stdin.buffer.read(64 * 1024 + 1)))
+    (path / "chart.tgz").write_bytes(chart)
+    (path / "crds.json").write_text(json.dumps(crds), encoding="utf-8")
+
+
+if __name__ == "__main__":
+    download_worker(Path(sys.argv[1]))

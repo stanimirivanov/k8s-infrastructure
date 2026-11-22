@@ -98,12 +98,24 @@ class MinimalNetworkTests(unittest.TestCase):
         start = "2026-11-22T12:00:00Z"
         end = "2026-11-22T12:00:02Z"
         image = "sha256:" + "a" * 64
+        digest = "sha256:" + "b" * 64
+        repo = "quay.io/cilium/cilium"
+        reference = f"{repo}:v1.20.3@{digest}"
+        staged = {reference: {"configDigest": image, "repoDigest": f"{repo}@{digest}"}}
         spec = {
             "containers": [
-                {"name": "agent", "resources": network_resources.resources(100, 1000, 256, 512)}
+                {
+                    "name": "agent",
+                    "image": reference,
+                    "resources": network_resources.resources(100, 1000, 256, 512),
+                }
             ],
             "initContainers": [
-                {"name": "setup", "resources": network_resources.resources(100, 1000, 512, 512)}
+                {
+                    "name": "setup",
+                    "image": reference,
+                    "resources": network_resources.resources(100, 1000, 512, 512),
+                }
             ],
         }
         init = {
@@ -123,25 +135,120 @@ class MinimalNetworkTests(unittest.TestCase):
                         "name": "agent",
                         "ready": True,
                         "restartCount": 0,
-                        "imageID": image,
+                        "imageID": f"docker-pullable://{repo}@{digest}",
                         "state": {"running": {"startedAt": end}},
                     }
                 ],
             },
         }
         bounds = network_resources.pod_bounds(spec)
-        self.assertEqual(completed_containers(pod, bounds)["setup"]["finishedAt"], end)
+        self.assertEqual(completed_containers(pod, bounds, staged)["setup"]["finishedAt"], end)
         for updates in ({"exitCode": 137}, {"reason": "OOMKilled"}):
             termination = init["state"]["terminated"]
             prior = termination.copy()
             termination.update(updates)
             with self.subTest(updates=updates), self.assertRaisesRegex(ValueError, "Initializer"):
-                completed_containers(pod, bounds)
+                completed_containers(pod, bounds, staged)
             termination.clear()
             termination.update(prior)
+        for other in ("sha256:" + "c" * 64, f"docker-pullable://quay.io/other/agent@{digest}"):
+            with self.subTest(image=other), self.assertRaisesRegex(ValueError, "staged image"):
+                init["imageID"] = other
+                completed_containers(pod, bounds, staged)
+        init["imageID"] = f"containerd://{image}"
+        self.assertEqual(completed_containers(pod, bounds, staged)["setup"]["finishedAt"], end)
         init["restartCount"] = 1
         with self.assertRaisesRegex(ValueError, "restarted"):
-            completed_containers(pod, bounds)
+            completed_containers(pod, bounds, staged)
+
+    def test_installed_fixture_refuses_admission_added_authority(self):
+        from copy import deepcopy
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from scripts import minimal_network, network_fixtures
+        from scripts.consumer_profile import MINIMAL_PROFILE, Target
+
+        target = Target("qual-neutral", "local-engine", Path("/tmp"), MINIMAL_PROFILE, 18443)
+        document = next(
+            item for item in network_fixtures.workloads(target) if item["kind"] == "Pod"
+        )
+        pod = deepcopy(document)
+        pod["metadata"]["uid"] = "pod-uid"
+        spec = pod["spec"]
+        spec.update(nodeName=f"{target.name}-worker", serviceAccountName="default")
+        container = spec["containers"][0]
+        digest = "sha256:" + "b" * 64
+        staged = {spec["nodeName"]: {container["image"]: {"configDigest": digest}}}
+        pod["status"] = {
+            "phase": "Running",
+            "conditions": [{"type": "Ready", "status": "True"}],
+            "containerStatuses": [
+                {
+                    "name": container["name"],
+                    "ready": True,
+                    "restartCount": 0,
+                    "imageID": digest,
+                    "state": {"running": {"startedAt": "2026-11-22T12:00:00Z"}},
+                }
+            ],
+        }
+        for changed in (
+            {"hostPID": True},
+            {"serviceAccountName": "unexpected"},
+            {"automountServiceAccountToken": True},
+            {"volumes": [{"name": "extra", "hostPath": {"path": "/"}}]},
+        ):
+            with (
+                self.subTest(changed=changed),
+                patch.object(minimal_network, "list_resources", return_value=[pod]),
+            ):
+                minimal_network.fixture_pods(target, [document], staged)
+                with patch.dict(spec, changed), self.assertRaisesRegex(ValueError, "authority"):
+                    minimal_network.fixture_pods(target, [document], staged)
+        with (
+            patch.object(minimal_network, "list_resources", return_value=[pod]),
+            patch.dict(container["securityContext"], {"privileged": True}),
+            self.assertRaisesRegex(ValueError, "authority"),
+        ):
+            minimal_network.fixture_pods(target, [document], staged)
+
+    def test_asset_timeout_stops_qualification_before_provider_access(self):
+        import subprocess
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from scripts import bootstrap_failure, minimal_bootstrap, minimal_network, network_assets
+        from scripts.consumer_profile import MINIMAL_PROFILE, Target
+
+        target = Target("qual-neutral", "local-engine", Path("/tmp"), MINIMAL_PROFILE, 18443)
+        receipt = {"artifactDigest": minimal_bootstrap.source_digest()}
+
+        def timed_out(command, *, timeout, **kwargs):
+            self.assertGreater(timeout, 0)
+            self.assertLess(timeout, 20)
+            raise subprocess.TimeoutExpired(command, timeout)
+
+        with (
+            minimal_network.runtime.deadline(20),
+            patch.object(network_assets, "urlopen", side_effect=AssertionError("unbounded fetch")),
+            patch.object(network_assets.subprocess, "run", side_effect=timed_out) as child,
+            patch.object(minimal_network.runtime, "command") as provider,
+            patch.object(minimal_network.network, "install_apis") as mutation,
+            self.assertRaises(bootstrap_failure.Failure) as refused,
+        ):
+            minimal_network.install(target, [], receipt, Path("/unused"), lambda: None)
+        self.assertEqual(
+            refused.exception.evidence,
+            {
+                "category": "timeout",
+                "phase": "network-assets",
+                "timedOut": True,
+            },
+        )
+        child.assert_called_once()
+        provider.assert_not_called()
+        mutation.assert_not_called()
 
     def test_fixture_budget_refuses_overlapping_oversized_init(self):
         from pathlib import Path

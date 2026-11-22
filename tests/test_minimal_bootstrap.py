@@ -41,6 +41,29 @@ class AdmissionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "alias"):
             bootstrap.verify_stores(value, observed, {})
 
+    def test_network_pin_inventory_change_refuses_prior_artifact_before_provider_access(self):
+        from tempfile import TemporaryDirectory
+        from unittest.mock import patch
+
+        from tests.test_host_admission import request
+
+        target = Target("qual-demo", "default", Path("/tmp"), "minimal-demo", 18443)
+        relative = Path("clusters/local-kind/isolated-network-local/releases.json")
+        with TemporaryDirectory() as root, patch.object(bootstrap, "ROOT", Path(root)):
+            inventory = Path(root) / relative
+            inventory.parent.mkdir(parents=True)
+            inventory.write_bytes((Path(__file__).resolve().parents[1] / relative).read_bytes())
+            (Path(root) / "uv.lock").touch()
+            value = request()
+            value.update(target=target.name, artifactDigest=bootstrap.source_digest())
+            inventory.write_bytes(inventory.read_bytes() + b"\n")
+            with (
+                patch.object(bootstrap.state, "load") as load,
+                self.assertRaisesRegex(ValueError, "artifact"),
+            ):
+                bootstrap.network_bootstrap(target, value, "boot")
+            load.assert_not_called()
+
     def test_reservation_needs_full_35gib_plus_filesystem_floor(self):
         from scripts import host_admission
         from tests.test_host_admission import observation, request

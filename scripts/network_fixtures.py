@@ -25,9 +25,9 @@ def namespaces(target: Target) -> tuple[str, str]:
     return f"{target.consumer}-net-a", f"{target.consumer}-net-b"
 
 
-def workloads(target: Target) -> list[dict]:
+def workloads(target: Target, *, images: dict | None = None) -> list[dict]:
     a, b = namespaces(target)
-    images = selection()["probes"]
+    images = selection()["probes"] if images is None else images
     documents = []
     for namespace, identity, role in [
         (a, f"{target.consumer}-a", "worker"),

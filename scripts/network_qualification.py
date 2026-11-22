@@ -77,8 +77,8 @@ def wait_condition(
         time.sleep(2)
 
 
-def create_fixtures(target: Target) -> None:
-    documents = workloads(target)
+def create_fixtures(target: Target, *, documents: list[dict] | None = None) -> None:
+    documents = workloads(target) if documents is None else documents
     spaces = [item for item in documents if item["kind"] == "Namespace"]
     for item in spaces:
         if kube(

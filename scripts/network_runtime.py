@@ -11,7 +11,16 @@ from typing import Any
 from . import consumer_lifecycle, consumer_runtime
 from .consumer_profile import MINIMAL_PROFILE, NETWORK_PROFILES, Target
 from .kubernetes import contains, fingerprint, kube, reference
-from .network_assets import MANAGER, download, labels, render, selection
+from .network_assets import (
+    MANAGER,
+    SELECTION_LABEL,
+    download,
+    labels,
+    ownership_labels,
+    render,
+    selection,
+)
+from .node_capacity import quantity
 
 
 def require_profile(target: Target) -> int:
@@ -48,9 +57,14 @@ def inventory(target: Target, documents: list[dict]) -> dict[tuple, dict]:
         actual = found.get(reference(item))
         if actual is None:
             continue
+        reviewed_labels = (
+            ownership_labels(target, item["metadata"]["labels"][SELECTION_LABEL])
+            if target.profile == MINIMAL_PROFILE
+            else labels(target)
+        )
         if actual["metadata"].get("deletionTimestamp") or any(
             actual["metadata"].get("labels", {}).get(key) != value
-            for key, value in labels(target).items()
+            for key, value in reviewed_labels.items()
         ):
             raise ValueError(
                 "Foreign, deleting or incompatible network resource; no adoption or forced upgrade"
@@ -167,12 +181,12 @@ def verify_pod_template(expected: dict, actual: dict) -> None:
                 raise ValueError("Network container security context differs")
 
 
-def comparable_spec(item: dict) -> dict:
+def comparable_spec(item: dict, *, minimal: bool = False) -> dict:
     """Normalize only observed API serialization of controller pod fields.
 
     Kubernetes canonicalizes whole CPU quantities to strings and omits false
-    mount flags, zero probe delays and null template annotations. Preserve the
-    original manifests and all other fields so actual changes still fail.
+    mount flags, zero probe delays and null template annotations. Minimal
+    budgets compare exact millicores and bytes after API canonicalization.
     """
     spec = deepcopy(item["spec"])
     if item["kind"] in {"Deployment", "DaemonSet"}:
@@ -183,7 +197,10 @@ def comparable_spec(item: dict) -> dict:
         for container in [*pod["containers"], *pod.get("initContainers", [])]:
             for budget in container.get("resources", {}).values():
                 cpu = budget.get("cpu")
-                if type(cpu) is int:
+                if minimal:
+                    for resource in {"cpu", "memory"} & budget.keys():
+                        budget[resource] = quantity(str(budget[resource]), cpu=resource == "cpu")
+                elif type(cpu) is int:
                     budget["cpu"] = str(cpu)
                 elif (
                     isinstance(cpu, str)
@@ -208,10 +225,14 @@ def observe(target: Target, shared: list[dict], documents: list[dict]) -> dict[s
             raise ValueError("Network resource missing; no readiness pass")
         for key in ("spec", "rules", "roleRef", "subjects", "data"):
             expected_value = (
-                comparable_spec(item) if key == "spec" and key in item else item.get(key)
+                comparable_spec(item, minimal=target.profile == MINIMAL_PROFILE)
+                if key == "spec" and key in item
+                else item.get(key)
             )
             actual_value = (
-                comparable_spec(actual) if key == "spec" and key in actual else actual.get(key)
+                comparable_spec(actual, minimal=target.profile == MINIMAL_PROFILE)
+                if key == "spec" and key in actual
+                else actual.get(key)
             )
             if key in item and not contains(expected_value, actual_value):
                 raise ValueError(f"Network {item['kind']} {item['metadata']['name']} {key} drift")

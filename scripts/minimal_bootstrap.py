@@ -25,6 +25,9 @@ from . import host_admission as admission
 from . import host_observation as host
 from .consumer_profile import MINIMAL_PROFILE, Target, identity, load_profile
 from .local_kind import ROOT
+from .network_assets import RELEASE_FILE
+
+NETWORK_RELEASE_PATH = RELEASE_FILE.relative_to(ROOT)
 
 
 def validate_request(target, request: dict, artifact_digest: str) -> None:
@@ -150,7 +153,7 @@ def kernel_metrics(path, memory: int) -> dict:
     }
 
 
-def source_digest() -> str:
+def source_digest(*, network_release: bytes | None = None) -> str:
     """Bind actual executable source, profiles and lock, including uncommitted changes."""
     paths = sorted(
         [
@@ -159,9 +162,11 @@ def source_digest() -> str:
             ROOT / "uv.lock",
         ]
     )
-    return admission.digest(
-        {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest() for p in paths}
-    )
+    manifest = {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest() for p in paths}
+    if network_release is None:
+        network_release = (ROOT / NETWORK_RELEASE_PATH).read_bytes()
+    manifest[str(NETWORK_RELEASE_PATH)] = hashlib.sha256(network_release).hexdigest()
+    return admission.digest(manifest)
 
 
 def create(
