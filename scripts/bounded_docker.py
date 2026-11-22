@@ -212,6 +212,8 @@ def forward(args: list[str], selection: dict) -> list[str]:
     """Delegate only bounded creation's observations and owned in-node bootstrap."""
     if not args:
         raise ValueError("Missing Docker operation")
+    if args == ["-v"]:
+        return args
     operation = args[0]
     if operation in {"info", "version", "ps", "inspect"}:
         return args

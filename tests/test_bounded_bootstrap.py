@@ -315,6 +315,7 @@ class DockerProtocolTests(unittest.TestCase):
         from scripts import bounded_docker as adapter
 
         selection = adapter.policy(self.target, "owner-nonce", self.root)
+        self.assertEqual(adapter.forward(["-v"], selection), ["-v"])
         lookup = ["network", "ls", "--filter=name=^kind$", "--format={{.ID}}"]
         self.assertEqual(adapter.forward(lookup, selection), lookup)
         for args in (["network", "create", "kind"], ["network", "rm", "kind"], ["network", "ls"]):
