@@ -130,6 +130,11 @@ temporary duplication, only the existing environment implementation is active.
 Consumers pin a reviewed immutable infrastructure release or revision. They do
 not execute an unreviewed branch or infer compatibility from repository layout.
 
+The [physical host admission gate](../host-admission.md) accepts product-neutral
+resource bounds and observes native Linux memory and physical storage. Its receipt
+is a fresh budget snapshot, not cluster ownership or installed acceptance. The
+minimal-demo lifecycle remains unavailable until bounded creation is implemented.
+
 ## Failure contract
 
 Infrastructure commands distinguish at least:
