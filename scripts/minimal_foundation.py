@@ -32,9 +32,10 @@ def resources(bounds: tuple[int, int, int, int]) -> dict:
 
 
 def kubeadm_configuration() -> str:
+    # kind v0.31.0 still emits v1beta3. Its merge matches the exact API version.
     return yaml.safe_dump(
         {
-            "apiVersion": "kubeadm.k8s.io/v1beta4",
+            "apiVersion": "kubeadm.k8s.io/v1beta3",
             "kind": "InitConfiguration",
             "patches": {"directory": PATCH_DIRECTORY},
         }
