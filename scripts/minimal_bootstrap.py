@@ -387,7 +387,7 @@ def network_operation(target: Target) -> Iterator[None]:
 
 
 def network_bootstrap(
-    target: Target, request: dict, expected_host_id: str
+    target: Target, request: dict, expected_host_id: str, *, retained_growth_bytes: int = 0
 ) -> tuple[dict, list[dict]]:
     """Re-admit the network stage against this exact disposable cold bootstrap."""
     from . import bounded_docker, consumer_lifecycle
@@ -437,6 +437,15 @@ def network_bootstrap(
         for field in ("cgroupIdentity", "startedAt")
     ):
         raise ValueError("Bounded node lifetime changed after cold bootstrap")
+    if type(retained_growth_bytes) is not int or not 0 <= retained_growth_bytes <= admission.GIB:
+        raise ValueError("Continuation may reserve at most one disposable 1Gi retained claim")
+    retained_accounts = [
+        item for item in request["disk"] if item["category"] == "retained" and item["limitBytes"]
+    ]
+    if retained_growth_bytes and (
+        len(retained_accounts) != 1 or retained_accounts[0]["limitBytes"] < retained_growth_bytes
+    ):
+        raise ValueError("Disposable retained claim requires one reviewed retained disk account")
     continuation_request = {
         **request,
         "memory": [
@@ -452,10 +461,12 @@ def network_bootstrap(
             ),
         ],
         # Cold admission already charged staging and retained allocations. The
-        # disposable Cilium phase refuses missing cached images and any PVCs
-        # before applying objects. Only runtime and preparation may grow here.
+        # Controllers require pre-staged images. Only the storage continuation
+        # spends the neutral claim reservation from the reviewed retained budget.
         "disk": [
-            {**item, "limitBytes": 0} if item["category"] in {"images", "retained"} else item
+            {**item, "limitBytes": retained_growth_bytes if item in retained_accounts else 0}
+            if item["category"] in {"images", "retained"}
+            else item
             for item in request["disk"]
         ],
     }

@@ -557,7 +557,7 @@ def qualify(target: Target, request: dict, expected_host_id: str) -> dict:
                 raise ValueError(
                     "Exact successful network qualification with its retained fixtures required"
                 )
-            path = network.reserve_receipt(target, database=True)
+            path = network.reserve_receipt(target, capability="database")
         receipt = {
             **identity(target),
             "incarnation": incarnation,

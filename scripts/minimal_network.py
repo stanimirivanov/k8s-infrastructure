@@ -10,6 +10,7 @@ import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import Literal
 
 from . import bootstrap_failure as failure
 from . import consumer_runtime as runtime
@@ -229,11 +230,12 @@ def foundation(
     }
 
 
-def reserve_receipt(target: Target, *, database: bool = False) -> Path:
-    capability = "database" if database else "network"
+def reserve_receipt(
+    target: Target, *, capability: Literal["network", "database", "delegation"] = "network"
+) -> Path:
     path = target.directory / f"{target.name}.{capability}-qualification.json"
     if target.directory.is_symlink():
-        raise ValueError("Redirected network evidence path")
+        raise ValueError("Redirected capability evidence path")
     # An existing receipt blocks retry, even when interrupted before the first write.
     with path.open("x", encoding="utf-8") as handle:
         os.fchmod(handle.fileno(), 0o600)
