@@ -91,7 +91,9 @@ class Target:
             raise ValueError("Unknown reviewed isolated consumer profile")
         if self.profile == TRANSITION_TEST_PROFILE and not self.consumer.startswith("qual-"):
             raise ValueError("Transition test profile requires a disposable qual- consumer")
-        if self.profile in NETWORK_PROFILES:
+        if self.profile in NETWORK_PROFILES or (
+            self.profile == MINIMAL_PROFILE and self.https_port is not None
+        ):
             if type(self.https_port) is not int or not 1024 <= self.https_port <= 65535:
                 raise ValueError("Networking profile requires explicit HTTPS host port 1024-65535")
         elif self.https_port is not None:
@@ -151,18 +153,13 @@ def configuration(target: Target) -> dict[str, Any]:
             for role in profile["nodes"]
         ],
     }
-    if target.profile == MINIMAL_PROFILE:
+    if target.profile in NETWORK_PROFILES or target.profile == MINIMAL_PROFILE:
         result["networking"] = {
             **result["networking"],
             "disableDefaultCNI": True,
             "kubeProxyMode": "none",
         }
-    if target.profile in NETWORK_PROFILES:
-        result["networking"] = {
-            **result["networking"],
-            "disableDefaultCNI": True,
-            "kubeProxyMode": "none",
-        }
+    if target.https_port is not None:
         result["nodes"][1]["extraPortMappings"] = [
             {
                 "containerPort": 8443,
@@ -188,6 +185,6 @@ def identity(target: Target) -> dict[str, str]:
         "profile": target.profile,
         "profileDigest": f"sha256:{hashlib.sha256(encoded).hexdigest()}",
     }
-    if target.profile in NETWORK_PROFILES:
+    if target.https_port is not None:
         result["httpsPort"] = str(target.https_port)
     return result

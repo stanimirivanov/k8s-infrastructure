@@ -43,6 +43,7 @@ def policy(target: Target, nonce: str, journal_dir: Path) -> dict[str, Any]:
         "image": profile["nodeImage"],
         "nonce": nonce,
         "journalDirectory": str(journal_dir.resolve()),
+        **({"httpsPort": target.https_port} if target.https_port is not None else {}),
         "nodes": {
             f"{target.name}-{role}": {"role": role, **budget}
             for role, budget in profile["nodes"].items()
@@ -123,6 +124,8 @@ def node_arguments(args: list[str], selection: dict) -> tuple[str, list[str]]:
         ):
             raise ValueError("Unexpected API listener protocol")
         expected += [args[index], "-e", "KUBECONFIG=/etc/kubernetes/admin.conf"]
+    elif "httpsPort" in selection:
+        expected.append(f"--publish=127.0.0.1:{selection['httpsPort']}:8443/tcp")
     expected.append(selection["image"])
     if args != expected:
         raise ValueError("Pinned kind node creation protocol changed; no uncapped fallback")
@@ -174,8 +177,11 @@ def intercept(args: list[str], selection: dict, invoke: Callable[[list[str]], st
     path = directory / f"{name}.json"
     receipt = {**base, "id": container_id, "phase": "created"}
     write_receipt(path, receipt, exclusive=True)
+    inspect = INSPECT
+    if "httpsPort" in selection:
+        inspect = INSPECT[:-1] + ',"ports":{{json .HostConfig.PortBindings}}}'
     with failure.phase("docker-inspect", "dependency-failure"):
-        observed = json.loads(invoke(["inspect", "--format", INSPECT, container_id]))
+        observed = json.loads(invoke(["inspect", "--format", inspect, container_id]))
     expected = {
         "id": container_id,
         "name": f"/{name}",
@@ -190,6 +196,13 @@ def intercept(args: list[str], selection: dict, invoke: Callable[[list[str]], st
         "startedAt": "0001-01-01T00:00:00Z",
         "restartCount": 0,
     }
+    if "httpsPort" in selection:
+        publish = next(part for part in create if part.startswith("--publish="))
+        _, host_port, container_port = publish.split(":")
+        ports = {container_port: [{"HostIp": "127.0.0.1", "HostPort": host_port}]}
+        if observed.get("ports") != ports:
+            raise ValueError("Stopped node listener differs from the reviewed loopback mapping")
+        expected["ports"] = ports
     if observed != expected:
         raise ValueError("Stopped node identity or creation limits mismatch; start refused")
     receipt.update(beforeStart=observed, phase="prestart-verified", startRequestedAt=time.time_ns())

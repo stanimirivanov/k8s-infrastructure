@@ -9,6 +9,32 @@ from scripts.node_capacity import envelope
 
 
 class ProfileTests(unittest.TestCase):
+    def test_minimal_https_listener_is_opt_in_loopback_and_bound_to_owner(self):
+        from scripts.consumer_profile import identity
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = Target("qual-cold", "default", root, "minimal-demo", 18443)
+            nodes = configuration(target)["nodes"]
+            self.assertNotIn("extraPortMappings", nodes[0])
+            self.assertEqual(
+                nodes[1]["extraPortMappings"],
+                [
+                    {
+                        "containerPort": 8443,
+                        "hostPort": 18443,
+                        "listenAddress": "127.0.0.1",
+                        "protocol": "TCP",
+                    }
+                ],
+            )
+            self.assertEqual(identity(target)["httpsPort"], "18443")
+            self.assertNotIn(
+                "httpsPort", identity(Target("qual-cold", "default", root, "minimal-demo"))
+            )
+            with self.assertRaises(ValueError):
+                Target("qual-cold", "default", root, "minimal-demo", 443)
+
     def test_minimal_demo_has_exact_distinct_budgets_without_cni_installation(self):
         profile = load_profile(name="minimal-demo")
         self.assertEqual(profile["nodes"]["control-plane"], {"cpus": 2, "memoryBytes": 4294967296})
@@ -53,6 +79,46 @@ class ProfileTests(unittest.TestCase):
 
 
 class DockerProtocolTests(unittest.TestCase):
+    def test_worker_gateway_publish_is_exact_and_inspected_before_start(self):
+        import json
+
+        from scripts import bounded_docker as adapter
+
+        target = Target("qual-cold", "default", self.root, "minimal-demo", 18443)
+        name = f"{target.name}-worker"
+        selection = adapter.policy(target, "owner-nonce", self.root)
+        publish = "--publish=127.0.0.1:18443:8443/tcp"
+        args = [
+            part.replace(self.name, name).replace("role=control-plane", "role=worker")
+            for part in self.args[:-4]
+        ] + [publish, self.image]
+        for mapping in ("--publish=0.0.0.0:18443:8443/tcp", "--publish=127.0.0.1:18444:8443/tcp"):
+            with self.assertRaises(ValueError):
+                adapter.node_arguments([*args[:-2], mapping, self.image], selection)
+
+        actions = []
+
+        def docker(command):
+            actions.append(command[0])
+            if command[0] == "create":
+                self.assertIn(publish, command)
+                self.assertEqual(command[command.index("--memory") + 1], "8589934592")
+                return self.node["id"]
+            return json.dumps(
+                {
+                    **self.node,
+                    "name": "/" + name,
+                    "role": "worker",
+                    "memory": 8589934592,
+                    "swap": 8589934592,
+                    "ports": {"8443/tcp": [{"HostIp": "0.0.0.0", "HostPort": "18443"}]},
+                }
+            )
+
+        with self.assertRaisesRegex(ValueError, "listener"):
+            adapter.intercept(args, selection, docker)
+        self.assertEqual(actions, ["create", "inspect"])
+
     def test_adapter_failure_retains_safe_journal(self):
         import json
         from unittest.mock import patch
