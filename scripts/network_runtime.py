@@ -296,14 +296,34 @@ def resume(target: Target) -> dict:
 
 
 def wait_controller(target: Target, item: dict) -> None:
+    name = item["metadata"]["name"]
+    namespace = item["metadata"].get("namespace", "kube-system")
+    if item["kind"] == "DaemonSet" and item["spec"]["updateStrategy"]["type"] == "OnDelete":
+        # kubectl rollout status only supports RollingUpdate DaemonSets.
+        deadline = time.monotonic() + 300
+        while time.monotonic() < deadline:
+            live = json.loads(
+                kube(target, ["-n", namespace, "get", "daemonset", name, "-o", "json"])
+            )
+            status = live.get("status", {})
+            if (
+                status.get("observedGeneration") == live["metadata"]["generation"]
+                and all(
+                    status.get(key) == 2
+                    for key in (
+                        "desiredNumberScheduled",
+                        "currentNumberScheduled",
+                        "numberReady",
+                        "numberAvailable",
+                        "updatedNumberScheduled",
+                    )
+                )
+                and status.get("numberMisscheduled", 0) == 0
+            ):
+                return
+            time.sleep(2)
+        raise TimeoutError(f"Cilium DaemonSet {name} did not reach exactly two available Pods")
     kube(
         target,
-        [
-            "-n",
-            item["metadata"].get("namespace", "kube-system"),
-            "rollout",
-            "status",
-            f"{item['kind'].lower()}/{item['metadata']['name']}",
-            "--timeout=300s",
-        ],
+        ["-n", namespace, "rollout", "status", f"{item['kind'].lower()}/{name}", "--timeout=300s"],
     )

@@ -42,6 +42,23 @@ def main(argv: list[str] | None = None) -> int:
                         "qual-validation", "local-engine", Path(directory), profile, 18443
                     )
                     shared, documents = render(target, *assets)
+                    if profile == MINIMAL_PROFILE:
+                        from . import network_resources as resources
+                        from .network_fixtures import workloads
+
+                        print(
+                            json.dumps(
+                                {
+                                    "minimalDemoRequiredImages": resources.required_images(
+                                        resources.controllers(documents), workloads(target)
+                                    ),
+                                    "minimalDemoResourceEnvelope": resources.rendered_bounds(
+                                        target, documents
+                                    ),
+                                },
+                                sort_keys=True,
+                            )
+                        )
                     print(
                         f"Verified pinned networking assets and Helm render for {profile}: "
                         f"{len(shared)} APIs, {len(documents)} resources; no cluster access."

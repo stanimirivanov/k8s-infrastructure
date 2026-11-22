@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .consumer_profile import LABEL, Target
+from .consumer_profile import LABEL, MINIMAL_PROFILE, Target
 from .network_assets import selection
 
 
@@ -52,6 +52,8 @@ def workloads(target: Target) -> list[dict]:
                     "capabilities": {"drop": ["ALL"]},
                 },
             }
+            if target.profile == MINIMAL_PROFILE:
+                container["imagePullPolicy"] = "Never"
             if name == "client":
                 container["command"] = ["sleep", "3600"]
             else:

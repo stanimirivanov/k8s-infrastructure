@@ -8,11 +8,18 @@ import re
 import tempfile
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from . import bootstrap_failure as failure
 from . import consumer_runtime as runtime
-from . import host_admission, host_observation, minimal_bootstrap, network_qualification
+from . import (
+    host_admission,
+    host_observation,
+    minimal_bootstrap,
+    minimal_foundation,
+    network_qualification,
+)
 from . import network_resources as resources
 from . import network_runtime as network
 from .consumer_profile import MINIMAL_PROFILE, Target, identity, load_profile
@@ -77,7 +84,7 @@ def foundation(target: Target, installed: set[str], fixture_uids: set[str]) -> d
         meta = item["metadata"]
         if meta.get("deletionTimestamp"):
             raise ValueError("Terminating controller in the disposable target")
-        if key in FOUNDATION and 0 < item["spec"]["replicas"] <= FOUNDATION[key]:
+        if key in FOUNDATION and item["spec"]["replicas"] == FOUNDATION[key]:
             foundation_ids.add(meta["uid"])
         elif (
             key[1] in installed
@@ -99,7 +106,20 @@ def foundation(target: Target, installed: set[str], fixture_uids: set[str]) -> d
             raise ValueError("Unowned ReplicaSet in disposable Cilium target")
     observed = {role: {"cpu": 0, "memory": 0} for role in (*resources.ROLES, "unassigned")}
     limits = {role: {"cpu": 0, "memory": 0} for role in observed}
-    static = set()
+    expected = {
+        name: (name, minimal_foundation.resources(budget))
+        for name, budget in minimal_foundation.CONTROL_PLANE.items()
+    }
+    expected.update(
+        {
+            "coredns": ("coredns", minimal_foundation.resources(minimal_foundation.COREDNS)),
+            "local-path-provisioner": (
+                "local-path-provisioner",
+                minimal_foundation.resources(minimal_foundation.PROVISIONER),
+            ),
+        }
+    )
+    counts: dict[str, int] = {}
     pods = list_resources(target, "pods")
     inventory = []
     for pod in pods:
@@ -116,7 +136,7 @@ def foundation(target: Target, installed: set[str], fixture_uids: set[str]) -> d
             and node == f"{target.name}-control-plane"
             and meta.get("annotations", {}).get("kubernetes.io/config.mirror")
         ):
-            static.add(component)
+            pass
         elif owner_uid(pod) not in foundation_ids:
             raise ValueError("Unexpected Pod in otherwise disposable Cilium target")
         elif spec.get("nodeSelector", {}).get(resources.ROLE) != "worker" or role not in {
@@ -126,6 +146,7 @@ def foundation(target: Target, installed: set[str], fixture_uids: set[str]) -> d
             raise ValueError("Foundation add-on is not fixed to its reviewed worker placement")
         else:
             role = "worker"
+            component = spec["containers"][0]["name"]
         statuses = pod.get("status", {})
         if (
             role not in observed
@@ -144,6 +165,17 @@ def foundation(target: Target, installed: set[str], fixture_uids: set[str]) -> d
                 "Foundation Pod has failed, restarted, terminated or changed placement"
             )
         bounds = resources.pod_bounds(spec)
+        expected_name, expected_resources = expected.get(component, (None, None))
+        wanted = {"containers": [{"name": expected_name, "resources": expected_resources}]}
+        if (
+            expected_resources is None
+            or spec.get("ephemeralContainers")
+            or resources.normalized(bounds) != resources.normalized(resources.pod_bounds(wanted))
+        ):
+            raise ValueError(
+                f"Foundation component {component} differs from the reviewed finite budget"
+            )
+        counts[component] = counts.get(component, 0) + 1
         for key in observed[role]:
             observed[role][key] += bounds["effectiveRequests"][key]
             limits[role][key] += bounds["effectiveLimits"][key]
@@ -162,8 +194,8 @@ def foundation(target: Target, installed: set[str], fixture_uids: set[str]) -> d
                 "overhead": spec.get("overhead", {}),
             }
         )
-    if static != set(STATIC_PODS):
-        raise ValueError("Incomplete static foundation inventory")
+    if counts != {**dict.fromkeys(STATIC_PODS, 1), "local-path-provisioner": 1, "coredns": 2}:
+        raise ValueError("Incomplete foundation Pod inventory or unexpected replacement overlap")
     return {
         "systemRequestsByRole": observed,
         "systemLimitsByRole": limits,
@@ -236,6 +268,7 @@ def completed_containers(pod: dict, bounds: dict) -> dict:
             finished = observed.get("finishedAt", "")
             if (
                 observed.get("exitCode") != 0
+                or observed.get("reason") == "OOMKilled"
                 or not re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", finished)
                 or finished < started
             ):
@@ -290,6 +323,10 @@ def controller_pods(target: Target, controllers: dict[str, dict], accounted: dic
             or node != f"{target.name}-{role}"
             or key in evidence
             or images != wanted_images
+            or any(
+                c.get("imagePullPolicy") != "Never"
+                for c in [*spec.get("initContainers", []), *spec["containers"]]
+            )
             or resources.normalized(actual) != resources.normalized(accounted[controller])
         ):
             raise ValueError("Installed Cilium Pod resources, placement or image selection drifted")
@@ -319,6 +356,8 @@ def fixture_pods(target: Target, documents: list[dict]) -> dict:
             or spec.get("nodeName") != f"{target.name}-{role}"
             or [(c["name"], c["image"]) for c in spec["containers"]]
             != [(c["name"], c["image"]) for c in template["containers"]]
+            or spec.get("ephemeralContainers")
+            or any(c.get("imagePullPolicy") != "Never" for c in spec["containers"])
             or resources.normalized(bounds) != resources.normalized(resources.pod_bounds(template))
         ):
             raise ValueError("Installed fixture Pod drifted from the reviewed bounded manifest")
@@ -364,22 +403,29 @@ def record_peaks(
             )
 
 
-def install(target: Target, journals: list[dict], receipt: dict, path: Path) -> tuple[dict, dict]:
+def install(
+    target: Target, journals: list[dict], receipt: dict, path: Path, headroom: Callable[[], None]
+) -> tuple[dict, dict]:
     with failure.phase("network-assets", "missing-prerequisite"):
         shared, documents = render(target, *download())
         bounds = resources.rendered_bounds(target, documents)
+        controllers = resources.controllers(documents)
         receipt["networkSelection"] = labels(target)["k8s-infrastructure.io/network-selection"]
         pins = selection()
         receipt["artifactPins"] = {
             key: pins[key] for key in ("cilium", "ciliumCRDs", "gateway", "probes")
         }
         receipt["resourceEnvelope"] = bounds
+    with failure.phase("image-admission", "missing-prerequisite"):
+        headroom()
+        receipt["cachedImages"] = cached_images(target, journals, controllers)
     with failure.phase("foundation-admission", "resource-admission-refused"):
         network.require_fresh_cni(target)
         guarded_foundation(target, receipt, set(), set())
         record_peaks(target, journals, receipt, "pre-cilium", resources.stage_fit(target, {}))
         save_receipt(path, receipt)
     with failure.phase("network-apis", "dependency-failure"):
+        headroom()
         network.install_apis(target, shared, documents, fresh=True)
         network.apply_objects(
             target,
@@ -390,10 +436,10 @@ def install(target: Target, journals: list[dict], receipt: dict, path: Path) -> 
             ],
         )
     installed: dict[str, dict] = {}
-    controllers = resources.controllers(documents)
     pod_evidence: dict = {}
     for name in resources.CONTROLLERS:
         with failure.phase(f"startup-{name}", "resource-admission-refused"):
+            headroom()
             guarded_foundation(target, receipt, set(installed), set())
             if installed and controller_pods(target, installed, bounds["pods"]) != pod_evidence:
                 raise ValueError("Previous Cilium instance changed before the next startup stage")
@@ -410,6 +456,7 @@ def install(target: Target, journals: list[dict], receipt: dict, path: Path) -> 
             receipt["lastCompletedPhase"] = f"startup-{name}"
             save_receipt(path, receipt)
     with failure.phase("network-readiness", "dependency-failure"):
+        headroom()
         network.apply_objects(
             target, [item for item in documents if item["kind"] == "GatewayClass"]
         )
@@ -475,14 +522,25 @@ def qualify(target: Target, hostname: str, request: dict, expected_host_id: str)
                     floor.append(0)
 
         sampler = threading.Thread(target=sample, daemon=True)
+
+        def headroom() -> None:
+            floor.append(host_observation.mem_available())
+            if min(floor) < 4 * host_admission.GIB:
+                raise failure.Failure(
+                    {"category": "resource-admission-refused", "phase": "physical-host-floor"}
+                )
+            receipt["physicalDiskFreeBytes"] = disk_floor(
+                request, expected_host_id, prior["networkAdmission"]
+            )
+
         sampler.start()
         try:
-            run_qualification(target, hostname, journals, receipt, path)
+            run_qualification(target, hostname, journals, receipt, path, headroom)
             with failure.phase("completion", "resource-admission-refused"):
                 stopped.set()
                 sampler.join(timeout=2)
-                floor.append(host_observation.mem_available())
-                if sampler.is_alive() or min(floor) < 4 * host_admission.GIB:
+                headroom()
+                if sampler.is_alive():
                     raise ValueError(
                         "Physical host memory floor was not preserved during Cilium qualification"
                     )
@@ -514,10 +572,16 @@ def qualify(target: Target, hostname: str, request: dict, expected_host_id: str)
 
 
 def run_qualification(
-    target: Target, hostname: str, journals: list[dict], receipt: dict, path: Path
+    target: Target,
+    hostname: str,
+    journals: list[dict],
+    receipt: dict,
+    path: Path,
+    headroom: Callable[[], None],
 ) -> None:
-    controllers, accounted = install(target, journals, receipt, path)
+    controllers, accounted = install(target, journals, receipt, path, headroom)
     with failure.phase("fixture-admission", "resource-admission-refused"):
+        headroom()
         documents = workloads(target)
         fixture_bounds: dict[str, list[dict]] = {role: [] for role in resources.ROLES}
         for item in documents:
@@ -544,10 +608,12 @@ def run_qualification(
         receipt["lastCompletedPhase"] = "fixture-admission"
         save_receipt(path, receipt)
     with failure.phase("allowed-denied-traffic", "dependency-failure"):
+        headroom()
         receipt["networkEvidence"] = network_qualification.traffic(target)
         receipt["lastCompletedPhase"] = "allowed-denied-traffic"
         save_receipt(path, receipt)
     with failure.phase("gateway-and-policy", "dependency-failure"):
+        headroom()
         receipt["tlsEvidence"] = network_qualification.tls(target, hostname)
         receipt["lastCompletedPhase"] = "gateway-and-policy"
         save_receipt(path, receipt)
@@ -563,10 +629,72 @@ def run_qualification(
                 "Controller or fixture changed during allowed/denied traffic qualification"
             )
         runtime.read_readiness(target)
+        check_failure_events(target)
         record_peaks(
             target,
             journals,
             receipt,
             "fixture-traffic",
             receipt["fixtureResourceEnvelope"]["steady"],
+        )
+
+
+def cached_images(target: Target, journals: list[dict], controllers: dict[str, dict]) -> dict:
+    """Identify preloaded immutable image content on each verified node before any CNI writes."""
+    images = resources.required_images(controllers, workloads(target))
+    evidence = {}
+    for journal in journals:
+        node = journal["name"]
+        evidence[node] = {}
+        for image in sorted(images[journal["role"]]):
+            response = runtime.command(
+                target,
+                [
+                    "docker",
+                    "--context",
+                    target.docker_context,
+                    "exec",
+                    journal["id"],
+                    "crictl",
+                    "--image-endpoint",
+                    "unix:///run/containerd/containerd.sock",
+                    "inspecti",
+                    "-o",
+                    "json",
+                    image,
+                ],
+            )
+            observed = json.loads(response)["status"]
+            repository, digest = image.split("@", 1)
+            expected = repository.rsplit(":", 1)[0] + "@" + digest
+            if expected not in observed.get("repoDigests", []) or not re.fullmatch(
+                r"sha256:[a-f0-9]{64}", observed.get("id", "")
+            ):
+                raise ValueError(
+                    f"Exact immutable image must already be staged on the {journal['role']}"
+                )
+            evidence[node][image] = {"configDigest": observed["id"], "repoDigest": expected}
+    return evidence
+
+
+def disk_floor(request: dict, host_id: str, decision: dict) -> dict[str, int]:
+    available = {}
+    for account in request["disk"]:
+        path = host_observation.ordinary_path(account["path"])
+        filesystem = host_admission.digest([host_id, path.stat().st_dev])
+        if filesystem not in available:
+            status = os.statvfs(path)
+            available[filesystem] = status.f_bavail * status.f_frsize
+    if set(available) != {store["filesystemId"] for store in decision["filesystems"]}:
+        raise ValueError("Network disk charge moved to a different observed filesystem")
+    if min(available.values()) < 10 * host_admission.GIB:
+        raise ValueError("Physical disk free space fell below the reviewed floor")
+    return available
+
+
+def check_failure_events(target: Target) -> None:
+    failures = {"Evicted", "BackOff", "OOMKilling", "Preempted", "UnexpectedAdmissionError"}
+    if any(event.get("reason") in failures for event in list_resources(target, "events")):
+        raise ValueError(
+            "Eviction, runtime failure or unexpected Pod restart occurred during qualification"
         )

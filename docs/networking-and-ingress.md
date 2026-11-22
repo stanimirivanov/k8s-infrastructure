@@ -18,6 +18,8 @@
 - CA bundles are public; CA keys, provider credentials and kubeconfigs are not.
   No automatic host trust installation or insecure verification is supported.
 
+The separately admitted `minimal-demo` Cilium path has its own [operating guide](minimal-network.md).
+
 ## Profile and ownership
 
 The profile pins kind v0.31.0/Kubernetes v1.35.0 by the existing node-image

@@ -117,6 +117,7 @@ def selection() -> dict:
         "init": {name: resources(100, 1000, memory, memory) for name, memory in INIT.items()},
         "placement": {name: roles_for(name) for name in CONTROLLERS},
         "rollout": "delete-before-replacement-v1",
+        "imagePullPolicy": "Never",
         "systemReservation": SYSTEM,
         "systemCPULimitMillicores": SYSTEM_CPU_LIMIT,
         "extraMemoryBytes": EXTRA_MEMORY,
@@ -138,6 +139,8 @@ def configure(target: Target, controllers: dict[str, dict]) -> None:
         ):
             raise ValueError("Minimal-demo Cilium container inventory changed")
         main[0]["resources"] = MAIN[name]
+        for c in [*main, *initial]:
+            c["imagePullPolicy"] = "Never"
         for c in initial:
             c["resources"] = selection()["init"][c["name"]]
         pod["nodeSelector"] = {
@@ -241,3 +244,18 @@ def normalized(bounds: dict) -> dict:
             for name, container in bounds["containers"].items()
         },
     }
+
+
+def required_images(controllers: dict[str, dict], fixtures: list[dict]) -> dict[str, list[str]]:
+    images: dict[str, set[str]] = {role: set() for role in ROLES}
+    for name, item in controllers.items():
+        pod = item["spec"]["template"]["spec"]
+        for role in roles_for(name):
+            images[role].update(
+                c["image"] for c in [*pod.get("initContainers", []), *pod["containers"]]
+            )
+    for item in fixtures:
+        if item["kind"] == "Pod":
+            pod = item["spec"]
+            images[pod["nodeSelector"][ROLE]].update(c["image"] for c in pod["containers"])
+    return {role: sorted(refs) for role, refs in images.items()}
