@@ -145,6 +145,11 @@ def check_document(desired: dict, actual: dict, *, type_checked: bool = True) ->
         "ResourceQuota",
     } and (canonical_policy(kind, desired["spec"]) != canonical_policy(kind, actual["spec"])):
         raise ValueError("Demo admission or quota scope drifted")
+    if kind == "ResourceQuota" and type_checked:
+        status = actual.get("status", {})
+        hard = desired["spec"]["hard"]
+        if status.get("hard") != hard or not hard.keys() <= status.get("used", {}).keys():
+            raise ValueError("Demo quota accounting pending")
     if kind == "ValidatingAdmissionPolicy" and type_checked:
         status = actual.get("status", {})
         if (
@@ -213,7 +218,10 @@ def configure(target: Target, operation: Operation | None) -> None:
                 inspect(target, policies)
                 break
             except ValueError as error:
-                if str(error) != "Demo admission type checking pending":
+                if str(error) not in {
+                    "Demo admission type checking pending",
+                    "Demo quota accounting pending",
+                }:
                     raise
                 time.sleep(1)
         if operation:
@@ -343,6 +351,30 @@ def probe_images() -> tuple[str, str]:
     return PROBE_IMAGE, database_assets.selection()["images"]["kind-helper"]
 
 
+def verify_storage_helper(target: Target, database: dict) -> None:
+    expected = database["storageDriver"]
+    actual = json.loads(
+        kube(
+            target,
+            [
+                "-n",
+                "local-path-storage",
+                "get",
+                "configmap",
+                "local-path-config",
+                "-o",
+                "json",
+            ],
+        )
+    )
+    if (
+        actual["metadata"].get("deletionTimestamp")
+        or actual["metadata"]["uid"] != expected.get("configurationUID")
+        or host_admission.digest(actual["data"]) != expected.get("configurationDigest")
+    ):
+        raise ValueError("The qualified local-path helper configuration changed")
+
+
 def qualify(target: Target, request: dict, host_id: str) -> dict:
     from .minimal_delegation_storage import qualify_storage
 
@@ -420,6 +452,7 @@ def qualify(target: Target, request: dict, host_id: str) -> dict:
                 publish("authorization-and-admission")
             with failure.phase("retained-filesystem", "dependency-failure"):
                 minimal_network.disk_floor(request, host_id, cold["networkAdmission"])
+                verify_storage_helper(target, database)
                 receipt["retainedFilesystem"] = qualify_storage(target, operation.namespace)
                 publish("retained-filesystem")
             with failure.phase("completion", "identity-mismatch"):

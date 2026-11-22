@@ -106,7 +106,7 @@ def pvc_delete(target, item: dict) -> None:
     current = json.loads(kube(target, ["-n", namespace, "get", "pvc", name, "-o", "json"]))
     if (
         current["metadata"]["uid"] != metadata["uid"]
-        or current["status"]["phase"] != "Pending"
+        or current.get("status", {}).get("phase", "Pending") != "Pending"
         or current["spec"].get("volumeName")
         or current["metadata"].get("annotations", {}).get("volume.kubernetes.io/selected-node")
     ):

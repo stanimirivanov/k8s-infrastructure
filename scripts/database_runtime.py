@@ -80,6 +80,7 @@ def apply_objects(target: Target, documents: list[dict]) -> None:
 
 def verify_driver(target: Target, documents: list[dict]) -> dict:
     """Qualify kind's pre-existing provisioner without adopting or modifying it."""
+    config_evidence = {}
     for kind, name in (
         ("StorageClass", "standard"),
         ("Deployment", "local-path-provisioner"),
@@ -102,6 +103,12 @@ def verify_driver(target: Target, documents: list[dict]) -> dict:
                 from .minimal_foundation import bounded_storage_config
 
                 data = bounded_storage_config(data)
+                from .host_admission import digest
+
+                config_evidence = {
+                    "configurationDigest": digest(data),
+                    "configurationUID": actual["metadata"]["uid"],
+                }
             if actual.get("data") != data:
                 raise ValueError("Kind storage setup, teardown or path differs; no implicit repair")
         elif not contains(comparable_spec(expected), comparable_spec(actual)):
@@ -137,6 +144,7 @@ def verify_driver(target: Target, documents: list[dict]) -> dict:
     if available < 4 * 1024**3:
         raise ValueError("Local backing filesystem has less than 4 GiB available")
     return {
+        **config_evidence,
         "backingFilesystemAvailableBytes": available,
         "capacityReserved": False,
         "requestedCapacityHardEnforced": False,
