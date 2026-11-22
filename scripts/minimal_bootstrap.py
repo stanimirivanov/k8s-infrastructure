@@ -168,11 +168,11 @@ def source_digest(
     if network_release is None:
         network_release = (ROOT / NETWORK_RELEASE_PATH).read_bytes()
     manifest[str(NETWORK_RELEASE_PATH)] = hashlib.sha256(network_release).hexdigest()
-    from .database_assets import RELEASE_FILE as database_path
+    from .database_assets import RELEASE_PATH as database_path
 
     if database_release is None:
-        database_release = database_path.read_bytes()
-    manifest[str(database_path.relative_to(ROOT))] = hashlib.sha256(database_release).hexdigest()
+        database_release = (ROOT / database_path).read_bytes()
+    manifest[str(database_path)] = hashlib.sha256(database_release).hexdigest()
     return admission.digest(manifest)
 
 

@@ -10,6 +10,7 @@ import json
 import re
 import subprocess
 import sys
+from pathlib import Path
 from urllib.request import urlopen
 
 import yaml
@@ -17,8 +18,8 @@ import yaml
 from .consumer_profile import LABEL, MINIMAL_PROFILE, Target
 from .local_kind import ROOT
 
-DIRECTORY = ROOT / "clusters/local-kind/isolated-network-local/database"
-RELEASE_FILE = DIRECTORY / "releases.json"
+RELEASE_PATH = Path("clusters/local-kind/isolated-network-local/database/releases.json")
+RELEASE_FILE = ROOT / RELEASE_PATH
 MANAGER = "k8s-infrastructure-database"
 STORAGE_CLASS = "local-retained"
 MAX_BYTES = 16 * 1024 * 1024

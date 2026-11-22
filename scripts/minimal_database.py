@@ -74,7 +74,10 @@ def admit_pod(target: Target, manifest: dict) -> dict:
     result = json.loads(
         kube(target, ["create", "--dry-run=server", "-f", "-", "-o", "json"], [pod])
     )
-    return check_pod(manifest, result["items"][0] if result.get("kind") == "List" else result)
+    items = result["items"] if result.get("kind") == "List" else [result]
+    if len(items) != 1 or reference(items[0]) != reference(pod):
+        raise ValueError("Database Pod admission returned an unexpected resource")
+    return check_pod(manifest, items[0])
 
 
 def deployment_evidence(
@@ -154,7 +157,11 @@ def install_support(target: Target, group: list[dict]) -> None:
 
 
 def restart_controller(
-    target: Target, manifest: dict, deployment_uid: str, after_drain: Callable[[], None]
+    target: Target,
+    manifest: dict,
+    deployment_uid: str,
+    pod_uid: str,
+    after_drain: Callable[[], None],
 ) -> None:
     """Scale one exact Deployment, wait for termination, then resume the same object."""
     name, namespace = manifest["metadata"]["name"], manifest["metadata"]["namespace"]
@@ -183,24 +190,23 @@ def restart_controller(
         )
 
     scale(1, 0)
-    end = time.monotonic() + 90
-    while True:
-        replicas = [
-            item
-            for item in json.loads(kube(target, [*prefix, "get", "replicasets", "-o", "json"]))[
-                "items"
+    with runtime.deadline(90):
+        while True:
+            runtime.remaining_timeout()
+            replicas = [
+                item
+                for item in json.loads(kube(target, [*prefix, "get", "replicasets", "-o", "json"]))[
+                    "items"
+                ]
+                if owner_uid(item) == deployment_uid
             ]
-            if owner_uid(item) == deployment_uid
-        ]
-        owners = {item["metadata"]["uid"] for item in replicas}
-        pods = json.loads(kube(target, [*prefix, "get", "pods", "-o", "json"]))["items"]
-        if not any(item["spec"]["replicas"] for item in replicas) and not any(
-            owner_uid(pod) in owners for pod in pods
-        ):
-            break
-        if time.monotonic() >= end:
-            raise TimeoutError("Database controller did not stop before replacement")
-        time.sleep(1)
+            owners = {item["metadata"]["uid"] for item in replicas}
+            pods = json.loads(kube(target, [*prefix, "get", "pods", "-o", "json"]))["items"]
+            if not any(item["spec"]["replicas"] for item in replicas) and not any(
+                pod["metadata"]["uid"] == pod_uid or owner_uid(pod) in owners for pod in pods
+            ):
+                break
+            time.sleep(1)
     after_drain()
     scale(0, 1)
 
@@ -228,10 +234,12 @@ class Qualification:
         self.manifests: dict = {}
         self.staged: dict = {}
 
-    def publish(self, phase: str) -> None:
+    def publish(self, phase: str, *, drained: str | None = None) -> None:
         self.receipt["lastCompletedPhase"] = phase
         self.receipt["controllerPods"] = {
-            name: {"deploymentUID": uid, **pod} for name, (uid, pod) in self.active.items()
+            name: {"deploymentUID": uid, **pod}
+            for name, (uid, pod) in self.active.items()
+            if name != drained
         }
         network.save_receipt(self.path, self.receipt)
 
@@ -289,7 +297,9 @@ class Qualification:
         with failure.phase(f"startup-{name}", "dependency-failure"):
             manifest = self.manifests[name]
             self.checkpoint()
-            admit_pod(self.target, manifest)
+            self.receipt.setdefault("admittedPodBoundsByStage", {})[f"startup-{name}"] = admit_pod(
+                self.target, manifest
+            )
             database_runtime.apply_objects(self.target, [manifest])
             wait_deployment(self.target, manifest)
             self.active[name] = self.inspect({name})[name]
@@ -302,13 +312,20 @@ class Qualification:
             manifest = self.manifests[name]
             self.checkpoint()
             uid, prior = self.active[name]
-            admit_pod(self.target, manifest)
+            self.receipt.setdefault("admittedPodBoundsByStage", {})[f"restart-{name}"] = admit_pod(
+                self.target, manifest
+            )
 
             def drained() -> None:
                 self.checkpoint(drained=name)
-                self.publish(f"drained-{name}")
+                self.receipt.setdefault("replacements", {})[name] = {
+                    "deploymentUID": uid,
+                    "oldPodUID": prior["uid"],
+                    "oldPodTerminated": True,
+                }
+                self.publish(f"drained-{name}", drained=name)
 
-            restart_controller(self.target, manifest, uid, drained)
+            restart_controller(self.target, manifest, uid, prior["uid"], drained)
             wait_deployment(self.target, manifest)
             replacement_uid, replacement = self.inspect({name})[name]
             if replacement_uid != uid or replacement["uid"] == prior["uid"]:
@@ -316,11 +333,7 @@ class Qualification:
             self.active[name] = replacement_uid, replacement
             self.checkpoint()
             self.peak(f"restart-{name}", self.bounds["oneReplacementByController"][name])
-            self.receipt.setdefault("replacements", {})[name] = {
-                "deploymentUID": uid,
-                "oldPodUID": prior["uid"],
-                "newPodUID": replacement["uid"],
-            }
+            self.receipt["replacements"][name]["newPodUID"] = replacement["uid"]
             self.publish(f"restart-{name}")
 
     def run(self) -> None:
@@ -362,6 +375,24 @@ class Qualification:
             if pod_resources.rendered_bounds(target, documents) != prior["resourceEnvelope"]:
                 raise ValueError("Network qualification resource selection changed")
             groups = database_assets.render(target, assets, release=release)
+            custom = {
+                (group, *reference(item)): item
+                for group, items in groups.items()
+                for item in items
+                if item["kind"] not in database_runtime.BUILTINS
+            }
+            if set(custom) != {
+                ("barman", "Issuer", "selfsigned-issuer", "cnpg-system"),
+                ("barman", "Certificate", "barman-cloud-client", "cnpg-system"),
+                ("barman", "Certificate", "barman-cloud-server", "cnpg-system"),
+            }:
+                raise ValueError("Unexpected database custom resource inventory")
+            issuer = custom["barman", "Issuer", "selfsigned-issuer", "cnpg-system"]
+            server = custom["barman", "Certificate", "barman-cloud-server", "cnpg-system"]
+            certificates = [
+                custom["barman", "Certificate", "barman-cloud-client", "cnpg-system"],
+                server,
+            ]
             self.manifests = resources.controllers(groups)
             self.bounds = resources.rendered_bounds(
                 target, groups, cilium=prior["resourceEnvelope"]["pods"], fixtures=self.fixtures
@@ -381,6 +412,9 @@ class Qualification:
             ] + [storage]
             if database_runtime.inventory(target, builtins):
                 raise ValueError("Existing database resources prevent a disposable qualification")
+            receipt["storageDriver"] = database_runtime.verify_driver(
+                target, assets["kind-storage"]
+            )
             self.peak(
                 "database-admission",
                 resources.stage_fit(
@@ -401,9 +435,7 @@ class Qualification:
             self.checkpoint()
             install_support(target, groups["cnpg"])
             install_support(target, groups["barman"])
-            issuer = next(item for item in groups["barman"] if item["kind"] == "Issuer")
-            certificates = [item for item in groups["barman"] if item["kind"] == "Certificate"]
-            probes.certificate_admission(target, issuer)
+            receipt["certificateAdmission"] = probes.certificate_admission(target, issuer)
             database_runtime.apply_objects(target, [issuer])
             receipt["issuer"] = probes.issuer_evidence(target, issuer)
             database_runtime.apply_objects(target, certificates)
@@ -413,14 +445,20 @@ class Qualification:
         with failure.phase("database-api-readiness", "dependency-failure"):
             self.checkpoint()
             database_runtime.apply_objects(target, [storage])
-            probes.cnpg_admission(target, postgres_image=release["images"]["postgres"])
+            receipt["cnpgAdmission"] = probes.cnpg_admission(
+                target, postgres_image=release["images"]["postgres"]
+            )
             self.publish("database-api-readiness")
         self.start("barman-cloud")
         for name in resources.STARTUP:
             self.restart(name)
             with failure.phase(f"recovery-{name}", "dependency-failure"):
-                probes.certificate_admission(target, issuer)
-                probes.cnpg_admission(target, postgres_image=release["images"]["postgres"])
+                receipt["replacements"][name]["certificateAdmission"] = (
+                    probes.certificate_admission(target, issuer)
+                )
+                receipt["replacements"][name]["cnpgAdmission"] = probes.cnpg_admission(
+                    target, postgres_image=release["images"]["postgres"]
+                )
                 current = probes.certificate_evidence(target, certificates)
                 if (
                     current != receipt["certificates"]
@@ -430,11 +468,6 @@ class Qualification:
                         "Original Barman Certificates or Issuer changed on controller restart"
                     )
                 if name == "cert-manager":
-                    server = next(
-                        item
-                        for item in certificates
-                        if item["metadata"]["name"] == "barman-cloud-server"
-                    )
                     certificate = probes.recovery_certificate(server)
                     probes.create_recovery_certificate(target, certificate)
                     receipt["postRestartCertificate"] = probes.certificate_evidence(
