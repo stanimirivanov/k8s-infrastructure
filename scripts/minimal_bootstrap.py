@@ -173,10 +173,10 @@ def source_digest(
     if database_release is None:
         database_release = (ROOT / database_path).read_bytes()
     manifest[str(database_path)] = hashlib.sha256(database_release).hexdigest()
-    from .delegated_argo_config import SELECTION as argo_selection
+    from .delegated_argo_config import SELECTION_PATH as argo_selection_path
 
-    manifest[str(argo_selection.relative_to(ROOT))] = hashlib.sha256(
-        argo_selection.read_bytes()
+    manifest[str(argo_selection_path)] = hashlib.sha256(
+        (ROOT / argo_selection_path).read_bytes()
     ).hexdigest()
     return admission.digest(manifest)
 
