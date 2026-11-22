@@ -9,6 +9,7 @@ import secrets
 import time
 from datetime import datetime
 
+from . import database_runtime
 from .consumer_profile import Target
 from .consumer_runtime import remaining_timeout
 from .database_assets import MANAGER
@@ -26,6 +27,7 @@ def _webhook_ready(
     configuration: str,
     name: str,
     service: tuple[str, str],
+    service_path: str,
     api_group: str,
     resource: str,
     operations: set[str],
@@ -42,6 +44,8 @@ def _webhook_ready(
         endpoint = hook.get("clientConfig", {}).get("service", {})
         if (
             (endpoint.get("namespace"), endpoint.get("name")) != service
+            or endpoint.get("path", "/") != service_path
+            or endpoint.get("port", 443) != 443
             or hook.get("failurePolicy") != "Fail"
             or hook.get("sideEffects") not in {"None", "NoneOnDryRun"}
             or hook.get("namespaceSelector", {}) != (namespace_selector or {})
@@ -51,6 +55,7 @@ def _webhook_ready(
                 (api_group in rule.get("apiGroups", []) or "*" in rule.get("apiGroups", []))
                 and ("v1" in rule.get("apiVersions", []) or "*" in rule.get("apiVersions", []))
                 and bool({resource, "*", "*/*"} & set(rule.get("resources", [])))
+                and rule.get("scope", "*") in {"Namespaced", "*"}
                 and (
                     operations <= set(rule.get("operations", []))
                     or "*" in rule.get("operations", [])
@@ -90,6 +95,7 @@ def certificate_admission(target: Target, issuer: dict) -> dict:
             configuration=f"{webhook_type}webhookconfiguration/cert-manager-webhook",
             name="webhook.cert-manager.io",
             service=("cert-manager", "cert-manager-webhook"),
+            service_path="/mutate" if mutating else "/validate",
             api_group="cert-manager.io",
             resource="certificaterequests" if mutating else "issuers",
             operations={"CREATE"} if mutating else {"CREATE", "UPDATE"},
@@ -112,6 +118,11 @@ def cnpg_admission(target: Target, *, postgres_image: str | None = None) -> dict
             configuration=f"{webhook_type}webhookconfiguration/cnpg-{webhook_type}-webhook-configuration",
             name=f"{webhook_type[0]}cluster.cnpg.io",
             service=("cnpg-system", "cnpg-webhook-service"),
+            service_path=(
+                "/mutate-postgresql-cnpg-io-v1-cluster"
+                if webhook_type == "mutating"
+                else "/validate-postgresql-cnpg-io-v1-cluster"
+            ),
             api_group="postgresql.cnpg.io",
             resource="clusters",
             operations={"CREATE"},
@@ -120,6 +131,67 @@ def cnpg_admission(target: Target, *, postgres_image: str | None = None) -> dict
     if postgres_image is not None:
         document["spec"]["imageName"] = postgres_image
     return _server_probe(target, document, ["create"])
+
+
+def barman_service_evidence(target: Target, expected: dict, pod_uid: str, worker: str) -> dict:
+    """Wait for CNPG plugin discovery to point to the current ready Barman Pod."""
+    service = database_runtime.inventory(target, [expected]).get(reference(expected), {})
+    metadata, spec = service.get("metadata", {}), service.get("spec", {})
+    service_uid = metadata.get("uid")
+    desired = expected["spec"]
+    if (
+        not service_uid
+        or not contains(expected["metadata"]["annotations"], metadata.get("annotations", {}))
+        or spec.get("selector") != desired["selector"]
+        or not contains(desired["ports"], spec.get("ports", []))
+        or spec.get("type", "ClusterIP") != "ClusterIP"
+        or spec.get("publishNotReadyAddresses", False)
+    ):
+        raise ValueError("Barman plugin Service differs from the reviewed discovery contract")
+    port = desired["ports"][0]["port"]
+    deadline = time.monotonic() + remaining_timeout(90)
+    args = [
+        "-n",
+        metadata["namespace"],
+        "get",
+        "endpointslices",
+        "-l",
+        f"kubernetes.io/service-name={metadata['name']}",
+        "-o",
+        "json",
+    ]
+    while True:
+        slices = json.loads(kube(target, args))["items"]
+        endpoints = [(slice_, endpoint) for slice_ in slices for endpoint in slice_["endpoints"]]
+        if len(endpoints) == 1:
+            slice_, endpoint = endpoints[0]
+            slice_meta = slice_["metadata"]
+            conditions = endpoint.get("conditions", {})
+            if (
+                slice_meta.get("uid")
+                and not slice_meta.get("deletionTimestamp")
+                and any(
+                    owner.get("kind") == "Service" and owner.get("uid") == service_uid
+                    for owner in slice_meta.get("ownerReferences", [])
+                )
+                and contains([{"port": port, "protocol": "TCP"}], slice_.get("ports", []))
+                and endpoint.get("nodeName") == worker
+                and contains(
+                    {"kind": "Pod", "namespace": metadata["namespace"], "uid": pod_uid},
+                    endpoint.get("targetRef", {}),
+                )
+                and conditions.get("ready") is True
+                and conditions.get("terminating") is not True
+            ):
+                return {
+                    "serviceUID": service_uid,
+                    "endpointSliceUID": slice_meta["uid"],
+                    "podUID": pod_uid,
+                    "port": port,
+                }
+        if time.monotonic() >= deadline:
+            raise TimeoutError("Plugin Service did not select the current Barman Pod")
+        time.sleep(1)
 
 
 def _ready(target: Target, document: dict) -> dict:

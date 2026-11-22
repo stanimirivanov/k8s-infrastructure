@@ -13,6 +13,30 @@ from tests import test_database
 
 
 class MinimalDatabaseTests(unittest.TestCase):
+    def test_support_refuses_namespace_created_after_freshness_check(self):
+        from scripts import consumer_runtime, minimal_database
+        from scripts.local_kind import CommandFailure
+
+        target = Target("qual-db-test", "local-engine", Path("/tmp"), "minimal-demo", 18443)
+        namespace = {"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "cnpg-system"}}
+        account = {
+            "apiVersion": "v1",
+            "kind": "ServiceAccount",
+            "metadata": {"name": "cnpg-manager", "namespace": "cnpg-system"},
+        }
+
+        def command(_target, args, *, input_data):
+            if "create" in args and namespace in json.loads(input_data)["items"]:
+                raise CommandFailure("AlreadyExists", exit_code=1)
+            return ""
+
+        with (
+            patch.object(consumer_runtime, "command", side_effect=command) as api,
+            self.assertRaisesRegex(CommandFailure, "AlreadyExists"),
+        ):
+            minimal_database.install_support(target, [namespace, account])
+        api.assert_called_once()
+
     def test_failed_network_receipt_refuses_database_writes_and_preserves_receipt(self):
         from scripts import bootstrap_failure, minimal_database
 
@@ -45,14 +69,84 @@ class MinimalDatabaseTests(unittest.TestCase):
                     minimal_database.minimal_bootstrap, "network_bootstrap", return_value=(cold, [])
                 ),
                 patch.object(minimal_database.runtime, "incarnation", return_value="owned"),
-                patch.object(minimal_database.database_runtime, "apply_objects") as apply,
+                patch("scripts.consumer_runtime.command") as command,
                 self.assertRaises(bootstrap_failure.Failure) as refused,
             ):
                 minimal_database.qualify(target, {}, "boot")
             self.assertEqual(refused.exception.evidence["phase"], "network-continuation")
             self.assertEqual(json.loads(path.read_text()), previous)
             self.assertEqual(list(target.directory.iterdir()), [path])
-            apply.assert_not_called()
+            command.assert_not_called()
+
+    def test_host_floor_failure_retains_its_own_phase_during_controller_startup(self):
+        from scripts import bootstrap_failure, host_admission, minimal_database
+
+        def start_controller(qualification):
+            qualification.manifests["cert-manager"] = {}
+            qualification.start("cert-manager")
+
+        for floor, memory in (("physical-host-memory", 3), ("physical-host-disk", 4)):
+            with self.subTest(floor=floor), TemporaryDirectory() as directory:
+                target = Target(
+                    "qual-db-test", "local-engine", Path(directory), "minimal-demo", 18443
+                )
+                target.directory.mkdir()
+                cold = {
+                    "artifactDigest": "sha256:" + "a" * 64,
+                    "sourceProvenance": {},
+                    "nodeImage": "pinned",
+                    "toolVersions": {},
+                    "networkAdmission": {},
+                }
+                previous = {
+                    **identity(target),
+                    **cold,
+                    "incarnation": "owned",
+                    "outcome": "qualified",
+                    "lastCompletedPhase": "completion",
+                    "installedNetworkQualified": True,
+                    "fixturePods": {"fixture": {"uid": "fixture-uid"}},
+                    "controllerPods": {"network": {}},
+                    "networkSelection": "reviewed",
+                    "kernelEvidenceByStage": {"pre-cilium": {}, "fixture-traffic": {}},
+                    "nodePeakCeilingBytes": {},
+                }
+                (target.directory / f"{target.name}.network-qualification.json").write_text(
+                    json.dumps(previous)
+                )
+                with (
+                    patch.object(
+                        minimal_database.minimal_bootstrap,
+                        "network_operation",
+                        return_value=nullcontext(),
+                    ),
+                    patch.object(
+                        minimal_database.minimal_bootstrap,
+                        "network_bootstrap",
+                        return_value=(cold, []),
+                    ),
+                    patch.object(minimal_database.runtime, "incarnation", return_value="owned"),
+                    patch.object(
+                        minimal_database.host_observation,
+                        "mem_available",
+                        return_value=memory * host_admission.GIB,
+                    ),
+                    patch.object(
+                        minimal_database.network, "disk_floor", side_effect=ValueError("private")
+                    ),
+                    patch.object(minimal_database.Qualification, "run", start_controller),
+                    self.assertRaises(bootstrap_failure.Failure) as refused,
+                ):
+                    minimal_database.qualify(target, {}, "boot")
+                receipt = json.loads(
+                    (target.directory / f"{target.name}.database-qualification.json").read_text()
+                )
+                self.assertEqual(receipt["outcome"], "failed")
+                self.assertEqual(receipt["lastCompletedPhase"], "network-verified")
+                self.assertEqual(
+                    receipt["failure"], {"category": "resource-admission-refused", "phase": floor}
+                )
+                self.assertEqual(refused.exception.evidence, receipt["failure"])
 
     def test_staged_envelope_accounts_retained_network_fixtures(self):
         from scripts import database_assets, minimal_database_resources

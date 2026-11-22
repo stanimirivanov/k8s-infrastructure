@@ -130,10 +130,21 @@ def wait_deployment(target: Target, manifest: dict) -> None:
     )
 
 
+def create_objects(target: Target, documents: list[dict]) -> None:
+    # Atomic create refuses a name claimed after inventory. Stop at the first refusal.
+    for item in documents:
+        kube(
+            target,
+            ["create", f"--field-manager={database_assets.MANAGER}", "-f", "-"],
+            [item],
+            request_timeout=120,
+        )
+
+
 def install_support(target: Target, group: list[dict]) -> None:
     schemas = [item for item in group if item["kind"] == "CustomResourceDefinition"]
     for item in schemas:
-        database_runtime.apply_objects(target, [item])
+        create_objects(target, [item])
         kube(
             target,
             [
@@ -144,8 +155,8 @@ def install_support(target: Target, group: list[dict]) -> None:
             ],
             request_timeout=90,
         )
-    database_runtime.apply_objects(target, [item for item in group if item["kind"] == "Namespace"])
-    database_runtime.apply_objects(
+    create_objects(target, [item for item in group if item["kind"] == "Namespace"])
+    create_objects(
         target,
         [
             item
@@ -300,7 +311,7 @@ class Qualification:
             self.receipt.setdefault("admittedPodBoundsByStage", {})[f"startup-{name}"] = admit_pod(
                 self.target, manifest
             )
-            database_runtime.apply_objects(self.target, [manifest])
+            create_objects(self.target, [manifest])
             wait_deployment(self.target, manifest)
             self.active[name] = self.inspect({name})[name]
             self.checkpoint()
@@ -338,6 +349,7 @@ class Qualification:
 
     def run(self) -> None:
         from . import minimal_database_probes as probes
+        from .minimal_database_ca import probe_ca_injection
 
         target, prior, receipt = self.target, self.previous, self.receipt
         with failure.phase("release-assets", "missing-prerequisite"):
@@ -393,6 +405,11 @@ class Qualification:
                 custom["barman", "Certificate", "barman-cloud-client", "cnpg-system"],
                 server,
             ]
+            barman_service = next(
+                item
+                for item in groups["barman"]
+                if reference(item) == ("Service", "barman-cloud", "cnpg-system")
+            )
             self.manifests = resources.controllers(groups)
             self.bounds = resources.rendered_bounds(
                 target, groups, cilium=prior["resourceEnvelope"]["pods"], fixtures=self.fixtures
@@ -436,20 +453,27 @@ class Qualification:
             install_support(target, groups["cnpg"])
             install_support(target, groups["barman"])
             receipt["certificateAdmission"] = probes.certificate_admission(target, issuer)
-            database_runtime.apply_objects(target, [issuer])
+            create_objects(target, [issuer])
             receipt["issuer"] = probes.issuer_evidence(target, issuer)
-            database_runtime.apply_objects(target, certificates)
+            create_objects(target, certificates)
             receipt["certificates"] = probes.certificate_evidence(target, certificates)
             self.publish("certificate-issuance")
         self.start("cnpg-controller-manager")
         with failure.phase("database-api-readiness", "dependency-failure"):
             self.checkpoint()
-            database_runtime.apply_objects(target, [storage])
+            create_objects(target, [storage])
             receipt["cnpgAdmission"] = probes.cnpg_admission(
                 target, postgres_image=release["images"]["postgres"]
             )
             self.publish("database-api-readiness")
         self.start("barman-cloud")
+        with failure.phase("barman-plugin-readiness", "dependency-failure"):
+            pod = self.active["barman-cloud"][1]
+            receipt["barmanPluginDiscovery"] = probes.barman_service_evidence(
+                target, barman_service, pod["uid"], pod["node"]
+            )
+            self.checkpoint()
+            self.publish("barman-plugin-readiness")
         for name in resources.STARTUP:
             self.restart(name)
             with failure.phase(f"recovery-{name}", "dependency-failure"):
@@ -473,6 +497,16 @@ class Qualification:
                     receipt["postRestartCertificate"] = probes.certificate_evidence(
                         target, [certificate]
                     )
+                if name == "cert-manager-cainjector":
+                    receipt["postRestartCAInjection"] = probe_ca_injection(target)
+                if name == "barman-cloud":
+                    pod = self.active[name][1]
+                    discovery = probes.barman_service_evidence(
+                        target, barman_service, pod["uid"], pod["node"]
+                    )
+                    if discovery["serviceUID"] != receipt["barmanPluginDiscovery"]["serviceUID"]:
+                        raise ValueError("Barman plugin Service changed during controller restart")
+                    receipt["replacements"][name]["pluginDiscovery"] = discovery
                 self.checkpoint()
                 self.peak(f"recovery-{name}", self.bounds["steady"])
                 self.publish(f"recovery-{name}")
@@ -563,14 +597,14 @@ def qualify(target: Target, request: dict, expected_host_id: str) -> dict:
                 sample_memory()
 
         def headroom() -> None:
-            sample_memory()
-            if min(floor) < 4 * host_admission.GIB:
-                raise ValueError(
-                    "Physical host memory floor was not preserved during database qualification"
+            with failure.phase("physical-host-memory", "resource-admission-refused"):
+                sample_memory()
+                if min(floor) < 4 * host_admission.GIB:
+                    raise ValueError("Physical host memory fell below the reviewed floor")
+            with failure.phase("physical-host-disk", "resource-admission-refused"):
+                receipt["physicalDiskFreeBytes"] = network.disk_floor(
+                    request, expected_host_id, cold["networkAdmission"]
                 )
-            receipt["physicalDiskFreeBytes"] = network.disk_floor(
-                request, expected_host_id, cold["networkAdmission"]
-            )
 
         sample_memory()
         sampler = threading.Thread(target=sample, daemon=True)

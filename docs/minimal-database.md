@@ -7,7 +7,7 @@ Status: installed qualification requires an explicitly authorized disposable run
 - Start from the same disposable target and source that passed [minimal-demo
   Cilium qualification](minimal-network.md).
 - Stage the five digest-qualified provider controller images on the owned worker
-  before applying the database provider selection.
+  before creating the database provider resources.
 - The gate checks worker placement, finite effective Pod resources, certificate
   issuance and stop-before-start controller replacement.
 - Keep the private qualification receipt. Removal is a separate operation
@@ -74,9 +74,12 @@ uv run --locked --offline python -m scripts.database qualify \
 
 ## Startup, evidence and recovery
 
-The gate uses the pinned cert-manager, CNPG and Barman resources. It observes
-controller startup on the worker, waits for the reviewed Barman issuer and
-client/server certificates, and exercises CNPG admission with a server dry-run.
+The gate creates the pinned cert-manager, CNPG and Barman resources and stops if
+a name is already in use. It observes controller startup on the worker, waits
+for the reviewed Barman issuer and client/server certificates, and exercises
+CNPG admission with a server dry-run. At startup and after Barman replacement,
+it checks that the reviewed CNPG plugin discovery Service has one ready endpoint
+for the current Barman Pod on the worker.
 It creates a new self-signed certificate after replacing the cert-manager
 controller to confirm that issuance resumes. After replacing the CA injector,
 it verifies injection of the public API server CA into a fresh webhook
@@ -89,15 +92,16 @@ before the replacement starts. Server dry-run and live Pod inspection check the
 complete admitted container inventory, including any initializer, sidecar or
 overhead. Live evidence records effective resource bounds, placement, lifecycle
 and peaks under the enclosing node caps. The operation has a 1,200-second shared
-deadline. Individual CRD, admission and termination waits run for at most 90
-seconds, and rollout and certificate waits for at most 120 seconds. The shared
-deadline can shorten any stage. Liveness or rendered resources alone cannot
-establish an installed result.
+deadline. Individual CRD, admission, termination and plugin endpoint waits run
+for at most 90 seconds, and rollout and certificate waits for at most 120
+seconds. The shared deadline can shorten any stage. Liveness or rendered
+resources alone cannot establish an installed result.
 
 Inspect `<target>.database-qualification.json` beneath the target state root's
 private `.local` directory. Use its last completed phase and sanitized failure
-details to distinguish an identity or host admission refusal, missing image,
-controller readiness failure, certificate failure or replacement failure. A
+details to distinguish an identity refusal, a physical host memory or disk
+admission refusal, a missing image, a controller readiness failure, a
+certificate failure or a replacement failure. A
 failure during replacement can leave the selected Deployment scaled to zero.
 Keep the detailed state and kubeconfig private. A failed smaller allocation blocks
 qualification. Use a newly admitted disposable target after reviewing a fix.
