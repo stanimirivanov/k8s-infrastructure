@@ -96,7 +96,7 @@ in the bootstrap receipt and the explicit context. For each node, get its
 host PID and verify the full ID and lifetime match the receipt:
 
 ```sh
-docker --context default inspect \
+timeout 10s docker --context default inspect \
   --format '{{.Id}} {{.State.Pid}} {{.State.StartedAt}}' "$NODE_CONTAINER_ID"
 cat "/proc/$NODE_PID/cgroup"
 ```
@@ -109,6 +109,13 @@ Pod's status. Find the corresponding `cri-containerd-<container-id>.scope`
 within the reviewed node's `kubepods.slice` and use that directory for `SCOPE`.
 Check the Pod UID, container kind and attempt as well as the node. The kubelet
 can remove a terminated container's cgroup before you compare it.
+
+```sh
+kubectl --kubeconfig /private/state/.local/qual-resource-01-local.kubeconfig \
+  --context kind-qual-resource-01-local --request-timeout=10s \
+  --namespace "$POD_NAMESPACE" get pod "$POD_NAME" \
+  -o 'custom-columns=UID:.metadata.uid,NODE:.spec.nodeName,INIT-IDS:.status.initContainerStatuses[*].containerID,APP-IDS:.status.containerStatuses[*].containerID'
+```
 
 ```sh
 stat --format='%d %i' -- "$SCOPE"
