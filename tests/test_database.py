@@ -58,6 +58,7 @@ class DatabaseTests(unittest.TestCase):
                                 "securityContext": {"runAsNonRoot": True},
                                 "containers": [
                                     {
+                                        "name": key,
                                         "image": images[key].split("@")[0],
                                         "securityContext": {
                                             "allowPrivilegeEscalation": False,
@@ -145,6 +146,38 @@ class DatabaseTests(unittest.TestCase):
                     pod = item["spec"]["template"]["spec"]
                     self.assertIn("@sha256:", pod["containers"][0]["image"])
                     self.assertEqual(pod["containers"][0]["resources"]["limits"]["cpu"], "500m")
+
+    def test_minimal_demo_renders_five_single_replica_worker_controllers(self):
+        target = Target("qual-neutral", "local-engine", self.root, "minimal-demo", 18444)
+        expected = {
+            "cert-manager": ("50m", "128Mi", "256Mi"),
+            "cert-manager-cainjector": ("50m", "64Mi", "128Mi"),
+            "cert-manager-webhook": ("50m", "64Mi", "128Mi"),
+            "cnpg-controller-manager": ("100m", "192Mi", "384Mi"),
+            "barman-cloud": ("50m", "64Mi", "128Mi"),
+        }
+        groups = assets.render(target, self.sources())
+        observed = {}
+        for docs in groups.values():
+            for item in docs:
+                if item["kind"] != "Deployment":
+                    continue
+                spec = item["spec"]
+                pod = spec["template"]["spec"]
+                self.assertEqual(spec["replicas"], 1)
+                self.assertEqual(spec["strategy"], {"type": "Recreate"})
+                self.assertEqual(pod["nodeSelector"]["k8s-infrastructure.io/role"], "worker")
+                self.assertEqual(pod["tolerations"], [])
+                (container,) = pod["containers"]
+                self.assertEqual(container["imagePullPolicy"], "Never")
+                bounds = container["resources"]
+                self.assertEqual(bounds["limits"]["cpu"], "500m")
+                observed[item["metadata"]["name"]] = (
+                    bounds["requests"]["cpu"],
+                    bounds["requests"]["memory"],
+                    bounds["limits"]["memory"],
+                )
+        self.assertEqual(observed, expected)
 
     def test_source_cannot_add_host_access_or_credential_payloads(self):
         for mutation in ("hostPath", "privileged", "secret"):

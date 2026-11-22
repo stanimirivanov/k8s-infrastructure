@@ -80,7 +80,12 @@ def owner_uid(item: dict) -> str | None:
 
 
 def foundation(
-    target: Target, installed: set[str], fixture_uids: set[str], selection_digest: str
+    target: Target,
+    installed: set[str],
+    fixture_uids: set[str],
+    selection_digest: str,
+    *,
+    additional: dict[tuple, str] | None = None,
 ) -> dict:
     """Inspect all Pod producers and residents before admitting another workload."""
     if list_resources(target, "persistentvolumeclaims,persistentvolumes"):
@@ -90,6 +95,8 @@ def foundation(
     )
     foundation_ids = set()
     network_ids = set()
+    additional = additional or {}
+    additional_ids = set()
     network_labels = ownership_labels(target, selection_digest)
     for item in controllers:
         key = reference(item)
@@ -104,10 +111,17 @@ def foundation(
             and all(meta.get("labels", {}).get(k) == v for k, v in network_labels.items())
         ):
             network_ids.add(meta["uid"])
+        elif key in additional and meta["uid"] == additional[key]:
+            additional_ids.add(meta["uid"])
         else:
             raise ValueError("Unexpected controller in otherwise disposable Cilium target")
-    if len(foundation_ids) != len(FOUNDATION) or len(network_ids) != len(installed):
+    if (
+        len(foundation_ids) != len(FOUNDATION)
+        or len(network_ids) != len(installed)
+        or additional_ids != set(additional.values())
+    ):
         raise ValueError("Incomplete foundation or staged Cilium controller inventory")
+    network_ids.update(additional_ids)
     for replica in list_resources(target, "replicasets"):
         uid = owner_uid(replica)
         if uid in foundation_ids:
@@ -215,8 +229,9 @@ def foundation(
     }
 
 
-def reserve_receipt(target: Target) -> Path:
-    path = target.directory / f"{target.name}.network-qualification.json"
+def reserve_receipt(target: Target, *, database: bool = False) -> Path:
+    capability = "database" if database else "network"
+    path = target.directory / f"{target.name}.{capability}-qualification.json"
     if target.directory.is_symlink():
         raise ValueError("Redirected network evidence path")
     # An existing receipt blocks retry, even when interrupted before the first write.
@@ -753,7 +768,10 @@ def cached_images(
     target: Target, journals: list[dict], controllers: dict[str, dict], fixtures: list[dict]
 ) -> dict:
     """Identify preloaded immutable image content on each verified node before any CNI writes."""
-    images = resources.required_images(controllers, fixtures)
+    return staged_images(target, journals, resources.required_images(controllers, fixtures))
+
+
+def staged_images(target: Target, journals: list[dict], images: dict[str, list[str]]) -> dict:
     evidence = {}
     for journal in journals:
         node = journal["name"]

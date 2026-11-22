@@ -8,14 +8,18 @@ import copy
 import hashlib
 import json
 import re
+import subprocess
+import sys
+from pathlib import Path
 from urllib.request import urlopen
 
 import yaml
 
-from .consumer_profile import LABEL, Target
+from .consumer_profile import LABEL, MINIMAL_PROFILE, Target
 from .local_kind import ROOT
 
-DIRECTORY = ROOT / "clusters/local-kind/isolated-network-local/database"
+RELEASE_PATH = Path("clusters/local-kind/isolated-network-local/database/releases.json")
+RELEASE_FILE = ROOT / RELEASE_PATH
 MANAGER = "k8s-infrastructure-database"
 STORAGE_CLASS = "local-retained"
 MAX_BYTES = 16 * 1024 * 1024
@@ -26,11 +30,18 @@ CONTROLLERS = {
     "cnpg-controller-manager": ("cnpg-system", "worker", "100m", "128Mi", "512Mi"),
     "barman-cloud": ("cnpg-system", "worker", "50m", "128Mi", "256Mi"),
 }
+MINIMAL_MEMORY = {
+    "cert-manager-cainjector": ("64Mi", "128Mi"),
+    "cert-manager": ("128Mi", "256Mi"),
+    "cert-manager-webhook": ("64Mi", "128Mi"),
+    "cnpg-controller-manager": ("192Mi", "384Mi"),
+    "barman-cloud": ("64Mi", "128Mi"),
+}
 
 
-def selection() -> dict:
+def selection(data: bytes | None = None) -> dict:
     """Require official versioned assets and immutable images, including runtime helpers."""
-    value = json.loads((DIRECTORY / "releases.json").read_text(encoding="utf-8"))
+    value = json.loads(RELEASE_FILE.read_bytes() if data is None else data)
     sources = {
         "cnpg": "https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/v{v}/releases/cnpg-{v}.yaml",
         "barman": "https://github.com/cloudnative-pg/plugin-barman-cloud/releases/download/v{v}/manifest.yaml",
@@ -76,8 +87,8 @@ def parse(data: bytes, asset: dict) -> list[dict]:
     return list(yaml.load_all(data, Loader=getattr(yaml, "CSafeLoader", yaml.SafeLoader)))
 
 
-def download() -> dict[str, list[dict]]:
-    release = selection()
+def download(*, release: dict | None = None, quiet: bool = False) -> dict[str, list[dict]]:
+    release = selection() if release is None else release
 
     def fetch(pair: tuple[str, dict]) -> tuple[str, list[dict]]:
         name, asset = pair
@@ -103,13 +114,26 @@ def download() -> dict[str, list[dict]]:
             )
         return name, parse(data, asset)
 
-    print("Verifying pinned CNPG, Barman, cert-manager and kind storage assets...", flush=True)
+    if not quiet:
+        print("Verifying pinned CNPG, Barman, cert-manager and kind storage assets...", flush=True)
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
         return dict(pool.map(fetch, release["assets"].items()))
 
 
-def labels(target: Target) -> dict[str, str]:
-    digest = hashlib.sha256(json.dumps(selection(), sort_keys=True).encode()).hexdigest()[:32]
+def download_bounded(data: bytes, *, timeout: int) -> dict[str, list[dict]]:
+    result = subprocess.run(
+        [sys.executable, "-m", "scripts.database_assets"],
+        input=data,
+        capture_output=True,
+        timeout=timeout,
+        check=True,
+    )
+    return json.loads(result.stdout)
+
+
+def labels(target: Target, release: dict | None = None) -> dict[str, str]:
+    release = selection() if release is None else release
+    digest = hashlib.sha256(json.dumps(release, sort_keys=True).encode()).hexdigest()[:32]
     return {
         "app.kubernetes.io/managed-by": "k8s-infrastructure",
         LABEL: target.consumer,
@@ -118,9 +142,11 @@ def labels(target: Target) -> dict[str, str]:
     }
 
 
-def render(target: Target, assets: dict[str, list[dict]]) -> dict[str, list[dict]]:
+def render(
+    target: Target, assets: dict[str, list[dict]], *, release: dict | None = None
+) -> dict[str, list[dict]]:
     """Transform verified upstream resources, not a reimplementation of their operators."""
-    release = selection()
+    release = selection() if release is None else release
     images = release["images"]
     mapping = {image.split("@")[0]: image for image in images.values()}
     result: dict[str, list[dict]] = {}
@@ -141,7 +167,7 @@ def render(target: Target, assets: dict[str, list[dict]]) -> dict[str, list[dict
                 for key, value in metadata.get("labels", {}).items()
                 if not key.startswith("rbac.authorization.k8s.io/aggregate-to-")
             }
-            metadata["labels"].update(labels(target))
+            metadata["labels"].update(labels(target, release))
             if kind == "Secret":
                 if name != "barman" or set(item.get("data", {})) != {"SIDECAR_IMAGE"}:
                     raise ValueError("Unexpected upstream Secret; no credential import")
@@ -156,7 +182,7 @@ def render(target: Target, assets: dict[str, list[dict]]) -> dict[str, list[dict
             if kind == "Service":
                 item["spec"].setdefault("type", "ClusterIP")
             if kind == "Deployment":
-                configure_controller(item, target, mapping)
+                configure_controller(item, target, mapping, images["acme-solver"])
             selected.append(item)
         result[name] = selected
     crds = [d for docs in result.values() for d in docs if d["kind"] == "CustomResourceDefinition"]
@@ -175,7 +201,7 @@ def render(target: Target, assets: dict[str, list[dict]]) -> dict[str, list[dict
     return result
 
 
-def configure_controller(item: dict, target: Target, mapping: dict[str, str]) -> None:
+def configure_controller(item: dict, target: Target, mapping: dict[str, str], solver: str) -> None:
     name = item["metadata"]["name"]
     namespace, role, cpu, memory, limit = CONTROLLERS[name]
     if item["metadata"].get("namespace") != namespace or item["spec"].get("replicas", 1) != 1:
@@ -213,6 +239,13 @@ def configure_controller(item: dict, target: Target, mapping: dict[str, str]) ->
     ):
         raise ValueError("Unexpected database controller container authority")
     container["image"] = mapping[container["image"]]
+    if target.profile == MINIMAL_PROFILE:
+        item["spec"]["strategy"] = {"type": "Recreate"}
+        pod["nodeSelector"]["k8s-infrastructure.io/role"] = "worker"
+        pod["tolerations"] = []
+        pod["automountServiceAccountToken"] = True
+        container["imagePullPolicy"] = "Never"
+        memory, limit = MINIMAL_MEMORY[name]
     container["resources"] = {
         "requests": {"cpu": cpu, "memory": memory},
         "limits": {"cpu": "500m", "memory": limit},
@@ -229,18 +262,21 @@ def configure_controller(item: dict, target: Target, mapping: dict[str, str]) ->
     ]
     for index, value in enumerate(container["args"]):
         if value.startswith("--acme-http01-solver-image="):
-            container["args"][index] = (
-                "--acme-http01-solver-image=" + selection()["images"]["acme-solver"]
-            )
+            container["args"][index] = "--acme-http01-solver-image=" + solver
 
 
-def storage_class(target: Target) -> dict:
+def storage_class(target: Target, *, release: dict | None = None) -> dict:
     return {
         "apiVersion": "storage.k8s.io/v1",
         "kind": "StorageClass",
-        "metadata": {"name": STORAGE_CLASS, "labels": labels(target)},
+        "metadata": {"name": STORAGE_CLASS, "labels": labels(target, release)},
         "provisioner": "rancher.io/local-path",
         "reclaimPolicy": "Retain",
         "volumeBindingMode": "WaitForFirstConsumer",
         "allowVolumeExpansion": False,
     }
+
+
+if __name__ == "__main__":
+    release = selection(sys.stdin.buffer.read(65537))
+    print(json.dumps(download(release=release, quiet=True)))
