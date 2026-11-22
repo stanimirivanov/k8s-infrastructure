@@ -5,13 +5,16 @@ from __future__ import annotations
 import json
 import re
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any
 
 import yaml
 
 from .consumer_profile import LABEL, NETWORK_PROFILES, Target, load_profile
 from .consumer_state import read_bounded
-from .local_kind import run
+from .local_kind import COMMAND_TIMEOUT, run
 from .node_capacity import verify_allocatable
 
 # Inspect only identity and resource metadata; never container environments or secrets.
@@ -25,8 +28,43 @@ NODE_FORMAT = (
 )
 
 
+_DEADLINE: ContextVar[float | None] = ContextVar("consumer_operation_deadline", default=None)
+
+
+@contextmanager
+def deadline(seconds: int) -> Iterator[None]:
+    """Bound an explicit operation without changing unscoped legacy command behavior."""
+    if type(seconds) is not int or seconds <= 0:
+        raise ValueError("Operation deadline must be a positive whole number of seconds")
+    end = time.monotonic() + seconds
+    previous = _DEADLINE.get()
+    token = _DEADLINE.set(min(previous, end) if previous is not None else end)
+    try:
+        yield
+    finally:
+        _DEADLINE.reset(token)
+
+
+def remaining_timeout(cap: int = COMMAND_TIMEOUT) -> int:
+    """Round down so another subprocess cannot run past the operation deadline."""
+    if type(cap) is not int or cap <= 0:
+        raise ValueError("Command timeout cap must be positive")
+    end = _DEADLINE.get()
+    remaining = min(cap, int(end - time.monotonic())) if end is not None else cap
+    if remaining <= 0:
+        raise ValueError("Consumer operation deadline exhausted; retain partial evidence")
+    return remaining
+
+
 def command(target: Target, args: list[str], *, input_data: bytes | None = None) -> str:
     try:
+        if _DEADLINE.get() is not None:
+            return run(
+                args,
+                input_data=input_data,
+                docker_context=target.docker_context,
+                timeout=remaining_timeout(),
+            )
         return run(args, input_data=input_data, docker_context=target.docker_context)
     except OSError:
         raise ValueError(

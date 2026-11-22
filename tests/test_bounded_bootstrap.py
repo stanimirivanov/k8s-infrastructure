@@ -321,3 +321,30 @@ class DockerProtocolTests(unittest.TestCase):
         for args in (["network", "create", "kind"], ["network", "rm", "kind"], ["network", "ls"]):
             with self.assertRaises(ValueError):
                 adapter.forward(args, selection)
+
+
+class DeadlineTests(unittest.TestCase):
+    def test_scoped_provider_deadline_bounds_commands_and_refuses_after_expiry(self):
+        from unittest.mock import patch
+
+        from scripts import consumer_runtime as runtime
+
+        with tempfile.TemporaryDirectory() as directory:
+            target = Target("qual-cold", "default", Path(directory), "minimal-demo")
+            with (
+                patch.object(runtime.time, "monotonic", return_value=100) as clock,
+                patch.object(runtime, "run", return_value="observed") as run,
+            ):
+                with runtime.deadline(900):
+                    self.assertEqual(runtime.remaining_timeout(600), 600)
+                    clock.return_value = 990
+                    runtime.command(target, ["docker", "info"])
+                    self.assertEqual(run.call_args.kwargs["timeout"], 10)
+                    with runtime.deadline(900):
+                        self.assertEqual(runtime.remaining_timeout(600), 10)
+                    clock.return_value = 1000
+                    with self.assertRaises(ValueError):
+                        runtime.command(target, ["docker", "info"])
+                    self.assertEqual(run.call_count, 1)
+                runtime.command(target, ["docker", "info"])
+                self.assertNotIn("timeout", run.call_args.kwargs)
