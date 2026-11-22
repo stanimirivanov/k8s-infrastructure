@@ -213,6 +213,118 @@ class MinimalNetworkTests(unittest.TestCase):
         ):
             minimal_network.fixture_pods(target, [document], staged)
 
+    def test_installed_cilium_accepts_only_the_standard_projected_token(self):
+        from copy import deepcopy
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from scripts import minimal_network
+        from scripts.consumer_profile import MINIMAL_PROFILE, Target
+        from scripts.kubernetes import reference
+
+        target = Target("qual-neutral", "local-engine", Path("/tmp"), MINIMAL_PROFILE, 18443)
+        node = f"{target.name}-worker"
+        name = "cilium-operator"
+        digest = "sha256:" + "b" * 64
+        container = {
+            "name": name,
+            "image": f"quay.io/cilium/operator-generic:v1.20.3@{digest}",
+            "imagePullPolicy": "Never",
+            "resources": network_resources.MAIN[name],
+        }
+        template: dict = {
+            "serviceAccountName": name,
+            "automountServiceAccountToken": True,
+            "hostNetwork": True,
+            "containers": [container],
+        }
+        controller = {
+            "kind": "Deployment",
+            "metadata": {"name": name, "namespace": "kube-system", "uid": "controller-uid"},
+            "spec": {"template": {"spec": template}},
+        }
+        token: dict = {
+            "name": "kube-api-access-xcml2",
+            "projected": {
+                "defaultMode": 420,
+                "sources": [
+                    {"serviceAccountToken": {"expirationSeconds": 3607, "path": "token"}},
+                    {
+                        "configMap": {
+                            "items": [{"key": "ca.crt", "path": "ca.crt"}],
+                            "name": "kube-root-ca.crt",
+                        }
+                    },
+                    {
+                        "downwardAPI": {
+                            "items": [
+                                {
+                                    "fieldRef": {
+                                        "apiVersion": "v1",
+                                        "fieldPath": "metadata.namespace",
+                                    },
+                                    "path": "namespace",
+                                }
+                            ]
+                        }
+                    },
+                ],
+            },
+        }
+        pod_spec = deepcopy(template)
+        pod_spec.update(nodeName=node, volumes=[token])
+        pod_spec["containers"][0]["volumeMounts"] = [
+            {
+                "name": token["name"],
+                "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount",
+                "readOnly": True,
+            }
+        ]
+        pod = {
+            "metadata": {
+                "uid": "pod-uid",
+                "ownerReferences": [{"uid": "controller-uid", "controller": True}],
+            },
+            "spec": pod_spec,
+            "status": {
+                "phase": "Running",
+                "conditions": [{"type": "Ready", "status": "True"}],
+                "containerStatuses": [
+                    {
+                        "name": name,
+                        "ready": True,
+                        "restartCount": 0,
+                        "imageID": digest,
+                        "state": {"running": {"startedAt": "2026-11-22T12:00:00Z"}},
+                    }
+                ],
+            },
+        }
+        with (
+            patch.object(
+                minimal_network.network,
+                "inventory",
+                return_value={reference(controller): controller},
+            ),
+            patch.object(
+                minimal_network,
+                "list_resources",
+                side_effect=lambda _, key: [pod] if key == "pods" else [],
+            ),
+        ):
+            args = (
+                target,
+                {name: controller},
+                {name: network_resources.pod_bounds(template)},
+                {
+                    node: {container["image"]: {"configDigest": digest}},
+                },
+            )
+            self.assertIn(f"{name}/worker", minimal_network.controller_pods(*args))
+            token["projected"]["sources"][0]["serviceAccountToken"]["audience"] = "unexpected"
+            with self.assertRaisesRegex(ValueError, "volume authority"):
+                minimal_network.controller_pods(*args)
+
     def test_asset_timeout_stops_qualification_before_provider_access(self):
         import subprocess
         from pathlib import Path

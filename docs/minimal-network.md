@@ -59,7 +59,9 @@ docker --context default exec "<node-id>" \
 ```
 
 The runtime verifies each CRI repository digest and records the observed image
-config digest before applying Cilium objects. Cilium and fixture Pod manifests
+config digest before applying Cilium objects. Each installed container image ID
+must match the repository or config digest staged for its exact reference on
+its assigned node. Cilium and fixture Pod manifests
 use `imagePullPolicy: Never`, so unstaged content cannot trigger an implicit
 registry pull during qualification. The pinned kind image supplies the sandbox
 image. Cold admission reserves 35 GiB across the four disk categories and
@@ -101,7 +103,9 @@ uv run --locked --offline python -m scripts.network qualify \
 ```
 
 The 900-second qualification deadline includes continuation admission,
-rendering, bootstrap and probes. Controller waits are at most 300 seconds, API
+assets, rendering, bootstrap and probes. Asset downloads have a 180-second
+wall-clock limit and Helm rendering has a 60-second limit. Both also respect
+the remaining qualification deadline. Controller waits are at most 300 seconds, API
 establishment and foundation rollout waits at most 60 seconds per resource,
 GatewayClass acceptance 90 seconds and individual traffic/Gateway checks at
 most 120 seconds, subject to the operation deadline. Image preparation is a
@@ -142,8 +146,10 @@ samples, observed physical free space and network/TLS outcomes. Kernel memory
 peaks cover the node lifetime and are compared against the largest accounted
 stage so far, including the non-Pod capacity deduction. CPU throttling is
 reported. OOM, eviction, unexpected restart, missing readiness or a sampled
-floor breach fail the candidate. Host sampling is phase evidence, and installed
-Cilium success is narrower than installed product acceptance.
+floor breach fail the candidate. Host sampling records the floor during each
+phase. Cilium qualification checks the installed Pod authority, including host
+namespaces, service accounts, mounts and security contexts. It also recognizes
+the pinned [Kubernetes service account projection](https://github.com/kubernetes/kubernetes/blob/v1.35.0/plugin/pkg/admission/serviceaccount/admission.go).
 
 ## Failure and exact cleanup
 
