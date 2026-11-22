@@ -131,7 +131,7 @@ class DockerProtocolTests(unittest.TestCase):
                     ("--pids-limit", "2048"),
                 ):
                     self.assertEqual(args[args.index(flag) + 1], value)
-                return self.node["id"] + "\n"
+                return str(self.node["id"]) + "\n"
             if args[0] == "inspect":
                 return json.dumps(self.node)
             self.assertEqual(args, ["start", self.node["id"]])
@@ -161,7 +161,7 @@ class DockerProtocolTests(unittest.TestCase):
                 policy = adapter.policy(self.target, "owner-nonce", Path(directory))
                 calls = []
 
-                def docker(args):
+                def docker(args, calls=calls, changed=changed):
                     calls.append(args[0])
                     return (
                         self.node["id"]
@@ -218,3 +218,58 @@ class DockerProtocolTests(unittest.TestCase):
         ):
             with self.subTest(args=args), self.assertRaises(ValueError):
                 adapter.intercept(args, policy, lambda _: self.fail("refusal must precede Docker"))
+
+    def test_private_executable_preserves_docker_streams_and_context_without_global_install(self):
+        import json
+        import os
+        import subprocess
+        import sys
+        from unittest.mock import patch
+
+        from scripts import bounded_docker as adapter
+
+        docker = self.root / "real-docker"
+        calls = self.root / "calls.jsonl"
+        docker.write_text(
+            f"#!{sys.executable}\nimport json, os, sys\n"
+            f"with open({str(calls)!r}, 'a') as stream: stream.write(json.dumps([sys.argv[1:], os.environ.get('DOCKER_CONTEXT'), os.environ.get('DOCKER_HOST')]) + '\\n')\n"
+            f"node = {self.node!r}\n"
+            "print(json.dumps(node) if sys.argv[1] == 'inspect' else node['id'])\n"
+        )
+        docker.chmod(0o700)
+        directory = self.root / "adapter"
+        with patch.object(adapter.shutil, "which", return_value=str(docker)):
+            overlay = adapter.prepare(self.target, "owner-nonce", directory)
+        self.assertEqual(os.stat(directory).st_mode & 0o777, 0o700)
+        environment = {
+            **os.environ,
+            **overlay,
+            "DOCKER_HOST": "tcp://foreign:2375",
+            "DOCKER_CONTEXT": "foreign",
+        }
+        result = subprocess.run(
+            [str(directory / "docker"), *self.args],
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), self.node["id"])
+        events = [json.loads(line) for line in calls.read_text().splitlines()]
+        self.assertEqual([entry[0][0] for entry in events], ["create", "inspect", "start"])
+        self.assertTrue(all(event[1:] == ["default", None] for event in events))
+        result = subprocess.run(
+            [str(directory / "docker"), "exec", "--privileged", self.name, "true"],
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(calls.read_text().splitlines()[-1])[0][2], self.node["id"])
+        with (
+            patch.object(adapter.shutil, "which", return_value=str(docker)),
+            self.assertRaises(FileExistsError),
+        ):
+            adapter.prepare(self.target, "owner-nonce", directory)

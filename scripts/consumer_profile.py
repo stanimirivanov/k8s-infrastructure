@@ -152,7 +152,11 @@ def configuration(target: Target) -> dict[str, Any]:
         ],
     }
     if target.profile == MINIMAL_PROFILE:
-        result["networking"].update(disableDefaultCNI=True, kubeProxyMode="none")
+        result["networking"] = {
+            **result["networking"],
+            "disableDefaultCNI": True,
+            "kubeProxyMode": "none",
+        }
     if target.profile in NETWORK_PROFILES:
         result["networking"] = {
             **result["networking"],
