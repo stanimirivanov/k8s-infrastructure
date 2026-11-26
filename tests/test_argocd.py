@@ -196,6 +196,71 @@ class ArgoCDBootstrapTests(unittest.TestCase):
         self.assertTrue(all("rollout" in command for command in commands[1:]))
         self.assertTrue(all("apply" not in command for command in commands))
 
+    def test_fresh_bootstrap_refuses_a_replacement_uid_before_any_apply(self) -> None:
+        expected = "10000000-0000-4000-8000-000000000001"
+        replacement = "10000000-0000-4000-8000-000000000002"
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            patch("scripts.argocd.local_kind.execute"),
+            patch("scripts.argocd.local_kind.run", return_value=replacement) as run,
+            patch("scripts.argocd.argocd_status.wait_for_argocd") as wait,
+            redirect_stdout(io.StringIO()) as output,
+        ):
+            status = argocd.main(
+                [
+                    "bootstrap",
+                    "--execute",
+                    "--state-root",
+                    temporary,
+                    "--expected-cluster-uid",
+                    expected,
+                ]
+            )
+
+        self.assertEqual(status, 1)
+        self.assertIn("cluster UID differs", output.getvalue())
+        run.assert_called_once()
+        self.assertIn("kube-system", run.call_args.args[0])
+        wait.assert_not_called()
+
+    def test_fresh_bootstrap_reapplies_the_same_manifest_with_the_same_owner(self) -> None:
+        uid = "10000000-0000-4000-8000-000000000001"
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            patch("scripts.argocd.local_kind.execute"),
+            patch(
+                "scripts.argocd.local_kind.run",
+                side_effect=[
+                    uid,
+                    "",
+                    "",
+                    self.namespace(),
+                    uid,
+                    self.namespace(),
+                    "",
+                    self.namespace(),
+                ],
+            ) as run,
+            patch("scripts.argocd.argocd_status.wait_for_argocd") as wait,
+        ):
+            args = [
+                "bootstrap",
+                "--execute",
+                "--state-root",
+                temporary,
+                "--expected-cluster-uid",
+                uid,
+            ]
+            self.assertEqual(argocd.main(args), 0)
+            self.assertEqual(argocd.main(args), 0)
+
+        applies = [call.args[0] for call in run.call_args_list if "apply" in call.args[0]]
+        self.assertEqual(len(applies), 2)
+        self.assertEqual(applies[0], applies[1])
+        self.assertIn("--field-manager=k8s-infrastructure", applies[0])
+        self.assertNotIn("--force-conflicts", applies[0])
+        self.assertEqual(wait.call_count, 2)
+
     def test_bootstrap_migrates_only_the_reviewed_legacy_namespace(self) -> None:
         with (
             tempfile.TemporaryDirectory() as temporary,
@@ -278,7 +343,9 @@ class ArgoCDBootstrapTests(unittest.TestCase):
             result = argocd.main(["bootstrap", "--execute", "--state-root", temporary])
 
         self.assertEqual(result, 0)
-        execute.assert_called_once_with("bootstrap", state_root=Path(temporary))
+        execute.assert_called_once_with(
+            "bootstrap", state_root=Path(temporary), expected_cluster_uid=None
+        )
         commands.assert_not_called()
 
     def test_production_module_has_no_consumer_gitops_behavior(self) -> None:

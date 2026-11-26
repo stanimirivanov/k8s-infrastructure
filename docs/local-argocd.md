@@ -36,6 +36,28 @@ Applications, repository credential Secrets, workload namespaces, release
 locks and product health. Those remain consumer composition. Installing Argo CD
 does not grant this repository authority over anything reconciled through it.
 
+### Bootstrap a fresh, reviewed cluster
+
+After the substrate is provisioned, independently read the live `kube-system`
+namespace UID through its dedicated kubeconfig. Record it in the approved
+infrastructure handoff. Use that recorded value as the expected UID for the
+offline preview and the explicit bootstrap. An approved value from the
+handoff lets a repeat invocation detect a replacement using the same name.
+
+```sh
+uv run --locked --offline python -m scripts.argocd bootstrap \
+  --state-root "$state_root" --expected-cluster-uid "$approved_uid"
+uv run --locked --offline python -m scripts.argocd bootstrap --execute \
+  --state-root "$state_root" --expected-cluster-uid "$approved_uid"
+```
+
+The explicit command reads the live UID again before applying. It reapplies the
+same Kustomization with the `k8s-infrastructure` field manager and stops on
+ownership conflicts. Inspect the cluster and existing field owners before
+retrying a refusal. Use the separately documented handoff procedure for a
+legacy Argo CD namespace. Consumer Applications are reconciled by Argo CD after
+its controllers pass readiness.
+
 Merging this provider release does not contact or change the existing local
 installation. Until consumer cutover, `perfeng-environment` remains the
 supported operator entry point for bootstrap, health and recovery. This

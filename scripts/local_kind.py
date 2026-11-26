@@ -96,6 +96,8 @@ def run(
     input_data: bytes | None = None,
     timeout: int = COMMAND_TIMEOUT,
     docker_context: str | None = None,
+    isolated_environment: dict[str, str] | None = None,
+    hold_lock: int | None = None,
 ) -> str:
     """Run one external command with bounded, private output handling."""
     if timeout <= 0:
@@ -116,6 +118,8 @@ def run(
             if key.startswith("KIND_EXPERIMENTAL_"):
                 environment.pop(key)
         environment["DOCKER_CONTEXT"] = docker_context
+    if isolated_environment is not None:
+        environment = isolated_environment
     # Only show the executable, never arguments/output that may contain credentials.
     label = Path(command[0]).stem
     print(f"Starting {label} command...", flush=True)
@@ -130,6 +134,7 @@ def run(
         stderr=subprocess.PIPE,
         env={**environment, "KIND_EXPERIMENTAL_PROVIDER": "docker"},
         start_new_session=True,
+        pass_fds=() if hold_lock is None else (hold_lock,),
     ) as process:
         try:
             while True:

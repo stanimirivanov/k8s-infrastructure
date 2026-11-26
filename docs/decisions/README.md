@@ -24,6 +24,7 @@
 | [0010](0010-disposable-transition-test-profile.md) | Proposed | Separate disposable memory-transition tests from full-installation qualification |
 | [0011](0011-pin-local-argocd-redis-image.md) | Proposed | Pin the Perfeng local Argo CD Redis source and pull policy while preserving image content |
 | [0012](0012-support-linux-development-hosts.md) | Accepted | Support Linux development hosts. |
+| [0013](0013-declarative-kind-provisioning.md) | Proposed | Provision new registered kind targets with OpenTofu and bind bootstrap to the live UID |
 
 ## Numbering under concurrent work
 

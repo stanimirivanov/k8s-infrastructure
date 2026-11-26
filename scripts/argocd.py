@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
+from uuid import UUID
 
 import yaml
 
@@ -134,6 +135,11 @@ def namespace_command(kube: list[str]) -> list[str]:
     return [*kube, "get", "namespace", NAMESPACE, "--ignore-not-found", "-o", "json"]
 
 
+def apply_command(kube: list[str], source: list[str], *, fresh: bool) -> list[str]:
+    ownership = "--field-manager=k8s-infrastructure" if fresh else "--force-conflicts"
+    return [*kube, "apply", "--server-side", ownership, *source]
+
+
 def validate_live_namespace(
     output: str,
     *,
@@ -173,46 +179,61 @@ def validate_live_namespace(
     raise ValueError("Argo CD namespace has an unexpected owner")
 
 
-def commands(action: str, root: Path = ROOT, state_root: Path = ROOT) -> list[list[str]]:
+def commands(
+    action: str,
+    root: Path = ROOT,
+    state_root: Path = ROOT,
+    *,
+    expected_cluster_uid: str | None = None,
+) -> list[list[str]]:
     """Build the bootstrap or health command sequence for offline preview."""
     if action not in {"bootstrap", "health"}:
         raise ValueError("Unknown Argo CD action")
     validate_configuration(root)
     kube = kubectl(state_root)
-    result = [namespace_command(kube)]
+    result = []
+    if expected_cluster_uid is not None:
+        if action != "bootstrap" or str(UUID(expected_cluster_uid)) != expected_cluster_uid:
+            raise ValueError("A canonical expected cluster UID is only valid for bootstrap")
+        result.append([*kube, "get", "namespace", "kube-system", "-o", "jsonpath={.metadata.uid}"])
+    result.append(namespace_command(kube))
     if action == "bootstrap":
         result.append(
-            [
-                *kube,
-                "apply",
-                "--server-side",
-                "--force-conflicts",
-                "-k",
-                str(root / BOOTSTRAP),
-            ]
+            apply_command(
+                kube, ["-k", str(root / BOOTSTRAP)], fresh=expected_cluster_uid is not None
+            )
         )
         result.append(namespace_command(kube))
     result.extend(argocd_status.rollout_commands(kube))
     return result
 
 
-def execute(action: str, root: Path = ROOT, state_root: Path = ROOT) -> None:
+def execute(
+    action: str,
+    root: Path = ROOT,
+    state_root: Path = ROOT,
+    *,
+    expected_cluster_uid: str | None = None,
+) -> None:
     """Operate only an owned cluster and an approved namespace handoff."""
     if action not in {"bootstrap", "health"}:
         raise ValueError("Unknown Argo CD action")
     state_root = local_kind.normalize_state_root(state_root)
-    validate_configuration(root)
+    steps = iter(commands(action, root, state_root, expected_cluster_uid=expected_cluster_uid))
     local_kind.execute("health", state_root)
     kube = kubectl(state_root)
-    current = local_kind.run(namespace_command(kube))
+    if expected_cluster_uid is not None:
+        if local_kind.run(next(steps)).strip() != expected_cluster_uid:
+            raise ValueError("Live cluster UID differs from the approved cluster UID")
+    current = local_kind.run(next(steps))
     validate_live_namespace(
         current,
         allow_missing=action == "bootstrap",
-        allow_legacy=action == "bootstrap",
+        allow_legacy=action == "bootstrap" and expected_cluster_uid is None,
     )
     if action == "bootstrap":
-        local_kind.run(commands(action, root, state_root)[1])
-        validate_live_namespace(local_kind.run(namespace_command(kube)))
+        local_kind.run(next(steps))
+        validate_live_namespace(local_kind.run(next(steps)))
     argocd_status.wait_for_argocd(kube)
     print(f"Local Argo CD action completed: {action}")
 
@@ -222,16 +243,27 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("action", choices=ACTIONS)
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--state-root", type=Path, default=ROOT)
+    parser.add_argument(
+        "--expected-cluster-uid", help="Approved kube-system UID for a fresh cluster"
+    )
     args = parser.parse_args(argv)
     try:
         if args.action == "validate":
+            if args.expected_cluster_uid is not None:
+                raise ValueError("An expected cluster UID is only valid for bootstrap")
             version = validate_configuration()
             print(f"Validated official Argo CD {version} bootstrap.")
         elif args.execute:
-            execute(args.action, state_root=args.state_root)
+            execute(
+                args.action,
+                state_root=args.state_root,
+                expected_cluster_uid=args.expected_cluster_uid,
+            )
         else:
             state_root = local_kind.normalize_state_root(args.state_root)
-            for command in commands(args.action, state_root=state_root):
+            for command in commands(
+                args.action, state_root=state_root, expected_cluster_uid=args.expected_cluster_uid
+            ):
                 print(json.dumps(command))
             print("Preview only. Add --execute to operate Argo CD on the selected substrate.")
     except (OSError, ValueError, TypeError, yaml.YAMLError) as error:

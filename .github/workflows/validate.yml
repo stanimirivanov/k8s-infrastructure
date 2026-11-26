@@ -30,6 +30,39 @@ jobs:
           version: v4.1.4
       - run: make doctor
       - run: make verify
+      - name: Verify pinned OpenTofu kind plans offline
+        shell: bash
+        run: |
+          scratch=$(mktemp -d "$RUNNER_TEMP/kind-iac.XXXXXX")
+          mirror="$scratch/mirror"
+          provider="registry.terraform.io/elioseverojunior/kind"
+          archive="terraform-provider-kind_0.0.4_linux_amd64.zip"
+          cli="tofu_1.13.10_linux_amd64.zip"
+          mkdir -p "$mirror/$provider" "$scratch/bin"
+          curl --fail --silent --show-error --location --proto '=https' --max-time 120 \
+            "https://github.com/opentofu/opentofu/releases/download/v1.13.10/$cli" \
+            -o "$scratch/$cli"
+          curl --fail --silent --show-error --location --proto '=https' --max-time 120 \
+            "https://github.com/elioseverojunior/terraform-provider-kind/releases/download/v0.0.4/$archive" \
+            -o "$mirror/$provider/$archive"
+          printf '%s  %s\n' c1f0d6b34d8328f963d3b1ad10896fae30a6c6890596190ffef477dab991090f "$scratch/$cli" | sha256sum -c -
+          provider_hash=$(uv run --locked --offline python -c 'from scripts.iac_pilot_state import PACKAGE_DIGEST; print(PACKAGE_DIGEST)')
+          printf '%s  %s\n' "$provider_hash" "$mirror/$provider/$archive" | sha256sum -c -
+          chmod 0444 "$mirror/$provider/$archive"
+          unzip -q "$scratch/$cli" tofu -d "$scratch/bin"
+          export DOCKER_HOST="unix://$scratch/no-docker.sock" KUBECONFIG="$scratch/no-kubeconfig"
+          export TF_DATA_DIR="$scratch/module-data" CHECKPOINT_DISABLE=1
+          export TF_CLI_CONFIG_FILE="$scratch/opentofu.tfrc"
+          cat > "$TF_CLI_CONFIG_FILE" <<EOF
+          provider_installation {
+            filesystem_mirror {
+              path    = "$mirror"
+              include = ["$provider"]
+            }
+          }
+          EOF
+          "$scratch/bin/tofu" -chdir=clusters/local-kind/iac-pilot init -backend=false -lockfile=readonly -input=false
+          make iac-pilot-check iac-pilot-plan-check TOFU="$scratch/bin/tofu"
 
   supply-chain:
     runs-on: ubuntu-latest
