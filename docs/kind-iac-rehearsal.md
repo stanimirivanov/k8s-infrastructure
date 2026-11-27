@@ -1,11 +1,13 @@
-# Disposable kind rehearsal on the laptop
+# Disposable kind rehearsal
 
-Status: The #74 rehearsal uses the laptop's existing Docker daemon. The
-disposable result informs the retained provisioning decision for Environment
-#434.
+Status: The hosted rehearsal qualifies the disposable lifecycle in GitHub
+Actions. The #74 laptop rehearsal informs the retained provisioning decision
+for Environment #434.
 
 ## TL;DR
 
+- Use the **Rehearse disposable kind** Actions workflow to qualify the
+  disposable lifecycle on a fresh GitHub-hosted VM.
 - Use the existing Linux AMD64 Docker daemon with cgroup v2. Check capacity and
   inotify before planning. The earlier pilot stopped at two Ready nodes when
   the third kubelet exhausted inotify instances.
@@ -13,6 +15,26 @@ disposable result informs the retained provisioning decision for Environment
   Review the exact saved plan, then explicitly apply its digest.
 - Verify three Ready nodes, CoreDNS, local-path storage, a zero-change repeat
   plan, and repeatable Argo CD bootstrap on the recorded cluster UID.
+
+## GitHub-hosted rehearsal
+
+Open [Rehearse disposable kind](https://github.com/stanimirivanov/k8s-infrastructure/actions/workflows/kind-rehearsal.yml)
+and select **Run workflow**. The workflow also runs for deployment input
+changes on main and on same-repository pull requests so reviewers can verify
+the proposed revision before merge. Its only target is `perfeng-iac-pilot-74`
+on the job's local Docker daemon. The workflow checks for a vacant target before
+applying and uses a fresh scratch backend and dedicated kubeconfig.
+
+The run summary identifies the revision and reports node placement, DNS, PVC
+read/write, repeatable Argo CD installation, an empty OpenTofu repeat plan and
+teardown. The job log includes the native OpenTofu results, target Docker
+inventory after a failed create, and workload status after a failure on a
+verified cluster. Cleanup uses a saved OpenTofu destroy when the scratch state
+contains the target. If create failed before recording state, cleanup can
+delete the exact named cluster after the recorded vacancy check. The workflow
+then checks that the target's containers and state entry are gone and removes
+the scratch saved plans. State and kubeconfig stay on the disposable VM. To
+retry, start a new hosted run.
 
 ## Setup
 
