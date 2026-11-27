@@ -1,7 +1,7 @@
 UV_RUN := uv run --locked --offline
 TOFU ?= tofu
 
-.PHONY: help bootstrap doctor fmt fmt-check docs docs-check check test configuration-check workflows-asset-check delegated-argo-asset-check network-asset-check database-asset-check metrics-check iac-pilot-check iac-pilot-plan-check pr-event-check verify supply-chain validate
+.PHONY: help bootstrap doctor fmt fmt-check docs docs-check check test configuration-check workflows-asset-check delegated-argo-asset-check network-asset-check database-asset-check metrics-check iac-pilot-check pr-event-check verify supply-chain validate
 
 help:
 	@echo k8s-infrastructure engineering command surface
@@ -18,8 +18,7 @@ help:
 	@echo "  make network-asset-check  Verify pinned Cilium/Gateway assets and actual Helm render"
 	@echo "  make database-asset-check  Verify pinned CNPG, Barman, cert-manager and kind storage assets"
 	@echo "  make metrics-check  Strictly lint/render the verified-TLS resource metrics chart"
-	@echo "  make iac-pilot-check  Check the initialized disposable OpenTofu module offline"
-	@echo "  make iac-pilot-plan-check  Verify both saved create plans using a local provider mirror"
+	@echo "  make iac-pilot-check  Format-check, validate and test the initialized kind module offline"
 	@echo "  make pr-event-check  Validate issue linkage in the GitHub PR event"
 	@echo "  make verify     Run all offline repository-local checks"
 	@echo "  make supply-chain  Check the lock and known vulnerabilities"
@@ -71,11 +70,9 @@ metrics-check:
 	$(UV_RUN) python -m scripts.metrics_chart
 
 iac-pilot-check:
-	$(TOFU) -chdir=clusters/local-kind/iac-pilot fmt -check
+	$(TOFU) -chdir=clusters/local-kind/iac-pilot fmt -check -recursive
 	$(TOFU) -chdir=clusters/local-kind/iac-pilot validate
-
-iac-pilot-plan-check:
-	$(UV_RUN) python -m scripts.iac_pilot_plan_check --tofu "$(TOFU)"
+	$(TOFU) -chdir=clusters/local-kind/iac-pilot test
 
 pr-event-check:
 	$(UV_RUN) python -m scripts.repository_policy --pr-event
