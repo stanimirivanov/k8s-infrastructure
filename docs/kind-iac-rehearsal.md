@@ -30,9 +30,26 @@ the archive and initializes with the checked-in read-only dependency lock
 and filesystem-only provider installation. Operations already holds a
 recoverable copy of the archive in its private artifact store.
 
-With `TF_CLI_CONFIG_FILE` set to the staged mirror configuration, run
-`make iac-pilot-plan-check` to verify both registered create plans from
-empty scratch state without Docker or Kubernetes access.
+With the pinned `tofu` on `PATH` and `TF_CLI_CONFIG_FILE` set to the staged
+mirror configuration, initialize an isolated work area and run the same native
+checks as PR CI:
+
+```sh
+(
+  set -eu
+  scratch=$(mktemp -d)
+  trap 'rm -rf "$scratch"' EXIT
+  export TF_DATA_DIR="$scratch/module-data" CHECKPOINT_DISABLE=1
+  export DOCKER_HOST="unix://$scratch/no-docker.sock" KUBECONFIG="$scratch/no-kubeconfig"
+  tofu -chdir=clusters/local-kind/iac-pilot init -backend=false -lockfile=readonly -input=false
+  make iac-pilot-check
+)
+```
+
+The tests plan both registered targets, check their topology and reject an
+unregistered name. They run without refreshing live state or using Docker or
+Kubernetes. If initialization fails, check that the staged mirror points to
+the verified provider archive and that the CLI version matches the module.
 
 The laptop's default local Docker endpoint is
 `unix:///var/run/docker.sock`. The pilot uses cluster name
