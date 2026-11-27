@@ -20,19 +20,21 @@ for Environment #434.
 
 Open [Rehearse disposable kind](https://github.com/stanimirivanov/k8s-infrastructure/actions/workflows/kind-rehearsal.yml)
 and select **Run workflow**. The workflow also runs for deployment input
-changes on main and same-repository pull requests. Its only
-target is perfeng-iac-pilot-74 on the job's local Docker daemon. The workflow
-checks for a vacant target before applying and uses a fresh scratch backend
-and dedicated kubeconfig.
+changes on main and on same-repository pull requests so reviewers can verify
+the proposed revision before merge. Its only target is `perfeng-iac-pilot-74`
+on the job's local Docker daemon. The workflow checks for a vacant target before
+applying and uses a fresh scratch backend and dedicated kubeconfig.
 
 The run summary identifies the revision and reports node placement, DNS, PVC
 read/write, repeatable Argo CD installation, an empty OpenTofu repeat plan and
-teardown. On failure, inspect the failed step and workload status in the job
-log. Cleanup uses a saved OpenTofu destroy when the scratch state contains the
-target. If create failed before recording state, cleanup can delete the exact
-named cluster after the recorded vacancy check. The workflow then checks that
-the target's containers and state entry are gone. To retry, start a new hosted
-run. Plans, state and kubeconfig stay on the disposable VM.
+teardown. The job log includes the native OpenTofu results, target Docker
+inventory after a failed create, and workload status after a failure on a
+verified cluster. Cleanup uses a saved OpenTofu destroy when the scratch state
+contains the target. If create failed before recording state, cleanup can
+delete the exact named cluster after the recorded vacancy check. The workflow
+then checks that the target's containers and state entry are gone and removes
+the scratch saved plans. State and kubeconfig stay on the disposable VM. To
+retry, start a new hosted run.
 
 ## Setup
 

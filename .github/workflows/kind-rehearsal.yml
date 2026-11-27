@@ -108,8 +108,8 @@ jobs:
             echo "The disposable cluster name is already in use."
             exit 1
           fi
-          tofu plan -input=false -lock-timeout=30s -var="cluster_name=$CLUSTER_NAME" \
-            -out="$REHEARSAL_DIR/create.tfplan" > "$REHEARSAL_DIR/create.log"
+          tofu plan -no-color -input=false -lock-timeout=30s -var="cluster_name=$CLUSTER_NAME" \
+            -target=kind_cluster.pilot -out="$REHEARSAL_DIR/create.tfplan"
 
       - name: Apply saved create plan
         id: create
@@ -117,8 +117,7 @@ jobs:
         timeout-minutes: 8
         run: |
           umask 077
-          tofu apply -input=false -lock-timeout=30s "$REHEARSAL_DIR/create.tfplan" \
-            > "$REHEARSAL_DIR/apply.log"
+          tofu apply -no-color -input=false -lock-timeout=30s "$REHEARSAL_DIR/create.tfplan"
           kind get kubeconfig --name "$CLUSTER_NAME" > "$KUBECONFIG"
 
       - name: Verify cluster identity, named nodes and placement
@@ -188,16 +187,32 @@ jobs:
           test "$("${kube[@]}" get namespace kube-system -o "jsonpath=$cluster_uid")" = "$CLUSTER_UID"
           test "$("${kube[@]}" get namespace argocd -o "jsonpath=$cluster_uid")" = "$namespace_uid"
           test "$("${kube[@]}" -n argocd get "${controllers[@]}" -o "jsonpath=$inventory" | LC_ALL=C sort)" = "$controller_versions"
-          "${kube[@]}" diff "${apply_args[@]}" > "$REHEARSAL_DIR/argocd.diff"
+          diff_status=0
+          "${kube[@]}" diff "${apply_args[@]}" > /dev/null || diff_status=$?
+          case "$diff_status" in
+            0) echo 'Server-side Argo CD diff is empty.' ;;
+            1) echo 'Server-side Argo CD diff found changes.' ;;
+            *) echo 'Server-side Argo CD diff failed.' ;;
+          esac
+          exit "$diff_status"
 
       - name: Verify repeat OpenTofu plan is empty
         id: repeat
         working-directory: clusters/local-kind/iac-pilot
         timeout-minutes: 2
         run: |
-          umask 077
-          tofu plan -input=false -lock-timeout=30s -detailed-exitcode -var="cluster_name=$CLUSTER_NAME" \
-            > "$REHEARSAL_DIR/repeat.log"
+          tofu plan -no-color -input=false -lock-timeout=30s -detailed-exitcode \
+            -var="cluster_name=$CLUSTER_NAME"
+
+      - name: Report target Docker inventory on failed create
+        if: failure() && steps.plan.outcome == 'success' && steps.create.outcome == 'failure'
+        timeout-minutes: 1
+        run: |
+          format='table {{.ID}}\t{{.Names}}\t{{.Status}}'
+          echo 'Containers with the disposable cluster label'
+          docker ps -a --last 10 --filter "label=io.x-k8s.kind.cluster=$CLUSTER_NAME" --format "$format"
+          echo 'Containers with the disposable cluster name prefix'
+          docker ps -a --last 10 --filter "name=^/$CLUSTER_NAME-" --format "$format"
 
       - name: Report workload status on failure
         if: failure() && steps.nodes.outcome == 'success'
@@ -221,14 +236,19 @@ jobs:
           fi
 
           if [[ -n "$managed" || "$CREATE_RESULT" == success ]]; then
-            test "$managed" = kind_cluster.pilot
-            target=$(tofu console -no-color -var="cluster_name=$CLUSTER_NAME" \
+            if [[ "$managed" != kind_cluster.pilot ]]; then
+              echo 'Expected exactly kind_cluster.pilot in the scratch state.'
+              exit 1
+            fi
+            target=$(tofu console -no-color -state="$REHEARSAL_DIR/cluster.tfstate" -var="cluster_name=$CLUSTER_NAME" \
               <<< 'kind_cluster.pilot.name == var.cluster_name')
-            test "$target" = true
-            tofu plan -destroy -input=false -lock-timeout=30s -var="cluster_name=$CLUSTER_NAME" \
-              -out="$REHEARSAL_DIR/destroy.tfplan" > "$REHEARSAL_DIR/destroy-plan.log"
-            tofu apply -input=false -lock-timeout=30s "$REHEARSAL_DIR/destroy.tfplan" \
-              > "$REHEARSAL_DIR/destroy-apply.log"
+            if [[ "$target" != true ]]; then
+              echo 'The scratch state did not confirm the disposable cluster name.'
+              exit 1
+            fi
+            tofu plan -no-color -destroy -input=false -lock-timeout=30s -var="cluster_name=$CLUSTER_NAME" \
+              -out="$REHEARSAL_DIR/destroy.tfplan"
+            tofu apply -no-color -input=false -lock-timeout=30s "$REHEARSAL_DIR/destroy.tfplan"
             echo 'method=saved OpenTofu destroy' >> "$GITHUB_OUTPUT"
           else
             # The provider can leave nodes before it records state on a failed create.
@@ -252,6 +272,14 @@ jobs:
           if [[ -f "$REHEARSAL_DIR/cluster.tfstate" ]]; then
             managed=$(tofu state list)
             test -z "$managed"
+          fi
+
+      - name: Remove scratch saved plans
+        if: always()
+        timeout-minutes: 1
+        run: |
+          if [[ -n "${REHEARSAL_DIR:-}" ]]; then
+            rm -f -- "$REHEARSAL_DIR/create.tfplan" "$REHEARSAL_DIR/destroy.tfplan"
           fi
 
       - name: Record rehearsal results
