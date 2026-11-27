@@ -1,0 +1,286 @@
+name: Rehearse disposable kind
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/kind-rehearsal.yml
+      - clusters/local-kind/iac-pilot/**
+      - clusters/local-kind/perfeng-local/addons/argocd/**
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/kind-rehearsal.yml
+      - clusters/local-kind/iac-pilot/**
+      - clusters/local-kind/perfeng-local/addons/argocd/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rehearse:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    env:
+      CLUSTER_NAME: perfeng-iac-pilot-74
+      KIND_CONTEXT: kind-perfeng-iac-pilot-74
+      DOCKER_HOST: unix:///var/run/docker.sock
+      KIND_EXPERIMENTAL_PROVIDER: docker
+      TF_IN_AUTOMATION: "1"
+      CHECKPOINT_DISABLE: "1"
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Set up pinned OpenTofu
+        uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
+        timeout-minutes: 3
+        with:
+          tofu_version: "1.13.10"
+          checksums: c1f0d6b34d8328f963d3b1ad10896fae30a6c6890596190ffef477dab991090f
+          tofu_wrapper: false
+      - name: Prepare scratch backend and pinned tools
+        id: setup
+        working-directory: clusters/local-kind/iac-pilot
+        timeout-minutes: 5
+        run: |
+          umask 077
+          scratch=$(mktemp -d "$RUNNER_TEMP/kind-rehearsal.XXXXXX")
+          export TF_DATA_DIR="$scratch/module-data"
+          export TF_CLI_CONFIG_FILE="$scratch/opentofu.tfrc"
+          {
+            printf 'REHEARSAL_DIR=%s\n' "$scratch"
+            printf 'TF_DATA_DIR=%s\n' "$TF_DATA_DIR"
+            printf 'TF_CLI_CONFIG_FILE=%s\n' "$TF_CLI_CONFIG_FILE"
+            printf 'KUBECONFIG=%s/kubeconfig\n' "$scratch"
+          } >> "$GITHUB_ENV"
+
+          mkdir "$scratch/bin"
+          curl -fsSL --proto '=https' --max-time 60 \
+            https://github.com/kubernetes-sigs/kind/releases/download/v0.31.0/kind-linux-amd64 \
+            -o "$scratch/bin/kind"
+          curl -fsSL --proto '=https' --max-time 60 \
+            https://dl.k8s.io/release/v1.35.0/bin/linux/amd64/kubectl \
+            -o "$scratch/bin/kubectl"
+          (
+            cd "$scratch/bin"
+            sha256sum --check <<'EOF'
+          eb244cbafcc157dff60cf68693c14c9a75c4e6e6fedaf9cd71c58117cb93e3fa  kind
+          a2e984a18a0c063279d692533031c1eff93a262afcc0afdc517375432d060989  kubectl
+          EOF
+          )
+          chmod 0500 "$scratch/bin/"{kind,kubectl}
+          printf '%s/bin\n' "$scratch" >> "$GITHUB_PATH"
+
+          provider=registry.terraform.io/elioseverojunior/kind
+          archive=terraform-provider-kind_0.0.4_linux_amd64.zip
+          mirror="$scratch/mirror"
+          mkdir -p "$mirror/$provider"
+          curl -fsSL --proto '=https' --max-time 120 \
+            "https://github.com/elioseverojunior/terraform-provider-kind/releases/download/v0.0.4/$archive" \
+            -o "$mirror/$provider/$archive"
+          provider_hash=7c9d7a8817d0a3293e4a358d9ab88f16c69ef13c6479130e5a790c0b2d1a4e46
+          printf '%s  %s\n' "$provider_hash" "$mirror/$provider/$archive" | sha256sum --check
+          chmod 0444 "$mirror/$provider/$archive"
+          cat > "$TF_CLI_CONFIG_FILE" <<EOF
+          provider_installation {
+            filesystem_mirror {
+              path    = "$mirror"
+              include = ["$provider"]
+            }
+          }
+          EOF
+          tofu init -lockfile=readonly -input=false -backend-config="path=$scratch/cluster.tfstate"
+
+      - name: Confirm vacant Docker target and save create plan
+        id: plan
+        working-directory: clusters/local-kind/iac-pilot
+        timeout-minutes: 2
+        run: |
+          umask 077
+          nodes=$(docker ps -aq --filter "label=io.x-k8s.kind.cluster=$CLUSTER_NAME")
+          names=$(docker ps -aq --filter "name=^/$CLUSTER_NAME-")
+          if [[ -n "$nodes$names" ]]; then
+            echo "The disposable cluster name is already in use."
+            exit 1
+          fi
+          tofu plan -input=false -lock-timeout=30s -var="cluster_name=$CLUSTER_NAME" \
+            -out="$REHEARSAL_DIR/create.tfplan" > "$REHEARSAL_DIR/create.log"
+
+      - name: Apply saved create plan
+        id: create
+        working-directory: clusters/local-kind/iac-pilot
+        timeout-minutes: 8
+        run: |
+          umask 077
+          tofu apply -input=false -lock-timeout=30s "$REHEARSAL_DIR/create.tfplan" \
+            > "$REHEARSAL_DIR/apply.log"
+          kind get kubeconfig --name "$CLUSTER_NAME" > "$KUBECONFIG"
+
+      - name: Verify cluster identity, named nodes and placement
+        id: nodes
+        timeout-minutes: 3
+        run: |
+          test "$(kubectl config current-context)" = "$KIND_CONTEXT"
+          server=$(kubectl --context="$KIND_CONTEXT" config view --minify -o jsonpath='{.clusters[0].cluster.server}')
+          [[ "$server" =~ ^https://127\.0\.0\.1:[0-9]+$ ]]
+
+          nodes=$(kubectl --context="$KIND_CONTEXT" get nodes -o name | LC_ALL=C sort)
+          test "$nodes" = "$(printf 'node/%s\n' "$CLUSTER_NAME-control-plane" "$CLUSTER_NAME-worker" "$CLUSTER_NAME-worker2")"
+          kubectl --context="$KIND_CONTEXT" wait --for=condition=Ready --timeout=90s nodes --all
+          test "$(kubectl --context="$KIND_CONTEXT" get nodes -l workload=control-plane,node-role.kubernetes.io/control-plane -o name)" = "node/$CLUSTER_NAME-control-plane"
+          test "$(kubectl --context="$KIND_CONTEXT" get nodes -l workload=performance-generator,perfeng.io/node-type=generator -o name)" = "node/$CLUSTER_NAME-worker"
+          test "$(kubectl --context="$KIND_CONTEXT" get nodes -l workload=sut,perfeng.io/node-type=sut -o name)" = "node/$CLUSTER_NAME-worker2"
+
+          cluster_uid=$(kubectl --context="$KIND_CONTEXT" get namespace kube-system -o jsonpath='{.metadata.uid}')
+          test -n "$cluster_uid"
+          printf 'CLUSTER_UID=%s\n' "$cluster_uid" >> "$GITHUB_ENV"
+
+      - name: Prove DNS and PVC read/write
+        id: probes
+        timeout-minutes: 4
+        run: |
+          kubectl --context="$KIND_CONTEXT" apply -f clusters/local-kind/iac-pilot/rehearsal/probes.yaml
+          kubectl --context="$KIND_CONTEXT" -n kind-rehearsal wait --for=condition=Complete --timeout=150s \
+            job/dns job/pvc
+          kubectl --context="$KIND_CONTEXT" -n kind-rehearsal wait \
+            --for=jsonpath='{.status.phase}'=Bound --timeout=15s pvc/probe-data
+
+      - name: Install and reapply pinned Argo CD
+        id: argocd
+        timeout-minutes: 8
+        run: |
+          umask 077
+          kubectl kustomize clusters/local-kind/perfeng-local/addons/argocd > "$REHEARSAL_DIR/argocd.yaml"
+          test -s "$REHEARSAL_DIR/argocd.yaml"
+          kube=(kubectl --context="$KIND_CONTEXT")
+          cluster_uid='{.metadata.uid}'
+          test "$("${kube[@]}" get namespace kube-system -o "jsonpath=$cluster_uid")" = "$CLUSTER_UID"
+          existing_namespace=$("${kube[@]}" get namespace argocd --ignore-not-found -o name)
+          test -z "$existing_namespace"
+
+          apply_args=(--server-side --field-manager=k8s-infrastructure -f "$REHEARSAL_DIR/argocd.yaml")
+          controllers=(
+            deployment/argocd-applicationset-controller
+            deployment/argocd-dex-server
+            deployment/argocd-notifications-controller
+            deployment/argocd-redis
+            deployment/argocd-repo-server
+            deployment/argocd-server
+            statefulset/argocd-application-controller
+          )
+          inventory='{range .items[*]}{.metadata.name}{" "}{.metadata.uid}{" "}{.metadata.generation}{"\n"}{end}'
+
+          "${kube[@]}" apply "${apply_args[@]}"
+          "${kube[@]}" -n argocd rollout status "${controllers[@]}" --timeout=240s
+          namespace_uid=$("${kube[@]}" get namespace argocd -o "jsonpath=$cluster_uid")
+          controller_versions=$("${kube[@]}" -n argocd get "${controllers[@]}" -o "jsonpath=$inventory" | LC_ALL=C sort)
+          test -n "$namespace_uid"
+          test "$(wc -l <<< "$controller_versions")" -eq "${#controllers[@]}"
+
+          test "$("${kube[@]}" get namespace kube-system -o "jsonpath=$cluster_uid")" = "$CLUSTER_UID"
+          "${kube[@]}" apply "${apply_args[@]}"
+          "${kube[@]}" -n argocd rollout status "${controllers[@]}" --timeout=90s
+          test "$("${kube[@]}" get namespace kube-system -o "jsonpath=$cluster_uid")" = "$CLUSTER_UID"
+          test "$("${kube[@]}" get namespace argocd -o "jsonpath=$cluster_uid")" = "$namespace_uid"
+          test "$("${kube[@]}" -n argocd get "${controllers[@]}" -o "jsonpath=$inventory" | LC_ALL=C sort)" = "$controller_versions"
+          "${kube[@]}" diff "${apply_args[@]}" > "$REHEARSAL_DIR/argocd.diff"
+
+      - name: Verify repeat OpenTofu plan is empty
+        id: repeat
+        working-directory: clusters/local-kind/iac-pilot
+        timeout-minutes: 2
+        run: |
+          umask 077
+          tofu plan -input=false -lock-timeout=30s -detailed-exitcode -var="cluster_name=$CLUSTER_NAME" \
+            > "$REHEARSAL_DIR/repeat.log"
+
+      - name: Report workload status on failure
+        if: failure() && steps.nodes.outcome == 'success'
+        timeout-minutes: 1
+        run: |
+          kubectl --context="$KIND_CONTEXT" --request-timeout=10s -n kind-rehearsal get jobs,pods,pvc
+          kubectl --context="$KIND_CONTEXT" --request-timeout=10s -n argocd get deployments,statefulsets,pods
+
+      - name: Destroy the disposable target
+        id: destroy
+        if: always() && steps.plan.outcome == 'success'
+        working-directory: clusters/local-kind/iac-pilot
+        timeout-minutes: 5
+        env:
+          CREATE_RESULT: ${{ steps.create.outcome }}
+        run: |
+          umask 077
+          managed=
+          if [[ -f "$REHEARSAL_DIR/cluster.tfstate" ]]; then
+            managed=$(tofu state list)
+          fi
+
+          if [[ -n "$managed" || "$CREATE_RESULT" == success ]]; then
+            test "$managed" = kind_cluster.pilot
+            target=$(tofu console -no-color -var="cluster_name=$CLUSTER_NAME" \
+              <<< 'kind_cluster.pilot.name == var.cluster_name')
+            test "$target" = true
+            tofu plan -destroy -input=false -lock-timeout=30s -var="cluster_name=$CLUSTER_NAME" \
+              -out="$REHEARSAL_DIR/destroy.tfplan" > "$REHEARSAL_DIR/destroy-plan.log"
+            tofu apply -input=false -lock-timeout=30s "$REHEARSAL_DIR/destroy.tfplan" \
+              > "$REHEARSAL_DIR/destroy-apply.log"
+            echo 'method=saved OpenTofu destroy' >> "$GITHUB_OUTPUT"
+          else
+            # The provider can leave nodes before it records state on a failed create.
+            # The preceding vacancy check bounds this fallback to this runner's target.
+            nodes=$(docker ps -aq --filter "label=io.x-k8s.kind.cluster=$CLUSTER_NAME")
+            if [[ -n "$nodes" ]]; then
+              kind delete cluster --name "$CLUSTER_NAME" --kubeconfig "$KUBECONFIG"
+              echo 'method=named cleanup after incomplete create' >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      - name: Verify target containers and state entry are gone
+        id: gone
+        if: always() && steps.plan.outcome == 'success'
+        working-directory: clusters/local-kind/iac-pilot
+        timeout-minutes: 1
+        run: |
+          nodes=$(docker ps -aq --filter "label=io.x-k8s.kind.cluster=$CLUSTER_NAME")
+          names=$(docker ps -aq --filter "name=^/$CLUSTER_NAME-")
+          test -z "$nodes$names"
+          if [[ -f "$REHEARSAL_DIR/cluster.tfstate" ]]; then
+            managed=$(tofu state list)
+            test -z "$managed"
+          fi
+
+      - name: Record rehearsal results
+        if: always()
+        env:
+          SETUP: ${{ steps.setup.outcome }}
+          PLAN: ${{ steps.plan.outcome }}
+          CREATE: ${{ steps.create.outcome }}
+          NODES: ${{ steps.nodes.outcome }}
+          PROBES: ${{ steps.probes.outcome }}
+          ARGOCD: ${{ steps.argocd.outcome }}
+          REPEAT: ${{ steps.repeat.outcome }}
+          DESTROY: ${{ steps.destroy.outcome }}
+          DESTROY_METHOD: ${{ steps.destroy.outputs.method }}
+          GONE: ${{ steps.gone.outcome }}
+        run: |
+          {
+            echo '## Disposable kind rehearsal'
+            printf 'Source revision [%s](%s/%s/commit/%s)\n\n' \
+              "$GITHUB_SHA" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_SHA"
+            printf '| Check | Result |\n| --- | --- |\n'
+            printf '| %s | %s |\n' \
+              'Scratch backend and pinned tools' "${SETUP:-skipped}" \
+              'Vacant target and saved create plan' "${PLAN:-skipped}" \
+              'Saved create apply' "${CREATE:-skipped}" \
+              'Three named nodes Ready with placement labels' "${NODES:-skipped}" \
+              'DNS lookup and PVC read/write' "${PROBES:-skipped}" \
+              'Argo CD rollouts, stable UIDs and generations, empty server-side diff' "${ARGOCD:-skipped}" \
+              'Empty repeat plan' "${REPEAT:-skipped}" \
+              "Teardown (${DESTROY_METHOD:-no method recorded})" "${DESTROY:-skipped}" \
+              'Target containers and state entry absent' "${GONE:-skipped}"
+          } >> "$GITHUB_STEP_SUMMARY"

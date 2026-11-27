@@ -1,0 +1,73 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kind-rehearsal
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: dns
+  namespace: kind-rehearsal
+spec:
+  activeDeadlineSeconds: 120
+  backoffLimit: 0
+  template:
+    spec:
+      automountServiceAccountToken: false
+      restartPolicy: Never
+      containers:
+        - name: lookup
+          image: docker.io/library/busybox:1.37.0-glibc@sha256:42a9ff19af33811ee466b24c66384461d37c32dcc28d1d27d49b8aca816bd5ee
+          command: [nslookup, kubernetes.default.svc.cluster.local]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 32Mi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: probe-data
+  namespace: kind-rehearsal
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: standard
+  resources:
+    requests:
+      storage: 16Mi
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pvc
+  namespace: kind-rehearsal
+spec:
+  activeDeadlineSeconds: 120
+  backoffLimit: 0
+  template:
+    spec:
+      automountServiceAccountToken: false
+      restartPolicy: Never
+      containers:
+        - name: read-write
+          image: docker.io/library/busybox:1.37.0-glibc@sha256:42a9ff19af33811ee466b24c66384461d37c32dcc28d1d27d49b8aca816bd5ee
+          command: [sh, -ec]
+          args:
+            - |
+              printf '%s\n' kind-pvc-probe > /data/probe
+              test "$(cat /data/probe)" = kind-pvc-probe
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 32Mi
+          volumeMounts:
+            - name: probe-data
+              mountPath: /data
+      volumes:
+        - name: probe-data
+          persistentVolumeClaim:
+            claimName: probe-data
