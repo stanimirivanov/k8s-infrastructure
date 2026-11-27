@@ -26,6 +26,7 @@
 | Deliberate disposable transition interruptions and explicit recovery | [Interruption qualification](transition-interruption-qualification.md) |
 | Disposable scheduler/restart proof | [Capacity qualification](capacity-qualification.md) |
 | Local kind operations | [Local-kind guide](local-kind.md) |
+| Native OpenTofu laptop deployment | [Local kind with OpenTofu](local-kind-opentofu.md) |
 | Declarative kind pilot and retained provisioning sign-off | [Operations rehearsal](kind-iac-rehearsal.md) |
 | FleetIQ or another isolated local consumer | [Isolated consumer guide](isolated-local-consumers.md), [ADR 0004](decisions/0004-isolated-local-consumer-profiles.md) |
 | Argo CD installation | [Local Argo CD guide](local-argocd.md), [Redis source decision](decisions/0011-pin-local-argocd-redis-image.md) |
