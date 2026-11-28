@@ -80,6 +80,12 @@ loopback Kubernetes API. Its owner-only state, kubeconfig, saved plans and
 evidence live under `~/.local/state/perfeng/kind-74`, outside Git. Use
 the same OS account and directory for all operations.
 
+## Local operator procedure
+
+Use the [native OpenTofu and kubectl procedure](local-kind-opentofu.md)
+for #81 disposable qualification. The original operator commands below
+record the earlier #74 rehearsal and are retained until reviewed cutover.
+
 ## Run the rehearsal
 
 From the infrastructure checkout, put the pinned tools on PATH. On the
