@@ -25,6 +25,7 @@
 | [0011](0011-pin-local-argocd-redis-image.md) | Proposed | Pin the Perfeng local Argo CD Redis source and pull policy while preserving image content |
 | [0012](0012-support-linux-development-hosts.md) | Accepted | Support Linux development hosts. |
 | [0013](0013-declarative-kind-provisioning.md) | Proposed | Provision new registered kind targets with OpenTofu and bind bootstrap to the live UID |
+| [0014](0014-optional-just-for-local-kind-plans.md) | Proposed | Offer optional pinned just commands for compatible local kind plans |
 
 ## Numbering under concurrent work
 

@@ -1,0 +1,48 @@
+name: Check local kind planning
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/kind-plan.yml
+      - clusters/local-kind/iac-pilot/**
+      - docs/local-kind-opentofu.md
+      - justfile
+      - tests/test_kind_just.py
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/kind-plan.yml
+      - clusters/local-kind/iac-pilot/**
+      - docs/local-kind-opentofu.md
+      - justfile
+      - tests/test_kind_just.py
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  offline-plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Install pinned just
+        shell: bash
+        run: |
+          umask 077
+          checksum="$GITHUB_WORKSPACE/clusters/local-kind/iac-pilot/just-linux-amd64.sha256"
+          archive=just-1.59.0-x86_64-unknown-linux-musl.tar.gz
+          tools="$RUNNER_TEMP/kind-plan-tools"
+          mkdir -- "$tools"
+          cd -- "$tools"
+          curl -fsSL --proto '=https' --max-time 60 \
+            "https://github.com/casey/just/releases/download/1.59.0/$archive" -o "$archive"
+          sha256sum --check --strict "$checksum"
+          tar -xzf "$archive" just
+          "$tools/just" --version
+          printf 'KIND_TEST_JUST=%s/just\n' "$tools" >> "$GITHUB_ENV"
+      - name: Exercise both planning interfaces without cluster access
+        run: python3 -m unittest discover -s tests -p 'test_kind_just.py' -v
