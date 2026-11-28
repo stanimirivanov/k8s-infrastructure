@@ -46,5 +46,5 @@ jobs:
           tar -xzf "$archive" just
           "$tools/just" --version
           printf 'KIND_TEST_JUST=%s/just\n' "$tools" >> "$GITHUB_ENV"
-      - name: Exercise both planning interfaces without cluster access
+      - name: Exercise local kind plan, apply and verify without cluster access
         run: make kind-plan-check
