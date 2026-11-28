@@ -284,7 +284,8 @@ with ZipFile(root / "saved.tfplan", "w") as archive:
 PY
     ;;
   show)
-    [[ $# == 3 && $3 == "$plan_dir/saved.tfplan" ]]
+    [[ $# == 3 && ( $3 == "$plan_dir/saved.tfplan" ||
+      ( $intent == destroy && $3 == "$plan_dir"/.runtime.??????/saved.tfplan ) ) ]]
     if [[ $2 == -json ]]; then
       provider=registry.terraform.io/elioseverojunior/kind
       host='' api_address=127.0.0.1
@@ -317,7 +318,8 @@ PY
     ;;
   graph)
     [[ $TF_LOG == JSON && $TF_LOG_PROVIDER == OFF && $# == 3 && $2 == -no-color ]]
-    [[ $3 == "-plan=$plan_dir/saved.tfplan" ]]
+    [[ $3 == "-plan=$plan_dir/saved.tfplan" ||
+      ( $intent == destroy && $3 == "-plan=$plan_dir"/.runtime.??????/saved.tfplan ) ]]
     if [[ -f "$0.graph-stale" ]]; then exit 1; fi
     if [[ -f "$0.graph-state" ]]; then state=$(cat "$0.graph-state"); fi
     if [[ -f "$0.graph-occupy" ]]; then
@@ -332,8 +334,15 @@ PY
   apply)
     [[ $# == 8 && $2 == -no-color && $3 == -input=false && $4 == -lock-timeout=30s ]]
     [[ $5 == "-state=$state" && $6 == "-state-out=$state" && $7 == "-backup=$state.backup" ]]
-    [[ $8 == "$plan_dir/saved.tfplan" ]]
+    [[ $8 == "$plan_dir/saved.tfplan" ||
+      ( $intent == destroy && $8 == "$plan_dir"/.runtime.??????/saved.tfplan ) ]]
     printf '%s\\n' "$8" >> "$0.applies"
+    if [[ $intent == destroy ]]; then
+      if [[ -f "$0.replace-original" ]]; then
+        printf 'replaced ciphertext\\n' > "$plan_dir/saved.tfplan"
+      fi
+      sha256sum < "$8" | cut -d ' ' -f 1 >> "$0.destroy-applies"
+    fi
     write_provider_config
     if [[ -f "$0.apply-error" ]]; then exit 1; fi
     if [[ $intent == destroy ]]; then
@@ -374,6 +383,7 @@ if [[ $1 == kustomize ]]; then
   [[ -f "$2/kustomization.yaml" && -f "$2/redis-pull-policy.yaml" ]]
   printf '%s\\n' "${2%/*}/argocd.yaml" > "$0.latest-manifest"
   cat -- "$2/namespace.yaml"
+  if [[ -f "$0.cluster-resource" ]]; then cat -- "$0.cluster-resource"; fi
   exit
 fi
 [[ $1 == --kubeconfig && $3 == --context && $4 == kind-* ]]
@@ -399,6 +409,12 @@ case "$1 $2" in
     printf '%s\\n' "$config" >> "$0.uid-reads"
     if [[ -f "$0.uid" ]]; then cat "$0.uid"; else printf '%s\\n' fixture-kube-system-uid; fi
     ;;
+  'get -f')
+    [[ $# == 7 && $3 == - && $4 == --ignore-not-found && $5 == --no-headers && $6 == -o &&
+      $7 == 'custom-columns=OWNER:.metadata.labels.infra\\.k8s-infrastructure\\.io/owner' ]]
+    cat > "$0.preflight-manifest"
+    if [[ -f "$0.existing-owner" ]]; then cat "$0.existing-owner"; fi
+    ;;
   'wait --for=condition=Ready')
     [[ $# == 5 && $3 == --timeout=90s &&
        $4 == "node/$cluster-control-plane" && $5 == "node/$cluster-worker" ]]
@@ -423,6 +439,7 @@ case "$1 $2" in
     cat > "$0.$1-manifest"
     if [[ $1 == apply ]]; then
       printf '%s\\n' 'argocd argocd k8s-infrastructure kubernetes-substrate' > "$0.argocd-owner"
+      printf '%s\\n' 'registered-kind-argocd' > "$0.existing-owner"
     else
       if [[ -f "$0.diff-changes" ]]; then printf 'drift\\n'; fi
       if [[ -f "$0.change-final-uid" ]]; then printf 'changed-uid\\n' > "$0.uid"; fi
@@ -1357,6 +1374,14 @@ esac
         self.write_tool("tofu", REGISTERED_TOFU)
         self.write_tool("kind", REGISTERED_KIND)
         self.write_tool("kubectl", REGISTERED_KUBECTL)
+        self.write_tool(
+            "mv",
+            """#!/bin/bash
+set -eu
+if [[ ${4:-} == */retired-registration.json && -f "$0.fail-retirement" ]]; then exit 1; fi
+exec /usr/bin/mv "$@"
+""",
+        )
         self.provider = self.root / "provider checkout"
         self.provider.mkdir()
         self.git(self.provider, "init", "-q")
@@ -1538,6 +1563,7 @@ esac
                 self.assertEqual(proof["manifestSha256"], hashlib.sha256(expected).hexdigest())
                 self.assertEqual((self.bin / "kubectl.apply-manifest").read_bytes(), expected)
                 self.assertEqual((self.bin / "kubectl.diff-manifest").read_bytes(), expected)
+                self.assertEqual((self.bin / "kubectl.preflight-manifest").read_bytes(), expected)
                 self.assertEqual((evidence.parent / "diff.log").read_bytes(), b"")
                 self.assertIn("rollouts passed", (evidence.parent / "rollout.log").read_text())
         self.assertEqual(len(evidence_paths), 2)
@@ -1561,6 +1587,28 @@ esac
                     self.assertNotEqual(result.returncode, 0)
                     self.assertIn(diagnosis, result.stderr)
                     self.assertFalse((self.bin / "kubectl.apply-manifest").exists())
+        self.assertFalse(list(plan.parent.parent.glob("bootstrap.*/bootstrapped.json")))
+
+    def test_bootstrap_refuses_an_unowned_rendered_cluster_resource_before_apply(self):
+        target, environment, candidate = self.prepare_target("stargazer", "stargazer-sandbox")
+        _, plan = self.approved_plan("native", target, environment, candidate)
+        result = self.apply("just", target, plan)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        cluster_role = "---\napiVersion: rbac.authorization.k8s.io/v1\nkind: ClusterRole\nmetadata:\n  name: argocd-server\n"
+        (self.bin / "kubectl.cluster-resource").write_text(cluster_role, encoding="utf-8")
+        for interface in ("just", "native"):
+            with self.subTest(interface=interface):
+                (self.bin / "kubectl.existing-owner").write_text(
+                    "registered-kind-argocd\n<none>\n", encoding="utf-8"
+                )
+                result = self.operation(interface, "bootstrap", target, str(environment))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(
+                    "An existing Argo CD object lacks the registered baseline ownership label",
+                    result.stderr,
+                )
+                self.assertIn(cluster_role, (self.bin / "kubectl.preflight-manifest").read_text())
+                self.assertFalse((self.bin / "kubectl.apply-manifest").exists())
         self.assertFalse(list(plan.parent.parent.glob("bootstrap.*/bootstrapped.json")))
 
     def test_bootstrap_requires_rollouts_empty_diff_and_final_uid_before_recording_success(self):
@@ -1629,7 +1677,9 @@ esac
         proof = json.loads(review.with_name("destroy-verified.json").read_text())
         self.assertEqual(proof["approver"], "Fixture Destroy Approver")
         self.assertEqual(proof["planSha256"], hashlib.sha256(plan.read_bytes()).hexdigest())
-        self.assertEqual((self.bin / "tofu.applies").read_text().splitlines().count(str(plan)), 1)
+        self.assertEqual(
+            (self.bin / "tofu.destroy-applies").read_text().splitlines(), [proof["planSha256"]]
+        )
         for path in plan.parent.rglob("*"):
             if path.is_file():
                 self.assertNotIn(b"sensitive-sentinel", path.read_bytes(), path.name)
@@ -1671,8 +1721,82 @@ esac
                     fixture.unlink()
                     self.assertNotEqual(stopped.returncode, 0)
                     self.assertIn(diagnosis, stopped.stderr)
-        self.assertNotIn(str(plan), (self.bin / "tofu.applies").read_text())
+        self.assertFalse((self.bin / "tofu.destroy-applies").exists())
         self.assertFalse(plan.with_name("destroy-attempted.json").exists())
+
+    def test_destroy_applies_the_reviewed_ciphertext_if_original_changes_at_apply(self):
+        for interface, owner in (("just", "stargazer"), ("native", "fleet")):
+            with self.subTest(interface=interface):
+                target, environment, candidate = self.prepare_target(owner, f"{owner}-sandbox")
+                _, create = self.approved_plan("just", target, environment, candidate)
+                applied = self.apply("native", target, create)
+                self.assertEqual(applied.returncode, 0, applied.stderr)
+                planned = self.operation("native", "plan-destroy", target, str(environment))
+                self.assertEqual(planned.returncode, 0, planned.stderr)
+                plan = Path(planned.stdout.strip()).with_name("saved.tfplan")
+                digest = hashlib.sha256(plan.read_bytes()).hexdigest()
+                (self.bin / "tofu.replace-original").touch()
+                result = self.destroy(interface, target, plan, digest=digest)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(plan.read_text(), "replaced ciphertext\n")
+                self.assertEqual(
+                    (self.bin / "tofu.destroy-applies").read_text().splitlines()[-1], digest
+                )
+                proof = json.loads(plan.with_name("destroy-verified.json").read_text())
+                self.assertEqual(proof["plan"], str(plan))
+                self.assertEqual(proof["planSha256"], digest)
+                self.assertFalse(list(plan.parent.glob(".runtime.*")))
+
+    def test_destroy_planning_and_execution_refuse_malformed_reused_key(self):
+        target, environment, candidate = self.prepare_target("stargazer", "stargazer-sandbox")
+        _, create = self.approved_plan("just", target, environment, candidate)
+        applied = self.apply("native", target, create)
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        planned = self.operation("native", "plan-destroy", target, str(environment))
+        self.assertEqual(planned.returncode, 0, planned.stderr)
+        plan = Path(planned.stdout.strip()).with_name("saved.tfplan")
+        key = self.registrations / ".destroy-keys" / f"{target}.key"
+        secret = key.read_text().strip()
+        key.write_text(secret + "\n\n", encoding="utf-8")
+        for interface in ("just", "native"):
+            with self.subTest(interface=interface):
+                for result in (
+                    self.operation(interface, "plan-destroy", target, str(environment)),
+                    self.destroy(interface, target, plan),
+                ):
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(
+                        "The per-target destroy plan key has an invalid format", result.stderr
+                    )
+                    self.assertNotIn(secret, result.stdout + result.stderr)
+        self.assertFalse((self.bin / "tofu.destroy-applies").exists())
+
+    def test_destroy_keeps_pending_reservation_on_archive_failure_and_resumes(self):
+        target, environment, candidate = self.prepare_target("stargazer", "stargazer-sandbox")
+        registration, create = self.approved_plan("just", target, environment, candidate)
+        applied = self.apply("native", target, create)
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        planned = self.operation("just", "plan-destroy", target, str(environment))
+        self.assertEqual(planned.returncode, 0, planned.stderr)
+        plan = Path(planned.stdout.strip()).with_name("saved.tfplan")
+        failure = self.bin / "mv.fail-retirement"
+        failure.touch()
+        blocked = self.destroy("native", target, plan)
+        self.assertNotEqual(blocked.returncode, 0)
+        self.assertTrue(registration.exists())
+        pending = plan.parent.parent / "active-destroy.json"
+        self.assertTrue(pending.exists())
+        operation = self.operation("just", "plan-destroy", target, str(environment))
+        self.assertIn("A destroy is pending", operation.stderr)
+        reservation = self.register("native", target, environment, candidate)
+        self.assertIn("A destroy is pending", reservation.stderr)
+        failure.unlink()
+        resumed = self.destroy("just", target, plan)
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertTrue(Path(resumed.stdout.strip()).exists())
+        self.assertFalse(registration.exists())
+        self.assertFalse(pending.exists())
+        self.assertEqual(len((self.bin / "tofu.destroy-applies").read_text().splitlines()), 1)
 
     def test_destroy_refuses_a_reviewed_retained_target_and_invalidated_plan(self):
         target, environment, candidate = self.prepare_target("stargazer", "stargazer-sandbox")
@@ -1695,7 +1819,7 @@ esac
                 self.assertNotEqual(blocked.returncode, 0)
                 self.assertIn("The reviewed environment changed", blocked.stderr)
         self.assertTrue(registration.exists())
-        self.assertNotIn(str(plan), (self.bin / "tofu.applies").read_text())
+        self.assertFalse((self.bin / "tofu.destroy-applies").exists())
 
     def test_destroy_requires_recovery_after_ambiguous_attempt_and_blocks_new_operations(self):
         target, environment, candidate = self.prepare_target("stargazer", "stargazer-sandbox")
@@ -1718,7 +1842,10 @@ esac
             blocked = self.operation("just", operation, target, str(environment))
             self.assertNotEqual(blocked.returncode, 0)
             self.assertIn("A destroy is pending", blocked.stderr)
-        self.assertEqual((self.bin / "tofu.applies").read_text().splitlines().count(str(plan)), 1)
+        self.assertEqual(
+            (self.bin / "tofu.destroy-applies").read_text().splitlines(),
+            [hashlib.sha256(plan.read_bytes()).hexdigest()],
+        )
 
     def test_registers_the_observed_docker_identity_and_retries_idempotently(self):
         target, environment, candidate = self.prepare_target("stargazer", "stargazer-sandbox")

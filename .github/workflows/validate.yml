@@ -66,6 +66,21 @@ jobs:
           export TF_DATA_DIR="$scratch/baseline-module-data"
           tofu -chdir=clusters/local-kind/kind-baseline init -backend=false -lockfile=readonly -input=false
           make kind-baseline-check
+      - name: Verify the baseline Argo CD overlay from pinned inputs
+        shell: bash
+        run: |
+          scratch=$(mktemp -d "$RUNNER_TEMP/kind-baseline-argocd.XXXXXX")
+          trap 'rm -rf -- "$scratch"' EXIT
+          curl --fail --silent --show-error --location --proto '=https' --max-time 120 \
+            https://dl.k8s.io/release/v1.35.0/bin/linux/amd64/kubectl -o "$scratch/kubectl"
+          echo 'a2e984a18a0c063279d692533031c1eff93a262afcc0afdc517375432d060989  kubectl' \
+            | (cd "$scratch" && sha256sum -c -)
+          chmod 0500 "$scratch/kubectl"
+          curl --fail --silent --show-error --location --proto '=https' --max-time 120 \
+            https://raw.githubusercontent.com/argoproj/argo-cd/e258ee23c3e52266d407572f4bcdfe7d9ed36cb5/manifests/install.yaml \
+            -o "$scratch/install.yaml"
+          KIND_BASELINE_KUBECTL="$scratch/kubectl" KIND_BASELINE_ARGO_INSTALL="$scratch/install.yaml" \
+            make kind-baseline-argo-check
 
   supply-chain:
     runs-on: ubuntu-latest

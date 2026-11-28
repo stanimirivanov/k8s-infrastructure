@@ -4,7 +4,12 @@ namespace: argocd
 resources:
   - namespace.yaml
   # Argo CD v3.5.2
-  - https://raw.githubusercontent.com/argoproj/argo-cd/v3.5.2/manifests/install.yaml
+  - https://raw.githubusercontent.com/argoproj/argo-cd/e258ee23c3e52266d407572f4bcdfe7d9ed36cb5/manifests/install.yaml
+labels:
+  - pairs:
+      infra.k8s-infrastructure.io/owner: registered-kind-argocd
+    includeSelectors: false
+    includeTemplates: false
 images:
   # Redis 8.2.3-alpine; identical multi-platform content on ECR Public and Docker Hub.
   - name: public.ecr.aws/docker/library/redis

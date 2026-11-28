@@ -177,10 +177,14 @@ just verify stargazer/sandbox "$PLAN"
 Review the environment commit, provider revision and the baseline profile's
 [Argo CD overlay](../clusters/local-kind/kind-baseline/addons/argocd/kustomization.yaml)
 before authorizing bootstrap. An Argo CD-only upgrade can use a reviewed provider
-pin and bootstrap by itself. Review and apply any prerequisite substrate changes
-through a separate approved infrastructure plan first. Bootstrap installs the
-provider's controllers. The environment owns its Applications and workload
-credentials.
+pin and bootstrap by itself. The registered `plan` and `apply` commands cover initial
+creation. For prerequisite substrate changes on a target with a registered UID,
+have Operations review a separate managed plan with the current owner. Bind the
+plan to the registered state and lock, verify the daemon, dedicated kubeconfig
+and UID before and after execution, and qualify the new profile before bootstrap.
+For a change of owner, follow the separate [substrate cutover](architecture/substrate-capability.md#compatibility-and-first-import)
+before switching the operating path. Bootstrap installs the provider's controllers.
+The environment owns its Applications and workload credentials.
 
 ```bash
 just bootstrap stargazer/sandbox "$ENVIRONMENT"
@@ -189,10 +193,14 @@ just bootstrap stargazer/sandbox "$ENVIRONMENT"
 The command takes the target lock, checks the registered state and dedicated
 kubeconfig, and checks the daemon and the live `kube-system` UID. It stages the
 overlay from the exact pinned Git commit and renders it once. The render needs
-access to the pinned upstream Argo CD manifest, and the cluster needs access to
-the controller images. An absent `argocd` namespace is acceptable. An existing
-namespace must have the provider's ownership labels. The command applies
-the hashed manifest with the `k8s-infrastructure` server-side field manager.
+access to the upstream Argo CD manifest at its pinned Git commit, and the cluster
+needs access to the controller images. An absent `argocd` namespace is acceptable.
+An existing namespace must have the provider's ownership labels. Before apply,
+the command also checks that each existing object in the rendered inventory,
+including cluster-scoped objects, has `infra.k8s-infrastructure.io/owner=registered-kind-argocd`.
+Review a bootstrap ownership cutover separately for an existing installation with
+unlabeled objects. The command applies the checked manifest with the
+`k8s-infrastructure` server-side field manager.
 
 The printed `bootstrapped.json` path identifies the private attempt. A successful
 attempt has the rendered `argocd.yaml`, `SHA256SUMS`, apply and rollout logs, an
@@ -232,8 +240,10 @@ state, or plan needs a fresh destroy plan and approval.
 just destroy stargazer/sandbox "$DESTROY_PLAN" "$DESTROY_SHA256" "$DESTROY_APPROVER" "$DESTROY_APPROVAL_UTC"
 ```
 
-Destroy rechecks the exact encrypted plan, target binding, daemon, backend,
-state digest, and live UID before OpenTofu applies the approved deletion. The
+Destroy verifies a private ciphertext snapshot against the exact approved digest.
+OpenTofu inspects that snapshot, checks the backend, and applies the deletion after
+the target binding, daemon, state digest, and live UID checks. The procedure records
+the original approved path and removes the temporary snapshot on exit. The
 procedure retires the registration only after checking the empty state and
 the absence of the nodes by kind cluster label and exact baseline container
 names. It prints the path of `retired-registration.json` in the private destroy
@@ -436,7 +446,7 @@ subshell releases both types of lock when the task exits.
     local -a logging=() encryption=()
     if [[ ${TRACE_PLAN_BACKEND:-} == yes ]]; then logging=(TF_LOG=JSON TF_LOG_PROVIDER=OFF); fi
     if [[ "$INTENT" == destroy ]]; then
-      private_file "$DESTROY_KEY"
+      check_destroy_key
       encryption=("TF_ENCRYPTION=$DESTROY_ENCRYPTION")
     fi
     # Use kind's single default kubeconfig path in the new private runtime or plan directory.
@@ -444,6 +454,11 @@ subshell releases both types of lock when the task exits.
       DOCKER_HOST="$DOCKER_HOST" KIND_EXPERIMENTAL_PROVIDER=docker TF_CLI_CONFIG_FILE="$TOFU_CONFIG" \
       TF_DATA_DIR="${RUNTIME:-$PLAN_DIR/.terraform}" TF_WORKSPACE=default CHECKPOINT_DISABLE=1 \
       "${logging[@]}" "${encryption[@]}" tofu -chdir="$PLAN_DIR" "$@"
+  }
+  check_destroy_key() {
+    private_file "$DESTROY_KEY"
+    [[ "$(wc -c < "$DESTROY_KEY")" == 65 ]] && LC_ALL=C grep -aqxE '[a-f0-9]{64}' -- "$DESTROY_KEY" ||
+      refuse 'The per-target destroy plan key has an invalid format.'
   }
   load_destroy_key() {
     local directory key
@@ -457,7 +472,7 @@ subshell releases both types of lock when the task exits.
       [[ "$key" =~ ^[a-f0-9]{64}$ ]] || refuse 'Could not generate the per-target destroy plan key.'
       write_record "$DESTROY_KEY" "$key"
     fi
-    private_file "$DESTROY_KEY"
+    check_destroy_key
     # Native OpenTofu reads the passphrase. Only an interpolation-safe path enters the child environment.
     printf -v DESTROY_ENCRYPTION 'key_provider "pbkdf2" "destroy" { passphrase = trimspace(file(base64decode("%s"))) }\nmethod "aes_gcm" "destroy" { keys = key_provider.pbkdf2.destroy }\nplan {\n  method = method.aes_gcm.destroy\n  enforced = true\n}\n' \
       "$(printf '%s' "$DESTROY_KEY" | base64 -w0)"
@@ -485,16 +500,17 @@ subshell releases both types of lock when the task exits.
     '
   }
   check_destroy_plan() {
-    private_file "$PLAN"
+    local sealed_plan=$1
+    private_file "$sealed_plan"
     jq -es '
       def base64: strings | test("^[A-Za-z0-9+/]+={0,2}$");
       length == 1 and (.[0] |
         keys == ["encrypted_data", "encryption_version", "meta"] and .encryption_version == "v0"
         and (.encrypted_data | base64) and (.meta | keys == ["key_provider.pbkdf2.destroy"])
         and (.meta["key_provider.pbkdf2.destroy"] | base64))
-    ' "$PLAN" >/dev/null 2>&1 || refuse 'The saved destroy plan must be an encrypted OpenTofu plan.'
+    ' "$sealed_plan" >/dev/null 2>&1 || refuse 'The saved destroy plan must be an encrypted OpenTofu plan.'
     # Prior state in show JSON contains credentials. Only retain the result of checking the expected delete.
-    run_tofu 60s show -json "$PLAN" 2>/dev/null |
+    run_tofu 60s show -json "$sealed_plan" 2>/dev/null |
       jq -e --arg cluster "$CLUSTER" --arg binding "$BINDING_SHA256" --arg provider "$PROVIDER_ADDRESS" '
         .variables.cluster_name.value == $cluster and .variables.plan_binding_sha256.value == $binding
         and .configuration.provider_config ==
@@ -514,10 +530,10 @@ subshell releases both types of lock when the task exits.
   }
   check_backend() {
     # OpenTofu 1.13.10 graph checks the embedded plan backend and state freshness read-only.
-    local trace backend
+    local checked_plan=${1:-$PLAN} trace backend
     backend=$(printf 'backend/local: state manager for workspace "default" will:\n - read initial snapshot from %s\n - write new snapshots to %s\n - create any backup at %s.backup' \
       "$STATE" "$STATE" "$STATE")
-    trace=$(TRACE_PLAN_BACKEND=yes run_tofu 60s graph -no-color -plan="$PLAN" 2>&1 >/dev/null) ||
+    trace=$(TRACE_PLAN_BACKEND=yes run_tofu 60s graph -no-color -plan="$checked_plan" 2>&1 >/dev/null) ||
       refuse 'OpenTofu could not validate the saved backend and state. Check for a stale plan.'
     jq -eRn --arg backend "$backend" '
       [inputs | fromjson? | select(."@level" == "trace") | ."@message"] as $messages
@@ -697,8 +713,14 @@ subshell releases both types of lock when the task exits.
       get namespace argocd --ignore-not-found -o "jsonpath=$owner_path" 2> "$PLAN_DIR/ownership.log")
     [[ -z "$ownership" || "$ownership" == 'argocd argocd k8s-infrastructure kubernetes-substrate' ]] ||
       refuse 'The argocd namespace lacks the infrastructure ownership labels.'
-    check_managed_identity
     manifest_bytes=$(checked_manifest && printf '.')
+    # Project only the ownership label, including for Secret and cluster-scoped objects.
+    ownership=$(printf '%s' "${manifest_bytes%.}" | run_kubectl 90s "$KUBECONFIG_PATH" --request-timeout=10s \
+      get -f - --ignore-not-found --no-headers -o 'custom-columns=OWNER:.metadata.labels.infra\.k8s-infrastructure\.io/owner' \
+      2>/dev/null && printf '.') || refuse 'Could not verify existing Argo CD object ownership.'
+    printf '%s' "${ownership%.}" | awk '$0 != "registered-kind-argocd" { exit 1 }' ||
+      refuse 'An existing Argo CD object lacks the registered baseline ownership label.'
+    check_managed_identity
     printf '%s' "${manifest_bytes%.}" | run_kubectl 120s "$KUBECONFIG_PATH" --request-timeout=30s \
       apply --server-side --field-manager=k8s-infrastructure -f - > "$PLAN_DIR/apply.log" 2>&1
 
@@ -857,7 +879,7 @@ subshell releases both types of lock when the task exits.
     [[ "$(digest < "$STATE")" == "$STATE_SHA256" ]] || refuse 'The registered state changed after destroy planning.'
   }
   destroy_or_resume() {
-    local attempts recorded applied state_sha retirement status
+    local sealed_plan=$1 attempts recorded applied state_sha retirement status
     local attempted_file="$PLAN_DIR/destroy-attempted.json" applied_file="$PLAN_DIR/destroy-applied.json"
     local verified_file="$PLAN_DIR/destroy-verified.json" retired_file="$PLAN_DIR/retired-registration.json"
     check_approval
@@ -871,15 +893,13 @@ subshell releases both types of lock when the task exits.
       [[ "$(clean_revision)" == "$ENV_REVISION" ]] ||
         refuse 'The reviewed environment changed. Save and separately approve a new destroy plan.'
       check_destroy_state
-      check_backend
+      check_backend "$sealed_plan"
       check_managed_identity
       check_destroy_state
-      check_digest
       write_record "$DESTROY_PENDING" "$attempts"
       write_record "$attempted_file" "$attempts"
-      check_digest
       if run_tofu 300s apply -no-color -input=false -lock-timeout=30s \
-        -state="$STATE" -state-out="$STATE" -backup="$STATE.backup" "$PLAN" > /dev/null 2>&1; then
+        -state="$STATE" -state-out="$STATE" -backup="$STATE.backup" "$sealed_plan" > /dev/null 2>&1; then
         printf 'OpenTofu destroy exited 0.\n' > "$PLAN_DIR/destroy.log"
       else
         status=$?
@@ -919,10 +939,11 @@ subshell releases both types of lock when the task exits.
       lock_registry
       [[ "$(load_registration "$REGISTRATION" "$TARGET")" == "$INPUT" ]] ||
         refuse 'The registration changed before retirement.'
-      rm -f -- "$DESTROY_PENDING"
-      mv -T -- "$REGISTRATION" "$retired_file"
+      mv -T -- "$REGISTRATION" "$retired_file" || refuse 'Could not archive the verified registration. Retry the same approved destroy.'
       sync -f -- "$retired_file"
       sync -f -- "$REGISTRY/$OWNER"
+      rm -f -- "$DESTROY_PENDING"
+      sync -f -- "$PLAN_ROOT"
     )
     printf '%s\n' "$retired_file"
   }
@@ -1095,6 +1116,7 @@ subshell releases both types of lock when the task exits.
     while IFS= read -r path; do canonical_private_path "$path" >/dev/null; done <<< "$PROPOSED_PATHS"
 
     lock_registry
+    ! path_exists "$DESTROY_PENDING" || refuse 'A destroy is pending. Resume its verified retirement or use explicit Operations recovery.'
 
     shopt -s nullglob
     for owner_dir in "$REGISTRY"/*/; do
@@ -1160,10 +1182,15 @@ subshell releases both types of lock when the task exits.
     if [[ "$INTENT" == destroy ]]; then
       load_destroy_key
       STATE_SHA256=$(jq -r .priorStateSha256 <<< "$BINDING")
+      # Verify the copy in the fresh runtime. Keep PLAN as the approved path in receipts.
+      sealed_plan="$RUNTIME/saved.tfplan"
+      cat -- "$PLAN" > "$sealed_plan" || refuse 'Could not copy the approved destroy plan.'
+      [[ "$(digest < "$sealed_plan")" == "$PLAN_SHA256" ]] ||
+        refuse 'The destroy plan snapshot differs from the exact approved file.'
       run_tofu 120s init -no-color -input=false -get=false -lockfile=readonly -backend-config="path=$STATE" \
         > /dev/null 2>&1 || refuse 'OpenTofu could not initialize the encrypted destroy attempt.'
-      check_destroy_plan
-      destroy_or_resume
+      check_destroy_plan "$sealed_plan"
+      destroy_or_resume "$sealed_plan"
       exit 0
     fi
     check_plan_archive
@@ -1224,7 +1251,7 @@ subshell releases both types of lock when the task exits.
       >/dev/null 2>&1 || refuse 'OpenTofu could not initialize the encrypted destroy attempt.'
     run_tofu 180s plan -destroy -no-color -input=false -refresh=false -lock-timeout=30s -out="$PLAN" \
       >/dev/null 2>&1 || refuse 'OpenTofu could not save the encrypted destroy plan.'
-    check_destroy_plan
+    check_destroy_plan "$PLAN"
     check_backend
     check_managed_identity
     check_destroy_state
@@ -1400,8 +1427,12 @@ storage. Publish the reviewed provider revision only after qualification.
   and the pinned overlay before retrying. A retry creates a new attempt.
 - Destroy journals its exact approval before applying and preserves the
   registration if OpenTofu fails or the empty-state and absence checks fail.
-  If `destroy-applied.json` exists, run `destroy` again with the same arguments
-  to resume the checks and retirement without another OpenTofu apply. If only
-  `destroy-attempted.json` exists, use explicit Operations recovery to establish
-  the state and Docker outcome under the target lock. Retain the key, ciphertext,
-  registration, journals and diagnostics privately for that review.
+  If `destroy-applied.json` and the live registration exist, run `destroy` again
+  with the same arguments to resume the checks and retirement. If a crash left
+  `active-destroy.json` after the registration was archived, have Operations
+  match the journal to `destroy-verified.json` and `retired-registration.json`
+  and confirm the empty state and node absence under the registry and target
+  locks. Clear only the stale journal through explicit Operations recovery.
+  If only `destroy-attempted.json` exists, use explicit Operations recovery to
+  establish the state and Docker outcome under the target lock. Retain the key,
+  ciphertext, registration, journals and diagnostics privately for that review.
