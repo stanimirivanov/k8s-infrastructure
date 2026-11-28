@@ -23,6 +23,7 @@ _kind PROVIDER OPERATION TARGET INPUT_PATH *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
     umask 077
+    unset RUNTIME EXPORTED_CONFIG TRACE_PLAN_BACKEND
 
     refuse() { printf '%s\n' "$1" >&2; exit 1; }
     digest() { sha256sum | cut -d ' ' -f 1; }
@@ -155,29 +156,33 @@ _kind PROVIDER OPERATION TARGET INPUT_PATH *ARGS:
       shift
       local -a logging=()
       if [[ ${TRACE_PLAN_BACKEND:-} == yes ]]; then logging=(TF_LOG=JSON TF_LOG_PROVIDER=OFF); fi
-      timeout --verbose --kill-after=5s "$deadline" env -i PATH="$PATH" HOME="$PLAN_DIR" \
+      # Use kind's single default kubeconfig path in the new private runtime or plan directory.
+      timeout --verbose --kill-after=5s "$deadline" env -i PATH="$PATH" HOME="${RUNTIME:-$PLAN_DIR}" \
         DOCKER_HOST="$DOCKER_HOST" KIND_EXPERIMENTAL_PROVIDER=docker TF_CLI_CONFIG_FILE="$TOFU_CONFIG" \
         TF_DATA_DIR="${RUNTIME:-$PLAN_DIR/.terraform}" TF_WORKSPACE=default CHECKPOINT_DISABLE=1 \
-        KUBECONFIG="$PLAN_DIR/provider.kubeconfig" "${logging[@]}" tofu -chdir="$PLAN_DIR" "$@"
+        "${logging[@]}" tofu -chdir="$PLAN_DIR" "$@"
     }
     check_plan_shape() {
       run_tofu 60s show -json "$PLAN" |
-        jq -ce --arg cluster "$CLUSTER" --arg binding "$BINDING_SHA256" --arg provider "$PROVIDER_ADDRESS" \
-          --arg intent "$INTENT" '
+        jq -ce --arg cluster "$CLUSTER" --arg binding "$BINDING_SHA256" --arg provider "$PROVIDER_ADDRESS" '
           select(.variables.cluster_name.value == $cluster and .variables.plan_binding_sha256.value == $binding)
+          | select(.configuration.provider_config ==
+              {kind: {name: "kind", full_name: $provider, version_constraint: "0.0.4"}})
+          | select(any(.configuration.root_module.resources[]?;
+              .address == "kind_cluster.baseline" and .provider_config_key == "kind"))
           | select((.resource_drift // []) == [] and (.deferred_changes // []) == [])
           | .resource_changes | select(type == "array" and length == 1) | .[0]
           | select(.address == "kind_cluster.baseline" and .mode == "managed" and .provider_name == $provider
             and .previous_address == null and .deposed == null and .change.importing == null
             and .change.after.name == $cluster
-            and (if $intent == "create" then .change.actions == ["create"]
-                 else .change.actions == ["no-op"] or .change.actions == ["update"] end))
+            and .change.after.networking.api_server_address == "127.0.0.1"
+            and .change.actions == ["create"])
           | .change.after.node
           | select(map(.role) == ["control-plane", "worker"])
           | map({name: ($cluster + "-" + .role), role: .role,
                  labels: ((.labels // {}) + (if .role == "control-plane"
                    then {"node-role.kubernetes.io/control-plane": ""} else {} end))})
-        ' || refuse 'OpenTofu did not save the expected bound baseline plan.'
+      '
     }
     check_backend() {
       # OpenTofu 1.13.10 graph checks the embedded plan backend and state freshness read-only.
@@ -277,7 +282,7 @@ _kind PROVIDER OPERATION TARGET INPUT_PATH *ARGS:
     run_kubectl() {
       local deadline=$1 config=$2
       shift 2
-      timeout --kill-after=5s "$deadline" env -i PATH="$PATH" HOME="$PLAN_DIR" \
+      timeout --kill-after=5s "$deadline" env -i PATH="$PATH" HOME="$RUNTIME" \
         kubectl --kubeconfig "$config" --context "$CONTEXT" "$@"
     }
     config_identity() {
@@ -324,23 +329,15 @@ _kind PROVIDER OPERATION TARGET INPUT_PATH *ARGS:
     check_uid() {
       [[ "$(live_uid)" == "$EXPECTED_UID" ]] || refuse 'The live kube-system UID differs from the registration.'
     }
-    check_managed_target() {
-      local attributes
-      [[ -n "$EXPECTED_UID" ]] || refuse 'A managed plan requires a registered kube-system UID.'
-      attributes=$(state_attributes)
-      private_file "$KUBECONFIG_PATH"
-      check_config "$attributes" "$KUBECONFIG_PATH"
-      check_uid
-    }
     record_identity() {
       local attributes uid observation recorded
       check_daemon
       attributes=$(state_attributes)
       if ! path_exists "$KUBECONFIG_PATH"; then
-        [[ "$INTENT" == create && -z "$EXPECTED_UID" && ! -e "$PLAN_DIR/identity-observed.json" ]] ||
+        [[ -z "$EXPECTED_UID" && ! -e "$PLAN_DIR/identity-observed.json" ]] ||
           refuse 'The registered kubeconfig is missing.'
         EXPORTED_CONFIG=$(mktemp "${KUBECONFIG_PATH%/*}/.kind-config.XXXXXX")
-        timeout --kill-after=5s 30s env -i PATH="$PATH" HOME="$PLAN_DIR" DOCKER_HOST="$DOCKER_HOST" \
+        timeout --kill-after=5s 30s env -i PATH="$PATH" HOME="$RUNTIME" DOCKER_HOST="$DOCKER_HOST" \
           KIND_EXPERIMENTAL_PROVIDER=docker kind get kubeconfig --name "$CLUSTER" > "$EXPORTED_CONFIG"
         check_config "$attributes" "$EXPORTED_CONFIG"
         mv -T -- "$EXPORTED_CONFIG" "$KUBECONFIG_PATH"
@@ -358,7 +355,7 @@ _kind PROVIDER OPERATION TARGET INPUT_PATH *ARGS:
         [[ "$(jq -cS . <<< "$recorded")" == "$observation" ]] ||
           refuse 'The observed live identity differs from the original apply evidence.'
       else
-        [[ "$INTENT" != create || -z "$EXPECTED_UID" ]] || refuse 'The original UID observation is missing.'
+        [[ -z "$EXPECTED_UID" ]] || refuse 'The original UID observation is missing.'
         write_record "$PLAN_DIR/identity-observed.json" "$observation"
       fi
       if [[ -z "$EXPECTED_UID" ]]; then
@@ -376,18 +373,8 @@ _kind PROVIDER OPERATION TARGET INPUT_PATH *ARGS:
       local -a expected=()
       for file in verify.log nodes.json repeat.log verified.json; do may_write_log "$PLAN_DIR/$file"; done
       mapfile -t expected < <(jq -r '.[] | "node/" + .name' <<< "$TOPOLOGY")
-      observed=$(run_kubectl 15s "$KUBECONFIG_PATH" --request-timeout=10s get nodes -o json 2>> "$PLAN_DIR/verify.log")
-      jq -e --argjson expected "$TOPOLOGY" '
-        (.items | map(.metadata.name) | sort) == ($expected | map(.name) | sort)
-        and (.items as $nodes | all($expected[]; . as $node |
-          any($nodes[]; .metadata.name == $node.name and
-            (.metadata.labels as $labels | all($node.labels | to_entries[]; $labels[.key] == .value)) and
-            ($node.role == "control-plane" or (.metadata.labels | has("node-role.kubernetes.io/control-plane") | not)))))
-      ' <<< "$observed" >/dev/null || refuse 'Unexpected baseline node inventory or role placement.'
       run_kubectl 100s "$KUBECONFIG_PATH" --request-timeout=90s wait --for=condition=Ready --timeout=90s \
         "${expected[@]}" >> "$PLAN_DIR/verify.log" 2>&1 || refuse 'The required baseline nodes did not become Ready.'
-      nodes=$(jq -c '[.items[] | .metadata | {name, labels}]' <<< "$observed")
-      write_record "$PLAN_DIR/nodes.json" "$nodes"
       check_snapshot
       if run_tofu 180s plan -no-color -input=false -lock-timeout=30s -state="$STATE" -detailed-exitcode \
         >> "$PLAN_DIR/repeat.log" 2>&1; then
@@ -397,6 +384,17 @@ _kind PROVIDER OPERATION TARGET INPUT_PATH *ARGS:
           refuse 'The registered state changed after the completed apply.'
         check_config "$attributes" "$KUBECONFIG_PATH"
         check_uid
+        observed=$(run_kubectl 15s "$KUBECONFIG_PATH" --request-timeout=10s get nodes -o json 2>> "$PLAN_DIR/verify.log")
+        nodes=$(jq -ce --argjson expected "$TOPOLOGY" '
+          [.items[] | {name: .metadata.name, labels: .metadata.labels,
+            ready: any(.status.conditions[]?; .type == "Ready" and .status == "True")}]
+          | select((map(.name) | sort) == ($expected | map(.name) | sort))
+          | select(. as $nodes | all($expected[]; . as $node |
+            any($nodes[]; .name == $node.name and .ready and
+              (.labels as $labels | all($node.labels | to_entries[]; $labels[.key] == .value)) and
+              ($node.role == "control-plane" or (.labels | has("node-role.kubernetes.io/control-plane") | not)))))
+        ' <<< "$observed") || refuse 'Unexpected baseline node inventory, role placement, or readiness.'
+        write_record "$PLAN_DIR/nodes.json" "$nodes"
         write_record "$PLAN_DIR/verified.json" "$(jq -cS --arg uid "$EXPECTED_UID" \
           '. + {kubeSystemUid: $uid, repeatPlanExit: 0}' <<< "$APPLIED")"
         if path_exists "$PENDING"; then rm -- "$PENDING"; sync -f -- "$PLAN_ROOT"; fi
@@ -419,15 +417,10 @@ _kind PROVIDER OPERATION TARGET INPUT_PATH *ARGS:
         [[ ! -e "$attempted_file" && ! -L "$attempted_file" && ! -e "$applied_file" && ! -L "$applied_file" ]] &&
           ! path_exists "$PENDING" && ! path_exists "$PLAN_DIR/apply.log" ||
           refuse 'An apply was already attempted. Resume verification or use explicit Operations recovery.'
-        if [[ "$INTENT" == create ]]; then
-          [[ -z "$EXPECTED_UID" ]] || refuse 'The reserved cluster already has a registered UID.'
-          check_vacancy
-        else
-          check_managed_target
-        fi
         check_backend
         check_daemon
         check_digest
+        check_vacancy
         attempts=$(operation_record | jq -cS --arg approver "$APPROVER" --arg time "$APPROVAL_UTC" \
           '. + {approver: $approver, approvalUtc: $time}')
         write_record "$PENDING" "$attempts"
@@ -516,6 +509,9 @@ _kind PROVIDER OPERATION TARGET INPUT_PATH *ARGS:
         KUBECONFIG_PATH=$(jq -r .kubeconfig <<< "$INPUT")
         CONTEXT=$(jq -r .context <<< "$INPUT")
         EXPECTED_UID=$(jq -r '.kubeSystemUid // empty' <<< "$INPUT")
+        if [[ "$OPERATION" != verify && -n "$EXPECTED_UID" ]]; then
+          refuse 'The reserved cluster already has a registered UID. Use verify with its applied plan.'
+        fi
         ;;
       *) refuse "$USAGE" ;;
     esac
@@ -548,12 +544,11 @@ _kind PROVIDER OPERATION TARGET INPUT_PATH *ARGS:
         keys == ["declarationSha256", "environmentRevision", "intent", "profile", "providerPinSha256",
           "providerRevision", "registrationSha256", "schemaVersion", "target"]
         and .schemaVersion == 1 and .target == $target and .profile == "kind-baseline"
-        and (.intent == "create" or .intent == "managed")
+        and .intent == "create"
         and (.environmentRevision | commit) and (.providerRevision | commit)
         and ([.declarationSha256, .providerPinSha256, .registrationSha256] | all(.[]; sha))
       ' <<< "$BINDING" >/dev/null || refuse 'The plan binding is invalid or differs from the registered target.'
       BINDING_SHA256=$(digest < "$PLAN_DIR/binding.json")
-      INTENT=$(jq -r .intent <<< "$BINDING")
       ENV_REVISION=$(jq -r .environmentRevision <<< "$BINDING")
       [[ "$(git_at "$ENVIRONMENT" rev-parse --show-toplevel)" == "$ENVIRONMENT" &&
          "$(git_at "$ENVIRONMENT" rev-parse --verify "$ENV_REVISION^{commit}")" == "$ENV_REVISION" ]] ||
@@ -656,11 +651,7 @@ _kind PROVIDER OPERATION TARGET INPUT_PATH *ARGS:
         refuse 'The saved provider revision differs from the reviewed environment pin.'
       check_snapshot
       STAGED_REGISTRATION=$(load_registration "$PLAN_DIR/registration.json" "$TARGET")
-      STAGED_UID=$(jq -r '.kubeSystemUid // empty' <<< "$STAGED_REGISTRATION")
-      BOUND_UID=''
-      if [[ "$INTENT" == managed ]]; then BOUND_UID=$EXPECTED_UID; fi
-      [[ "$(jq -cS 'del(.kubeSystemUid)' <<< "$INPUT")" == "$(jq -cS 'del(.kubeSystemUid)' <<< "$STAGED_REGISTRATION")" &&
-         "$STAGED_UID" == "$BOUND_UID" ]] ||
+      [[ "$(jq -cS 'del(.kubeSystemUid)' <<< "$INPUT")" == "$(jq -cS . <<< "$STAGED_REGISTRATION")" ]] ||
         refuse 'The current registration differs from the saved target binding or UID.'
       check_plan_archive
       RUNTIME=$(mktemp -d "$PLAN_DIR/.runtime.XXXXXX")
@@ -671,18 +662,13 @@ _kind PROVIDER OPERATION TARGET INPUT_PATH *ARGS:
       # Reinstall using the reviewed lock and a fresh CLI data directory before using the plan.
       run_tofu 120s init -no-color -input=false -get=false -lockfile=readonly -backend-config="path=$STATE" \
         >> "$PLAN_DIR/operation-init.log" 2>&1
-      TOPOLOGY=$(check_plan_shape)
+      TOPOLOGY=$(check_plan_shape) || refuse 'OpenTofu did not save the expected bound baseline create plan.'
       apply_or_resume
       exit 0
     fi
 
     ! path_exists "$PENDING" || refuse 'An apply is pending. Resume verification or use explicit Operations recovery.'
-    if [[ -z "$EXPECTED_UID" ]]; then
-      INTENT=create
-      check_vacancy
-    else
-      INTENT=managed
-    fi
+    check_vacancy
     MIRROR=${KIND_PROVIDER_MIRROR:?Set KIND_PROVIDER_MIRROR to the qualified local provider mirror}
     [[ -d "$MIRROR" && "$(realpath -e -- "$MIRROR")" == "$MIRROR" && "$MIRROR" != *[[:cntrl:]]* ]] ||
       refuse 'Use a canonical directory path for the local provider mirror.'
@@ -703,17 +689,16 @@ _kind PROVIDER OPERATION TARGET INPUT_PATH *ARGS:
     stage_blob "$ENVIRONMENT" "$ENV_REVISION" "$PIN_PATH" > "$PLAN_DIR/provider-pin.json"
     cp -- "$REGISTRATION" "$PLAN_DIR/registration.json"
     jq -nS --arg target "$TARGET" --arg environment "$ENV_REVISION" --arg provider "$PROVIDER_REVISION" \
-      --arg intent "$INTENT" --arg registration "$(digest < "$PLAN_DIR/registration.json")" \
+      --arg registration "$(digest < "$PLAN_DIR/registration.json")" \
       --arg declaration "$(digest < "$PLAN_DIR/declaration.json")" \
       --arg pin "$(digest < "$PLAN_DIR/provider-pin.json")" \
-      '{schemaVersion: 1, target: $target, profile: "kind-baseline", intent: $intent,
+      '{schemaVersion: 1, target: $target, profile: "kind-baseline", intent: "create",
         environmentRevision: $environment, providerRevision: $provider, registrationSha256: $registration,
         declarationSha256: $declaration, providerPinSha256: $pin}' > "$PLAN_DIR/binding.json"
     BINDING_SHA256=$(digest < "$PLAN_DIR/binding.json")
     jq -n --arg name "$CLUSTER" --arg digest "$BINDING_SHA256" \
       '{cluster_name: $name, plan_binding_sha256: $digest}' > "$PLAN_DIR/target.auto.tfvars.json"
 
-    if [[ "$INTENT" == managed ]]; then check_managed_target; fi
     PLAN="$PLAN_DIR/saved.tfplan"
     run_tofu 120s init -no-color -input=false -get=false -lockfile=readonly -backend-config="path=$STATE" > "$PLAN_DIR/init.log" 2>&1
     run_tofu 180s plan -no-color -input=false -refresh=false -lock-timeout=30s -out="$PLAN" > "$PLAN_DIR/plan.log" 2>&1
@@ -721,7 +706,7 @@ _kind PROVIDER OPERATION TARGET INPUT_PATH *ARGS:
     run_tofu 60s show -no-color "$PLAN" > "$PLAN_DIR/plan.txt" 2>>"$PLAN_DIR/show.log"
     PLAN_SHA256=$(digest < "$PLAN")
     printf '%s  saved.tfplan\n' "$PLAN_SHA256" > "$PLAN_DIR/SHA256SUMS"
-    printf '# Plan review\n\n- Target %s\n- Profile kind-baseline\n- Intent %s\n- Environment revision %s\n- Provider revision %s\n- Binding SHA-256 %s\n- Plan %s\n- SHA-256 %s\n' \
-      "$TARGET" "$INTENT" "$ENV_REVISION" "$PROVIDER_REVISION" "$BINDING_SHA256" "$PLAN" "$PLAN_SHA256" > "$PLAN_DIR/.review"
+    printf '# Plan review\n\n- Target %s\n- Profile kind-baseline\n- Intent create\n- Environment revision %s\n- Provider revision %s\n- Binding SHA-256 %s\n- Plan %s\n- SHA-256 %s\n' \
+      "$TARGET" "$ENV_REVISION" "$PROVIDER_REVISION" "$BINDING_SHA256" "$PLAN" "$PLAN_SHA256" > "$PLAN_DIR/.review"
     mv -T -- "$PLAN_DIR/.review" "$PLAN_DIR/REVIEW.md"
     printf '%s\n' "$PLAN_DIR/REVIEW.md"

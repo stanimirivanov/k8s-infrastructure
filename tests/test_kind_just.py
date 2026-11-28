@@ -217,21 +217,30 @@ set -eu
 plan_dir=${1#-chdir=}
 shift
 [[ $1 == graph || ! -v TF_LOG ]]
-[[ $KUBECONFIG == "$plan_dir/provider.kubeconfig" && $TF_WORKSPACE == default ]]
+[[ $TF_WORKSPACE == default ]]
 [[ $TF_CLI_CONFIG_FILE == "$plan_dir/opentofu.tfrc" ]]
 lock=$(jq -er .lock "$plan_dir/registration.json")
 state=$(jq -er .state "$plan_dir/registration.json")
 cluster=$(jq -er .clusterName "$plan_dir/registration.json")
 if flock -n "$lock" true; then exit 99; fi
+write_provider_config() {
+  local config=${KUBECONFIG:-$HOME/.kube/config}
+  mkdir -p -- "${config%/*}"
+  printf 'fixture provider kubeconfig\\n' > "$config"
+}
 case "$1" in
   init)
     [[ $# == 6 && $* == *-lockfile=readonly* && $* == *-get=false* && $6 == "-backend-config=path=$state" ]]
+    mkdir -p -- "$TF_DATA_DIR"
+    touch -- "$TF_DATA_DIR/fixture-provider-installed"
     ;;
   plan)
     if [[ $* == *-detailed-exitcode* ]]; then
       [[ $* == *"-state=$state"* && -s $state ]]
+      write_provider_config
       printf '%s\\n' 'fixture repeat plan'
       if [[ -f "$0.repeat-exit" ]]; then exit "$(cat "$0.repeat-exit")"; fi
+      if [[ -f "$0.repeat-lose-readiness" ]]; then touch "${0%/*}/kubectl.worker-unready"; fi
       exit 0
     fi
     [[ $# == 6 && $* == *-refresh=false* && $* == *-lock-timeout=30s* && $6 == "-out=$plan_dir/saved.tfplan" ]]
@@ -256,14 +265,24 @@ PY
   show)
     [[ $# == 3 && $3 == "$plan_dir/saved.tfplan" ]]
     if [[ $2 == -json ]]; then
-      intent=$(jq -er .intent "$plan_dir/binding.json")
-      if [[ $intent == managed ]]; then action=no-op; else action=create; fi
-      unzip -p "$3" tfplan | jq --arg action "$action" '{variables: (with_entries(.value |= {value: .})), resource_changes: [{
-        address: "kind_cluster.baseline", mode: "managed",
-        provider_name: "registry.terraform.io/elioseverojunior/kind",
-        change: {actions: [$action], after: {name: .cluster_name,
-          node: [{role: "control-plane", labels: null}, {role: "worker", labels: null}]}}
-      }]}'
+      provider=registry.terraform.io/elioseverojunior/kind
+      host='' api_address=127.0.0.1
+      if [[ -f "$0.show-provider-host" ]]; then host=unix:///fixture/other.sock; fi
+      if [[ -f "$0.show-public-api" ]]; then api_address=0.0.0.0; fi
+      unzip -p "$3" tfplan | jq --arg provider "$provider" --arg host "$host" --arg api "$api_address" '{
+        variables: (with_entries(.value |= {value: .})),
+        configuration: {
+          provider_config: {kind: ({name: "kind", full_name: $provider, version_constraint: "0.0.4"}
+            + (if $host == "" then {} else {expressions: {host: {constant_value: $host}}} end))},
+          root_module: {resources: [{address: "kind_cluster.baseline", provider_config_key: "kind"}]}
+        },
+        resource_changes: [{
+          address: "kind_cluster.baseline", mode: "managed", provider_name: $provider,
+          change: {actions: ["create"], after: {name: .cluster_name,
+            networking: {api_server_address: $api},
+            node: [{role: "control-plane", labels: null}, {role: "worker", labels: null}]}}
+        }]
+      }'
     else
       printf 'fixture readable baseline plan\\n'
     fi
@@ -273,6 +292,9 @@ PY
     [[ $3 == "-plan=$plan_dir/saved.tfplan" ]]
     if [[ -f "$0.graph-stale" ]]; then exit 1; fi
     if [[ -f "$0.graph-state" ]]; then state=$(cat "$0.graph-state"); fi
+    if [[ -f "$0.graph-occupy" ]]; then
+      printf '%s %s\\n' "$cluster-worker" "$cluster" > "${0%/*}/docker.containers"
+    fi
     backend=$(printf 'backend/local: state manager for workspace "default" will:\\n - read initial snapshot from %s\\n - write new snapshots to %s\\n - create any backup at %s.backup' \\
       "$state" "$state" "$state")
     jq -n -c --arg path "$backend" '
@@ -284,6 +306,7 @@ PY
     [[ $5 == "-state=$state" && $6 == "-state-out=$state" && $7 == "-backup=$state.backup" ]]
     [[ $8 == "$plan_dir/saved.tfplan" ]]
     printf '%s\\n' "$8" >> "$0.applies"
+    write_provider_config
     if [[ -f "$0.apply-error" ]]; then exit 1; fi
     if [[ -s $state ]]; then exit 0; fi
     config=$(FIXTURE_TOFU_STATE_CONFIG=1 "$(dirname "$0")/kind" get kubeconfig --name "$cluster")
@@ -337,9 +360,13 @@ case "$1 $2" in
   'get nodes')
     [[ $3 == -o && $4 == json ]]
     if [[ -f "$0.nodes" ]]; then cat "$0.nodes"; else
-      jq -n --arg cluster "$cluster" '{items: [
-        {metadata: {name: ($cluster + "-worker"), labels: {}}},
-        {metadata: {name: ($cluster + "-control-plane"), labels: {"node-role.kubernetes.io/control-plane": ""}}}
+      worker_ready=True
+      if [[ -f "$0.worker-unready" ]]; then worker_ready=False; fi
+      jq -n --arg cluster "$cluster" --arg worker_ready "$worker_ready" '{items: [
+        {metadata: {name: ($cluster + "-worker"), labels: {}},
+          status: {conditions: [{type: "Ready", status: $worker_ready}]}},
+        {metadata: {name: ($cluster + "-control-plane"), labels: {"node-role.kubernetes.io/control-plane": ""}},
+          status: {conditions: [{type: "Ready", status: "True"}]}}
       ]}'
     fi
     ;;
@@ -1449,6 +1476,37 @@ esac
         self.assertEqual(receipt["approver"], "Fixture Approver")
         self.assertEqual(receipt["planSha256"], hashlib.sha256(plan.read_bytes()).hexdigest())
 
+    def test_provider_kubeconfig_isolated_from_old_plan_path_and_ambient_config(self):
+        self.registrations = self.root / "registrations:local"
+        self.registrations.mkdir(mode=0o700)
+        self.env["KIND_REGISTRATIONS"] = str(self.registrations)
+        unrelated_runtime = self.root / "unrelated runtime"
+        unrelated_runtime.mkdir(mode=0o700)
+        self.env["RUNTIME"] = str(unrelated_runtime)
+        self.env["TRACE_PLAN_BACKEND"] = "yes"
+        target, environment, candidate = self.prepare_target("stargazer", "stargazer-sandbox")
+        _, plan = self.approved_plan("native", target, environment, candidate)
+        old_config = self.root / "old provider config"
+        old_config.write_text("keep old config\n")
+        (plan.parent / "provider.kubeconfig").symlink_to(old_config)
+        ambient_config = self.root / "ambient config"
+        ambient_config.write_text("keep ambient config\n")
+        self.env["KUBECONFIG"] = str(ambient_config)
+        unowned_cleanup_file = self.root / "kubeconfig outside cleanup"
+        unowned_cleanup_file.write_text("keep unowned config\n")
+        self.env["EXPORTED_CONFIG"] = str(unowned_cleanup_file)
+
+        result = self.apply("just", target, plan)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.operation("native", "verify", target, str(plan))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        self.assertEqual(old_config.read_text(), "keep old config\n")
+        self.assertEqual(ambient_config.read_text(), "keep ambient config\n")
+        self.assertEqual(unowned_cleanup_file.read_text(), "keep unowned config\n")
+        self.assertEqual(list(unrelated_runtime.iterdir()), [])
+        self.assertEqual(list(plan.parent.glob(".runtime.*")), [])
+
     def test_refuses_wrong_approval_or_backend_before_apply(self):
         target, environment, candidate = self.prepare_target("stargazer", "stargazer-sandbox")
         _, plan = self.approved_plan("just", target, environment, candidate)
@@ -1515,6 +1573,45 @@ esac
         self.assertFalse((self.bin / "tofu.applies").exists())
         self.assertFalse((plan.parent / "apply-attempted.json").exists())
 
+    def test_refuses_a_saved_plan_with_a_docker_host_override(self):
+        target, environment, candidate = self.prepare_target("stargazer", "stargazer-sandbox")
+        _, plan = self.approved_plan("just", target, environment, candidate)
+        (self.bin / "tofu.show-provider-host").touch()
+
+        result = self.apply("native", target, plan)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("expected bound baseline create plan", result.stderr)
+        self.assertFalse((self.bin / "tofu.applies").exists())
+        self.assertFalse((plan.parent / "apply-attempted.json").exists())
+
+    def test_refuses_to_publish_a_plan_that_exposes_the_api(self):
+        target, environment, candidate = self.prepare_target("stargazer", "stargazer-sandbox")
+        result = self.register("native", target, environment, candidate)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        (self.bin / "tofu.show-public-api").touch()
+
+        result = self.plan("just", target, environment)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("saved plan differs from the selected profile", result.stderr)
+        self.assertEqual(
+            list((self.registrations / ".plans" / target).glob("plan.*/REVIEW.md")), []
+        )
+
+    def test_refuses_a_cluster_created_during_saved_backend_validation(self):
+        target, environment, candidate = self.prepare_target("stargazer", "stargazer-sandbox")
+        _, plan = self.approved_plan("just", target, environment, candidate)
+        (self.bin / "tofu.graph-occupy").touch()
+
+        result = self.apply("just", target, plan)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("already in use", result.stderr)
+        self.assertFalse((self.bin / "tofu.applies").exists())
+        self.assertFalse((plan.parent / "apply-attempted.json").exists())
+        self.assertFalse((plan.parent.parent / "active-apply.json").exists())
+
     def test_resumes_confirmed_apply_after_kubeconfig_mismatch_without_replaying(self):
         target, environment, candidate = self.prepare_target("stargazer", "stargazer-sandbox")
         registration, plan = self.approved_plan("just", target, environment, candidate)
@@ -1568,12 +1665,16 @@ esac
             nodes,
             {
                 "items": [
-                    {"metadata": {"name": "stargazer-sandbox-control-plane", "labels": {}}},
+                    {
+                        "metadata": {"name": "stargazer-sandbox-control-plane", "labels": {}},
+                        "status": {"conditions": [{"type": "Ready", "status": "True"}]},
+                    },
                     {
                         "metadata": {
                             "name": "stargazer-sandbox-worker",
                             "labels": {"node-role.kubernetes.io/control-plane": ""},
-                        }
+                        },
+                        "status": {"conditions": [{"type": "Ready", "status": "True"}]},
                     },
                 ]
             },
@@ -1602,25 +1703,62 @@ esac
         self.assertTrue((plan.parent / "verified.json").exists())
         self.assertEqual((self.bin / "tofu.applies").read_text().splitlines(), [str(plan)])
 
-    def test_managed_plan_refuses_wrong_uid_before_apply(self):
+    def test_registered_cluster_refuses_new_saved_plans_and_requires_uid_to_verify(self):
         target, environment, candidate = self.prepare_target("stargazer", "stargazer-sandbox")
         _, create_plan = self.approved_plan("just", target, environment, candidate)
-        result = self.apply("just", target, create_plan)
-        self.assertEqual(result.returncode, 0, result.stderr)
         result = self.plan("native", target, environment)
         self.assertEqual(result.returncode, 0, result.stderr)
-        managed_plan = Path(result.stdout.strip()).with_name("saved.tfplan")
-        self.assertNotEqual(create_plan.read_bytes(), managed_plan.read_bytes())
-        uid_file = self.bin / "kubectl.uid"
-        uid_file.write_text("different-live-uid\n")
-        result = self.apply("native", target, managed_plan)
+        other_plan = Path(result.stdout.strip()).with_name("saved.tfplan")
+        result = self.apply("just", target, create_plan)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        result = self.plan("native", target, environment)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("already has a registered UID", result.stderr)
+        self.assertEqual(
+            set(create_plan.parent.parent.glob("plan.*")), {create_plan.parent, other_plan.parent}
+        )
+
+        result = self.apply("native", target, other_plan)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("already has a registered UID", result.stderr)
+        self.assertFalse((other_plan.parent / "operation-init.log").exists())
+        self.assertFalse((other_plan.parent / "apply-attempted.json").exists())
+        self.assertEqual((self.bin / "tofu.applies").read_text().splitlines(), [str(create_plan)])
+
+        repeat_log = create_plan.parent / "repeat.log"
+        original_repeat_log = repeat_log.read_bytes()
+        (self.bin / "kubectl.uid").write_text("different-live-uid\n")
+        result = self.operation("native", "verify", target, str(create_plan))
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("UID differs", result.stderr)
-        self.assertFalse((managed_plan.parent / "apply-attempted.json").exists())
-        self.assertEqual((self.bin / "tofu.applies").read_text().splitlines(), [str(create_plan)])
-        uid_file.unlink()
-        result = self.apply("just", target, managed_plan)
+        self.assertEqual(repeat_log.read_bytes(), original_repeat_log)
+
+    def test_refuses_an_unready_final_inventory_after_the_repeat_plan(self):
+        target, environment, candidate = self.prepare_target("stargazer", "stargazer-sandbox")
+        _, plan = self.approved_plan("native", target, environment, candidate)
+        late_change = self.bin / "tofu.repeat-lose-readiness"
+        late_change.touch()
+
+        result = self.apply("just", target, plan)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("readiness", result.stderr)
+        self.assertTrue((plan.parent / "applied.json").is_file())
+        self.assertFalse((plan.parent / "verified.json").exists())
+        self.assertTrue((plan.parent.parent / "active-apply.json").is_file())
+        late_change.unlink()
+        (self.bin / "kubectl.worker-unready").unlink()
+
+        result = self.operation("native", "verify", target, str(plan))
+
         self.assertEqual(result.returncode, 0, result.stderr)
+        nodes = json.loads((plan.parent / "nodes.json").read_text())
+        self.assertEqual(
+            {node["name"]: node["ready"] for node in nodes},
+            {"stargazer-sandbox-control-plane": True, "stargazer-sandbox-worker": True},
+        )
+        self.assertEqual((self.bin / "tofu.applies").read_text().splitlines(), [str(plan)])
 
     def test_both_entry_points_save_independently_bound_plans_from_two_owners(self):
         module = self.provider / BASELINE / "main.tf"
