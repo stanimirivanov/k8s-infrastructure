@@ -1,7 +1,9 @@
 """Exercise the optional local kind recipes with disposable fixtures."""
 
 import hashlib
+import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -73,7 +75,13 @@ case "$1" in
       printf 'Error: Saved plan is stale\\n' >&2
       exit 1
     fi
-    printf 'fixture applied state\\n' > "$FIXTURE_STATE/cluster.tfstate"
+    config=$(jq -cn --arg server "$FIXTURE_STATE_CONFIG_SERVER" --arg ca "$FIXTURE_STATE_CONFIG_CA" \
+      '{clusters: [{cluster: {server: $server, "certificate-authority-data": $ca}}]}')
+    jq -cn --arg name "$FIXTURE_CLUSTER" --arg endpoint "$FIXTURE_STATE_ENDPOINT" --arg config "$config" \
+      '{resources: [{mode: "managed", type: "kind_cluster", name: "pilot",
+        provider: "provider[\\"registry.terraform.io/elioseverojunior/kind\\"]",
+        instances: [{attributes: {name: $name, endpoint: $endpoint, kubeconfig: $config}}]}]}' \
+      > "$FIXTURE_STATE/cluster.tfstate"
     printf 'fixture apply complete\\n'
     ;;
   plan)
@@ -100,7 +108,11 @@ case "$1" in
   show)
     [[ $3 == "$plan_dir/saved.tfplan" ]]
     if [[ $2 == -json ]]; then
-      printf '{"variables":{"cluster_name":{"value":"%s"}}}\\n' "$FIXTURE_PLAN_CLUSTER"
+      if [[ -e "$FIXTURE_STATE/kubeconfig" ]]; then actions='["no-op"]'; else actions='["create"]'; fi
+      changes=$(printf '[{"address":"kind_cluster.pilot","mode":"managed","provider_name":"registry.terraform.io/elioseverojunior/kind","change":{"actions":%s,"after":{"name":"%s"}}}]' \
+        "$actions" "$FIXTURE_PLAN_CLUSTER")
+      printf '{"variables":{"cluster_name":{"value":"%s"}},"resource_changes":%s}\\n' \
+        "$FIXTURE_PLAN_CLUSTER" "${FIXTURE_PLAN_RESOURCE_CHANGES:-$changes}"
     else
       printf 'fixture readable plan\\n'
     fi
@@ -124,8 +136,9 @@ exec "$FIXTURE_REAL_TIMEOUT" "$@"
 KUBECTL = """#!/bin/bash
 set -eu
 [[ $1 == --kubeconfig ]]
+config=$2
 case "$2" in
-  "$FIXTURE_STATE/kubeconfig"|"$FIXTURE_STATE/plans/"*/kubeconfig) ;;
+  "$FIXTURE_STATE/kubeconfig"|"$FIXTURE_STATE/plans/"*/kubeconfig|/dev/stdin) ;;
   *) exit 99 ;;
 esac
 [[ $3 == --context && $4 == "kind-$FIXTURE_CLUSTER" ]]
@@ -134,10 +147,17 @@ shift 4
 if [[ $1 == --request-timeout=* ]]; then shift; fi
 case "$1 $2" in
   'config view')
-    printf 'https://127.0.0.1:12345'
+    [[ $3 == --minify ]]
+    if [[ $4 == --raw ]]; then
+      [[ $5 == -o && $6 == 'jsonpath={.clusters[0].cluster.server}{" "}{.clusters[0].cluster.certificate-authority-data}' ]]
+      jq -er '.clusters[0].cluster | .server + " " + .["certificate-authority-data"]' "$config"
+    else
+      jq -er '.clusters[0].cluster.server' "$config"
+    fi
     ;;
   'get namespace')
     [[ $3 == kube-system ]]
+    touch "$FIXTURE_UID_READ"
     printf '%s' "$FIXTURE_LIVE_UID"
     ;;
   'wait --for=condition=Ready')
@@ -181,7 +201,8 @@ KIND = """#!/bin/bash
 set -eu
 [[ $1 == get && $2 == kubeconfig && $3 == --name && $4 == "$FIXTURE_CLUSTER" ]]
 if flock -n "$FIXTURE_STATE/operation.lock" true; then exit 99; fi
-printf 'fixture dedicated kubeconfig\\n'
+jq -cn --arg server "$FIXTURE_DEDICATED_SERVER" --arg ca "$FIXTURE_DEDICATED_CA" \
+  '{fixture: "fixture dedicated kubeconfig", clusters: [{cluster: {server: $server, "certificate-authority-data": $ca}}]}'
 """
 
 
@@ -281,6 +302,7 @@ class KindJustTests(unittest.TestCase):
         self.plan_attempted = self.root / "plan-attempted"
         self.tofu_deadlines = self.root / "tofu-deadlines"
         self.apply_attempts = self.root / "apply-attempts"
+        self.uid_read = self.root / "uid-read"
         real_timeout = shutil.which("timeout", path=os.defpath)
         if real_timeout is None:
             self.fail("timeout is required for the local kind planning fixtures")
@@ -304,6 +326,12 @@ class KindJustTests(unittest.TestCase):
             FIXTURE_RESOURCES="",
             FIXTURE_NAME_MATCH="true",
             FIXTURE_LIVE_UID="fixture-uid",
+            FIXTURE_UID_READ=str(self.uid_read),
+            FIXTURE_STATE_ENDPOINT="https://127.0.0.1:12345",
+            FIXTURE_STATE_CONFIG_SERVER="https://127.0.0.1:12345",
+            FIXTURE_STATE_CONFIG_CA="Zml4dHVyZS1jYQ==",
+            FIXTURE_DEDICATED_SERVER="https://127.0.0.1:12345",
+            FIXTURE_DEDICATED_CA="Zml4dHVyZS1jYQ==",
             FIXTURE_PLAN_ATTEMPTED=str(self.plan_attempted),
             FIXTURE_PLAN_ERROR="no",
             FIXTURE_TOFU_DEADLINES=str(self.tofu_deadlines),
@@ -320,9 +348,12 @@ class KindJustTests(unittest.TestCase):
         return self.command("bash", "--noprofile", "--norc", cwd=self.checkout, input_text=source)
 
     def saved_plan(self, interface: str, profile: str, intent: str):
+        plans = self.state / "plans"
+        previous = set(plans.glob("plan.*/saved.tfplan"))
         result = self.plan(interface, profile, intent)
         self.assertEqual(result.returncode, 0, result.stderr)
-        return next((self.state / "plans").glob("plan.*/saved.tfplan"))
+        (saved,) = set(plans.glob("plan.*/saved.tfplan")) - previous
+        return saved
 
     def apply(self, profile: str, intent: str, saved: Path | str, digest: str):
         return self.command(
@@ -337,9 +368,9 @@ class KindJustTests(unittest.TestCase):
             cwd=self.checkout,
         )
 
-    def register_existing_cluster(self):
+    def register_existing_cluster(self, uid: str = "fixture-uid", daemon: str = "fixture-daemon"):
         (self.state / "identity.json").write_text(
-            '{"daemon":"fixture-daemon","uid":"fixture-uid"}\n', encoding="utf-8"
+            json.dumps({"daemon": daemon, "uid": uid}) + "\n", encoding="utf-8"
         )
         (self.state / "kubeconfig").touch(mode=0o600)
         (self.state / "cluster.tfstate").touch(mode=0o600)
@@ -366,25 +397,17 @@ class KindJustTests(unittest.TestCase):
         self.assertEqual(self.apply_attempts.read_text(), "apply\n")
         self.assert_lock_released()
 
-    def native_block(self, heading: str):
+    def native_block(self, heading: str, index: int = 0):
         runbook = (self.checkout / RUNBOOK).read_text(encoding="utf-8")
-        section = runbook.split(f"{heading}\n", 1)[1]
-        return section.split("~~~sh\n", 1)[1].split("~~~", 1)[0]
+        section = runbook.split(f"{heading}\n", 1)[1].split("\n## ", 1)[0]
+        return re.findall(r"^~~~sh\n(.*?)^~~~$", section, re.MULTILINE | re.DOTALL)[index]
 
     def native_operation(self, *headings: str):
-        session = self.native_block("## Open a locked session").split('if [[ -d "$STATE_DIR"', 1)[0]
-        source = "\n".join(
-            (
-                session,
-                'exec 9>>"$STATE_DIR/operation.lock"',
-                "flock -w 15 9",
-                'KCFG="$STATE_DIR/kubeconfig"',
-                'CTX="kind-$CLUSTER"',
-                'EXPECTED_DAEMON=$(jq -er ".daemon" "$STATE_DIR/identity.json")',
-                'EXPECTED_UID=$(jq -er ".uid" "$STATE_DIR/identity.json")',
-                *(self.native_block(heading) for heading in headings),
-            )
-        )
+        session = "## Open a locked session"
+        source = [self.native_block(session, 1)]
+        if self.env.get("INTENT") != "create":
+            source.append(self.native_block(session, 2))
+        source.extend(self.native_block(heading) for heading in headings)
         return self.command(
             "bash",
             "--noprofile",
@@ -392,12 +415,41 @@ class KindJustTests(unittest.TestCase):
             "-e",
             "-o",
             "pipefail",
+            "-c",
+            self.native_block(session),
             cwd=self.checkout,
-            input_text=source,
+            input_text="\n".join(source),
+        )
+
+    def native_apply(self, intent: str, saved: Path, digest: str, *after_apply: str):
+        self.env.update(
+            INTENT=intent,
+            APPROVED_PLAN=str(saved),
+            APPROVED_SHA256=digest,
+            APPROVED_BY="Fixture Approver",
+            APPROVED_AT="2026-11-28T01:02:03Z",
+        )
+        target = "### Vacant target" if intent == "create" else "### Managed target"
+        return self.native_operation(
+            "### Locate the approved plan",
+            "## Check the plan target",
+            target,
+            "### Run the saved apply",
+            *after_apply,
         )
 
     def verify(self, profile: str, saved: Path):
         return self.command(JUST or "just", "verify", profile, str(saved), cwd=self.checkout)
+
+    def native_verify(self, saved: Path):
+        self.env.update(INTENT="managed", APPROVED_PLAN=str(saved))
+        return self.native_operation(
+            "### Locate the approved plan",
+            "### Resume verification",
+            "## Check the plan target",
+            "### Managed target",
+            "## Verify the apply",
+        )
 
     def test_native_apply_of_a_recipe_plan_can_resume_with_the_recipe(self):
         profile = "pilot-74"
@@ -405,25 +457,49 @@ class KindJustTests(unittest.TestCase):
         self.register_existing_cluster()
         saved = self.saved_plan("just", profile, "managed")
         digest = hashlib.sha256(saved.read_bytes()).hexdigest()
-        self.env.update(
-            INTENT="managed",
-            APPROVED_PLAN=str(saved),
-            APPROVED_SHA256=digest,
-            APPROVED_BY="Fixture Approver",
-            APPROVED_AT="2026-11-28T01:02:03Z",
-        )
-        result = self.native_operation(
-            "### Locate the approved plan",
-            "## Check the plan target",
-            "### Managed target",
-            "### Run the saved apply",
-        )
+        result = self.native_apply("managed", saved, digest)
         self.assertEqual(result.returncode, 0, result.stderr)
         result = self.verify(profile, saved)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("zero changes", result.stdout)
         self.assertEqual(self.apply_attempts.read_text(), "apply\n")
         self.assert_lock_released()
+
+    def test_apply_refuses_resource_actions_outside_the_approved_target_and_intent(self):
+        profile = "pilot-74"
+        self.prepare_checkout(profile)
+        self.register_existing_cluster()
+        saved = self.saved_plan("just", profile, "managed")
+        digest = hashlib.sha256(saved.read_bytes()).hexdigest()
+        cluster_change = {
+            "address": "kind_cluster.pilot",
+            "mode": "managed",
+            "provider_name": "registry.terraform.io/elioseverojunior/kind",
+            "change": {"actions": ["no-op"], "after": {"name": self.env["FIXTURE_CLUSTER"]}},
+        }
+        unrelated_change = {**cluster_change, "address": "kind_cluster.unrelated"}
+        for changes in (
+            [],
+            [cluster_change, unrelated_change],
+            [unrelated_change],
+            [{**cluster_change, "mode": "data"}],
+            [{**cluster_change, "provider_name": "registry.example.invalid/other/kind"}],
+            *(
+                [{**cluster_change, "change": {**cluster_change["change"], "actions": actions}}]
+                for actions in (["delete"], ["delete", "create"], ["create", "delete"], ["create"])
+            ),
+        ):
+            self.env["FIXTURE_PLAN_RESOURCE_CHANGES"] = json.dumps(changes)
+            for interface in ("just", "native"):
+                with self.subTest(changes=changes, interface=interface):
+                    if interface == "just":
+                        result = self.apply(profile, "managed", saved, digest)
+                    else:
+                        result = self.native_apply("managed", saved, digest)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("unexpected resource changes", result.stderr)
+                    self.assertFalse(self.apply_attempts.exists())
+                    self.assert_lock_released()
 
     def test_native_verification_resumes_an_interrupted_recipe_apply(self):
         profile = "pilot-74"
@@ -440,17 +516,134 @@ class KindJustTests(unittest.TestCase):
         self.assertEqual(log.stat().st_mode & 0o777, 0o600)
         self.assert_lock_released()
 
-        self.env.update(FIXTURE_READINESS="ready", APPROVED_PLAN=str(saved))
-        result = self.native_operation(
-            "### Locate the approved plan",
-            "### Resume verification",
-            "## Check the plan target",
-            "### Managed target",
-            "## Verify the apply",
-        )
+        self.env["FIXTURE_READINESS"] = "ready"
+        result = self.native_verify(saved)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("zero changes", result.stdout)
         self.assertEqual(self.apply_attempts.read_text(), "apply\n")
+        self.assert_lock_released()
+
+    def test_native_verification_records_private_evidence_for_readiness_and_placement(self):
+        profile = "pilot-74"
+        self.prepare_checkout(profile)
+        self.register_existing_cluster()
+        saved = self.saved_plan("just", profile, "managed")
+        digest = hashlib.sha256(saved.read_bytes()).hexdigest()
+        result = self.native_apply("managed", saved, digest)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = saved.parent / "verify.log"
+
+        self.env["FIXTURE_READINESS"] = "fixture wait interrupted"
+        result = self.native_verify(saved)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("did not all become Ready", result.stderr)
+        self.assertIn("fixture wait interrupted", log.read_text())
+        self.assertEqual(log.stat().st_mode & 0o777, 0o600)
+        self.assertFalse((saved.parent / "repeat.log").exists())
+
+        self.env.update(FIXTURE_READINESS="ready", FIXTURE_INVENTORY="placement")
+        result = self.native_verify(saved)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Unexpected placement", result.stderr)
+        self.assertIn(
+            f"Selector workload=sut,perfeng.io/node-type=sut returned node/{self.env['FIXTURE_CLUSTER']}-worker",
+            log.read_text(),
+        )
+        self.assertFalse((saved.parent / "repeat.log").exists())
+        self.assert_lock_released()
+
+    def test_verify_refuses_a_coherent_replacement_registration(self):
+        profile = "pilot-74"
+        self.prepare_checkout(profile)
+        self.register_existing_cluster()
+        saved = self.saved_plan("just", profile, "managed")
+        digest = hashlib.sha256(saved.read_bytes()).hexdigest()
+        self.env["FIXTURE_READINESS"] = "one node unready"
+        result = self.apply(profile, "managed", saved, digest)
+        self.assertIn("did not all become Ready", result.stderr)
+        self.env["FIXTURE_READINESS"] = "ready"
+        for uid, daemon in (("replacement-uid", "fixture-daemon"), ("fixture-uid", "other-daemon")):
+            self.register_existing_cluster(uid=uid, daemon=daemon)
+            self.env.update(FIXTURE_LIVE_UID=uid, FIXTURE_DAEMON=daemon)
+            for interface in ("just", "native"):
+                with self.subTest(interface=interface, uid=uid, daemon=daemon):
+                    result = (
+                        self.verify(profile, saved)
+                        if interface == "just"
+                        else self.native_verify(saved)
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("apply receipt differs from the registered target", result.stderr)
+                    self.assertFalse((saved.parent / "repeat.log").exists())
+                    self.assert_lock_released()
+
+    def test_apply_and_verify_refuse_altered_or_extra_staged_inputs(self):
+        profile = "pilot-74"
+        self.prepare_checkout(profile)
+        self.register_existing_cluster()
+        saved = self.saved_plan("native", profile, "managed")
+        digest = hashlib.sha256(saved.read_bytes()).hexdigest()
+        for operation in ("apply", "verify"):
+            if operation == "verify":
+                self.env["FIXTURE_READINESS"] = "one node unready"
+                result = self.apply(profile, "managed", saved, digest)
+                self.assertIn("did not all become Ready", result.stderr)
+                self.env["FIXTURE_READINESS"] = "ready"
+                self.assertFalse((saved.parent / "repeat.log").exists())
+            for filename, message in (
+                ("main.tf", "differs from the reviewed source"),
+                (".terraform.lock.hcl", "differs from the reviewed source"),
+                ("target.auto.tfvars", "differs from the reviewed source"),
+                ("source-revision.txt", "source revision does not match"),
+                ("injected.tf", "Unexpected OpenTofu input"),
+                ("injected.tofu", "Unexpected OpenTofu input"),
+                ("injected.auto.tfvars", "Unexpected OpenTofu input"),
+                ("injected.tf.json", "Unexpected OpenTofu input"),
+                ("injected.tofu.json", "Unexpected OpenTofu input"),
+                ("injected.auto.tfvars.json", "Unexpected OpenTofu input"),
+            ):
+                path = saved.parent / filename
+                original = path.read_bytes() if path.exists() else None
+                path.write_bytes(b"fixture account data must stay private\n")
+                try:
+                    for interface in ("just", "native"):
+                        with self.subTest(
+                            operation=operation, interface=interface, filename=filename
+                        ):
+                            if operation == "apply" and interface == "just":
+                                result = self.apply(profile, "managed", saved, digest)
+                            elif operation == "apply":
+                                result = self.native_apply("managed", saved, digest)
+                            elif interface == "just":
+                                result = self.verify(profile, saved)
+                            else:
+                                result = self.native_verify(saved)
+                            self.assertNotEqual(result.returncode, 0)
+                            self.assertIn(message, result.stderr)
+                            self.assertNotIn("fixture account data", result.stderr + result.stdout)
+                            self.assertFalse((saved.parent / "repeat.log").exists())
+                            self.assert_lock_released()
+                finally:
+                    if original is None:
+                        path.unlink()
+                    else:
+                        path.write_bytes(original)
+            if operation == "apply":
+                self.assertFalse(self.apply_attempts.exists())
+
+    def test_native_legacy_verification_requires_the_original_approved_digest(self):
+        profile = "pilot-74"
+        self.prepare_checkout(profile)
+        self.register_existing_cluster()
+        saved = self.saved_plan("native", profile, "managed")
+        digest = hashlib.sha256(saved.read_bytes()).hexdigest()
+        result = self.native_verify(saved)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("original approved digest", result.stderr)
+        self.env["APPROVED_SHA256"] = digest
+        result = self.native_verify(saved)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("zero changes", result.stdout)
         self.assert_lock_released()
 
     def test_create_records_the_uid_from_the_dedicated_kubeconfig(self):
@@ -472,6 +665,35 @@ class KindJustTests(unittest.TestCase):
         self.assertEqual(self.apply_attempts.read_text(), "apply\n")
         self.assert_lock_released()
 
+    def test_create_refuses_to_read_a_uid_when_the_kubeconfig_differs_from_state(self):
+        profile = "pilot-74"
+        self.prepare_checkout(profile)
+        for interface in ("just", "native"):
+            for variable, wrong in (
+                ("FIXTURE_STATE_ENDPOINT", "https://127.0.0.1:43210"),
+                ("FIXTURE_STATE_CONFIG_SERVER", "https://127.0.0.1:43210"),
+                ("FIXTURE_DEDICATED_CA", "b3RoZXItY2E="),
+            ):
+                with self.subTest(interface=interface, variable=variable):
+                    saved = self.saved_plan("just", profile, "create")
+                    digest = hashlib.sha256(saved.read_bytes()).hexdigest()
+                    previous = self.env[variable]
+                    self.env[variable] = wrong
+                    if interface == "just":
+                        result = self.apply(profile, "create", saved, digest)
+                    else:
+                        result = self.native_apply(
+                            "create", saved, digest, "## Register a new cluster"
+                        )
+                    self.env[variable] = previous
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("saved kubeconfig differs", result.stderr)
+                    self.assertFalse(self.uid_read.exists())
+                    self.assertFalse((self.state / "kubeconfig").exists())
+                    self.assertFalse((self.state / "identity.json").exists())
+                    self.assert_lock_released()
+                    (self.state / "cluster.tfstate").unlink()
+
     def test_incomplete_create_registration_preserves_evidence_for_recovery(self):
         profile = "pilot-74"
         self.prepare_checkout(profile)
@@ -485,9 +707,28 @@ class KindJustTests(unittest.TestCase):
         self.assertTrue((saved.parent / "kubeconfig").exists())
         self.assertFalse((self.state / "identity.json").exists())
         self.assertFalse((saved.parent / "repeat.log").exists())
+        self.assertEqual(
+            (saved.parent / "apply.status").read_text(), f"applied {digest} fixture-daemon\n"
+        )
         result = self.verify(profile, saved)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("kubeconfig or identity record is missing", result.stderr)
+        self.assertIn("no completed apply receipt", result.stderr)
+        self.assertEqual(self.apply_attempts.read_text(), "apply\n")
+        self.assert_lock_released()
+
+        self.env.update(INTENT="create", APPROVED_PLAN=str(saved), FIXTURE_LIVE_UID="fixture-uid")
+        result = self.native_operation(
+            "### Locate the approved plan",
+            "## Check the plan target",
+            "## Register a new cluster",
+            "## Verify the apply",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("zero changes", result.stdout)
+        self.assertEqual(
+            (saved.parent / "apply.status").read_text(),
+            f"complete {digest} fixture-uid fixture-daemon\n",
+        )
         self.assertEqual(self.apply_attempts.read_text(), "apply\n")
         self.assert_lock_released()
 

@@ -167,15 +167,18 @@ _kind OPERATION PROFILE *ARGS:
       fi
     }
 
+    SOURCE=clusters/local-kind/iac-pilot
+    PROFILE_SOURCE="$SOURCE/profiles/$PROFILE"
+    INPUTS=("$SOURCE/main.tf" "$SOURCE/.terraform.lock.hcl" "$PROFILE_SOURCE/target.auto.tfvars")
+    STAGED_INPUTS=(main.tf .terraform.lock.hcl target.auto.tfvars)
+    if [[ "$PROFILE" == retained-434 ]]; then
+      INPUTS+=("$PROFILE_SOURCE/retained-lifecycle.tf")
+      STAGED_INPUTS+=(retained_override.tf)
+    fi
+
     save_plan() {
       check_target_registration
       # Archive only the tracked inputs belonging to this profile.
-      SOURCE=clusters/local-kind/iac-pilot
-      PROFILE_SOURCE="$SOURCE/profiles/$PROFILE"
-      INPUTS=("$SOURCE/main.tf" "$SOURCE/.terraform.lock.hcl" "$PROFILE_SOURCE/target.auto.tfvars")
-      if [[ "$PROFILE" == retained-434 ]]; then
-        INPUTS+=("$PROFILE_SOURCE/retained-lifecycle.tf")
-      fi
       install -d -m 700 "$PLANS"
       PLAN_DIR=$(mktemp -d "$PLANS/plan.XXXXXX")
       git archive --format=tar "$SOURCE_REVISION" -- "${INPUTS[@]}" |
@@ -229,6 +232,32 @@ _kind OPERATION PROFILE *ARGS:
         grep -Fxq -- "- Plan $PLAN" "$REVIEW" ||
         refuse 'The review record differs from the selected profile or plan.'
       export KUBECONFIG="$PLAN_DIR/provider.kubeconfig"
+      check_staged_inputs
+    }
+
+    check_staged_inputs() {
+      local revision index staged path
+      revision=$(cat -- "$PLAN_DIR/source-revision.txt")
+      [[ "$revision" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ &&
+         "$(git rev-parse --verify "$revision^{commit}" 2>/dev/null)" == "$revision" ]] &&
+        grep -Fxq -- "- Source revision $revision" "$REVIEW" ||
+        refuse 'The staged source revision does not match the review or is unavailable.'
+      for index in "${!INPUTS[@]}"; do
+        staged="$PLAN_DIR/${STAGED_INPUTS[index]}"
+        if [[ ! -f "$staged" || -L "$staged" ]] ||
+           ! git archive --format=tar "$revision" -- "${INPUTS[index]}" |
+             tar -xOf - "${INPUTS[index]}" | cmp -s -- "$staged" -; then
+          refuse "Staged input ${STAGED_INPUTS[index]} differs from the reviewed source."
+        fi
+      done
+      for path in "$PLAN_DIR"/{*,.*}.{tf,tofu,tfvars,tf.json,tofu.json,tfvars.json}; do
+        [[ -e "$path" || -L "$path" ]] || continue
+        case "${path##*/}" in
+          main.tf|target.auto.tfvars) continue ;;
+          retained_override.tf) [[ "$PROFILE" == retained-434 ]] && continue ;;
+        esac
+        refuse 'Unexpected OpenTofu input in the saved plan directory.'
+      done
     }
 
     check_digest() {
@@ -241,9 +270,14 @@ _kind OPERATION PROFILE *ARGS:
     }
 
     write_apply_status() {
-      local receipt
+      local status=$1 receipt
+      shift
       receipt=$(mktemp "$PLAN_DIR/apply.status.XXXXXX")
-      printf '%s %s\n' "$1" "$APPROVED_SHA256" > "$receipt"
+      {
+        printf '%s %s' "$status" "$APPROVED_SHA256"
+        if (( $# )); then printf ' %s' "$@"; fi
+        printf '\n'
+      } > "$receipt"
       mv -T -- "$receipt" "$PLAN_DIR/apply.status"
     }
 
@@ -271,8 +305,20 @@ _kind OPERATION PROFILE *ARGS:
       check_target_registration
       check_target_state
       run_tofu 60s show -json "$PLAN" |
-        jq -e --arg cluster "$CLUSTER" '.variables.cluster_name.value == $cluster' >/dev/null ||
-        refuse 'The saved plan names a different cluster.'
+        jq -e --arg cluster "$CLUSTER" --arg intent "$INTENT" '
+          if .variables.cluster_name.value != $cluster then
+            error("The saved plan names a different cluster.")
+          elif (.resource_changes | type == "array" and length == 1) and
+            (.resource_changes[0] |
+              .address == "kind_cluster.pilot" and .mode == "managed" and
+              .provider_name == "registry.terraform.io/elioseverojunior/kind" and
+              .previous_address == null and .deposed == null and .change.importing == null and
+              .change.after.name == $cluster and
+              (if $intent == "create" then .change.actions == ["create"]
+               else .change.actions == ["no-op"] or .change.actions == ["update"] end)) then
+            true
+          else error("The saved plan contains unexpected resource changes.") end
+        ' >/dev/null
       PHASE=apply
       RECOVERY='Inspect apply.log, state and inventory before attempting another operation.'
       printf '\n- Approved SHA-256 %s\n- Approver %s\n- Approval UTC %s\n' \
@@ -282,20 +328,37 @@ _kind OPERATION PROFILE *ARGS:
       run_tofu 300s apply -no-color -input=false -lock-timeout=30s \
         -state="$STATE" -state-out="$STATE" -backup="$BACKUP" "$PLAN" \
         > "$PLAN_DIR/apply.log" 2>&1
-      write_apply_status complete
+      write_apply_status applied "$EXPECTED_DAEMON"
     }
 
     register_cluster() {
       PHASE=registration
       RECOVERY='Review the partial registration before resuming verification.'
       check_daemon
-      local config="$PLAN_DIR/kubeconfig" identity="$PLAN_DIR/identity.json" api_server
+      local config="$PLAN_DIR/kubeconfig" identity="$PLAN_DIR/identity.json"
+      local fields='jsonpath={.clusters[0].cluster.server}{" "}{.clusters[0].cluster.certificate-authority-data}'
+      local dedicated state_config endpoint api_server ca
+      local mismatch='The saved kubeconfig differs from the dedicated kind kubeconfig.'
       [[ ! -e "$config" && ! -L "$config" && ! -e "$identity" && ! -L "$identity" ]] ||
         refuse 'The saved plan already has staged registration files.'
       timeout --kill-after=5s 30s kind get kubeconfig --name "$CLUSTER" > "$config"
-      api_server=$(run_kubectl 15s "$config" config view --minify -o 'jsonpath={.clusters[0].cluster.server}')
-      [[ "$api_server" =~ ^https://127\.0\.0\.1:[0-9]+$ ]] ||
-        refuse 'The new kubeconfig does not point to the loopback API.'
+      if ! dedicated=$(run_kubectl 15s "$config" config view --minify --raw -o "$fields" 2>/dev/null) ||
+         ! state_config=$(jq -er --arg cluster "$CLUSTER" '
+            select(.resources | type == "array" and length == 1) | .resources[0] |
+            select(.mode == "managed" and .type == "kind_cluster" and .name == "pilot" and .module == null and
+              .provider == "provider[\"registry.terraform.io/elioseverojunior/kind\"]" and
+              (.instances | type == "array" and length == 1)) | .instances[0] |
+            select(.index_key == null and .deposed == null and .attributes.name == $cluster) |
+            .attributes.kubeconfig | strings | select(length > 0)
+          ' "$STATE" 2>/dev/null |
+          run_kubectl 15s /dev/stdin config view --minify --raw -o "$fields" 2>/dev/null) ||
+         ! endpoint=$(jq -er '.resources[0].instances[0].attributes.endpoint | strings' "$STATE" 2>/dev/null); then
+        refuse "$mismatch"
+      fi
+      read -r api_server ca <<< "$dedicated"
+      [[ "$api_server" =~ ^https://127\.0\.0\.1:[0-9]+$ && -n "$ca" &&
+         "$dedicated" == "$state_config" && "$api_server" == "$endpoint" ]] ||
+        refuse "$mismatch"
       EXPECTED_UID=$(run_kubectl 15s "$config" --request-timeout=10s \
         get namespace kube-system -o 'jsonpath={.metadata.uid}')
       [[ -n "$EXPECTED_UID" ]] || refuse 'The new kube-system namespace has no UID.'
@@ -323,7 +386,7 @@ _kind OPERATION PROFILE *ARGS:
           refuse 'A verification evidence path is redirected or invalid.'
       done
       printf '\nChecking cluster identity and nodes\n' >> "$VERIFY_LOG"
-      check_target_state
+      check_uid
       run_kubectl 100s "$KCFG" --request-timeout=90s wait --for=condition=Ready --timeout=90s \
         "node/$CLUSTER-control-plane" "node/$CLUSTER-worker" "node/$CLUSTER-worker2" >> "$VERIFY_LOG" 2>&1 ||
         refuse 'The required nodes did not all become Ready. See verify.log.'
@@ -336,6 +399,7 @@ _kind OPERATION PROFILE *ARGS:
       check_placement workload=sut,perfeng.io/node-type=sut worker2
       run_kubectl 15s "$KCFG" --request-timeout=10s get nodes -L workload,perfeng.io/node-type \
         > "$PLAN_DIR/nodes.txt" 2>> "$VERIFY_LOG"
+      check_staged_inputs
       if run_tofu 180s plan -no-color -input=false -lock-timeout=30s -state="$STATE" -detailed-exitcode \
         >> "$PLAN_DIR/repeat.log" 2>&1; then
         check_daemon
@@ -353,9 +417,14 @@ _kind OPERATION PROFILE *ARGS:
       [[ -f "$receipt" && ! -L "$receipt" ]] ||
         refuse 'The saved plan has no completed apply receipt. Use the runbook recovery steps.'
       status=$(cat -- "$receipt")
-      [[ "$status" =~ ^complete\ ([0-9a-f]{64})$ ]] ||
+      [[ "$status" =~ ^complete\ ([0-9a-f]{64})\ ([^[:space:]]+)\ ([^[:space:]]+)$ ]] ||
         refuse 'The saved plan has no completed apply receipt. Use the runbook recovery steps.'
-      check_digest "${BASH_REMATCH[1]}"
+      local digest=${BASH_REMATCH[1]} uid=${BASH_REMATCH[2]} daemon=${BASH_REMATCH[3]}
+      check_digest "$digest"
+      check_target_registration
+      [[ "$uid" == "$EXPECTED_UID" && "$daemon" == "$EXPECTED_DAEMON" ]] ||
+        refuse 'The apply receipt differs from the registered target.'
+      check_target_state
     }
 
     if [[ "$OPERATION" == plan ]]; then
@@ -371,13 +440,17 @@ _kind OPERATION PROFILE *ARGS:
     trap 'exit 143' TERM
     if [[ "$OPERATION" == apply ]]; then
       apply_plan
+      PHASE=registration
+      RECOVERY='Review the registration before resuming verification.'
       if [[ "$INTENT" == create ]]; then
         register_cluster
       fi
+      check_daemon
+      check_target_state
+      write_apply_status complete "$EXPECTED_UID" "$EXPECTED_DAEMON"
     else
       PHASE=verification
       RECOVERY='Confirm that the original apply and registration completed.'
       check_completed_apply
-      check_target_registration
     fi
     verify_plan

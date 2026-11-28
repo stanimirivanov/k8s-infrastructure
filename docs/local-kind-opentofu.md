@@ -364,7 +364,10 @@ host registration.
 
 ### Locate the approved plan
 
-Set `APPROVED_PLAN` to the approved absolute path.
+Set `APPROVED_PLAN` to the approved absolute path. Use a checkout that
+contains the reviewed Git commit. Both interfaces compare the staged
+module, lock file and profile inputs byte for byte with that commit and
+refuse additional OpenTofu inputs before apply or verification.
 
 ~~~sh
 {
@@ -383,6 +386,60 @@ Set `APPROVED_PLAN` to the approved absolute path.
   [[ ! -L "$PLAN_DIR/provider.kubeconfig" && ! -L "$PLAN_DIR/.terraform" ]]
   grep -Fxq -- "- Profile $PROFILE" "$REVIEW"
   grep -Fxq -- "- Plan $APPROVED_PLAN" "$REVIEW"
+
+  check_staged_inputs() {
+    local revision index staged path source=clusters/local-kind/iac-pilot
+    local profile_source="$source/profiles/$PROFILE"
+    local inputs=("$source/main.tf" "$source/.terraform.lock.hcl" "$profile_source/target.auto.tfvars")
+    local staged_inputs=(main.tf .terraform.lock.hcl target.auto.tfvars)
+    if [[ "$PROFILE" == retained-434 ]]; then
+      inputs+=("$profile_source/retained-lifecycle.tf")
+      staged_inputs+=(retained_override.tf)
+    fi
+    revision=$(cat -- "$PLAN_DIR/source-revision.txt")
+    [[ "$revision" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ &&
+       "$(git rev-parse --verify "$revision^{commit}" 2>/dev/null)" == "$revision" ]] &&
+      grep -Fxq -- "- Source revision $revision" "$REVIEW" ||
+      { printf '%s\n' 'The staged source revision does not match the review or is unavailable.' >&2; exit 1; }
+    for index in "${!inputs[@]}"; do
+      staged="$PLAN_DIR/${staged_inputs[index]}"
+      if [[ ! -f "$staged" || -L "$staged" ]] ||
+         ! git archive --format=tar "$revision" -- "${inputs[index]}" |
+           tar -xOf - "${inputs[index]}" | cmp -s -- "$staged" -; then
+        printf 'Staged input %s differs from the reviewed source.\n' "${staged_inputs[index]}" >&2
+        exit 1
+      fi
+    done
+    for path in "$PLAN_DIR"/{*,.*}.{tf,tofu,tfvars,tf.json,tofu.json,tfvars.json}; do
+      [[ -e "$path" || -L "$path" ]] || continue
+      case "${path##*/}" in
+        main.tf|target.auto.tfvars) continue ;;
+        retained_override.tf) [[ "$PROFILE" == retained-434 ]] && continue ;;
+      esac
+      printf '%s\n' 'Unexpected OpenTofu input in the saved plan directory.' >&2
+      exit 1
+    done
+  }
+  check_staged_inputs
+
+  verify_approved_digest() {
+    local digest
+    digest=$(sha256sum < "$APPROVED_PLAN")
+    [[ "${digest%% *}" == "${APPROVED_SHA256:?Load the original approved digest}" ]] &&
+      grep -Fxq -- "- SHA-256 $APPROVED_SHA256" "$REVIEW" ||
+      { printf '%s\n' 'The saved plan or review differs from the approved SHA-256.' >&2; exit 1; }
+  }
+  record_apply_status() {
+    local status=$1 receipt
+    shift
+    receipt=$(mktemp "$PLAN_DIR/apply.status.XXXXXX")
+    {
+      printf '%s %s' "$status" "$APPROVED_SHA256"
+      if (( $# )); then printf ' %s' "$@"; fi
+      printf '\n'
+    } > "$receipt"
+    mv -T -- "$receipt" "$PLAN_DIR/apply.status"
+  }
 }
 ~~~
 
@@ -390,8 +447,10 @@ Set `APPROVED_PLAN` to the approved absolute path.
 
 First run the [daemon check](#check-the-plan-target) and the
 [vacant](#vacant-target) or [managed](#managed-target) checks in this shell.
-The apply checks the staged plan's cluster name, verifies the SHA-256 again
-just before executing the plan, and uses the registered local state paths.
+Apply checks the saved plan's cluster name and permits only the pinned
+provider's `kind_cluster.pilot`. A vacant target requires a create. A managed
+target permits an update or no changes. Apply checks the SHA-256 again just
+before executing the plan and uses the registered local state paths.
 OpenTofu can wait up to 30 seconds for its backend lock and refuses stale
 plans. The overall apply has a five-minute deadline with five seconds for
 termination. The kind provider allows 180 seconds for cluster readiness.
@@ -408,20 +467,20 @@ termination. The kind provider allows 180 seconds for cluster readiness.
     { printf '%s\n' 'An apply was already attempted for this plan. Use the runbook recovery steps.' >&2; exit 1; }
   KUBECONFIG="$PLAN_DIR/provider.kubeconfig" timeout --verbose --kill-after=5s 60s \
     tofu -chdir="$PLAN_DIR" show -json "$APPROVED_PLAN" |
-    jq -e --arg cluster "$CLUSTER" '.variables.cluster_name.value == $cluster' >/dev/null
-  verify_approved_digest() {
-    local digest
-    digest=$(sha256sum < "$APPROVED_PLAN")
-    [[ "${digest%% *}" == "${APPROVED_SHA256:?Set the approved digest}" ]] &&
-      grep -Fxq -- "- SHA-256 $APPROVED_SHA256" "$REVIEW" ||
-      { printf '%s\n' 'The saved plan or review differs from the approved SHA-256.' >&2; exit 1; }
-  }
-  record_apply_status() {
-    local receipt
-    receipt=$(mktemp "$PLAN_DIR/apply.status.XXXXXX")
-    printf '%s %s\n' "$1" "$APPROVED_SHA256" > "$receipt"
-    mv -T -- "$receipt" "$PLAN_DIR/apply.status"
-  }
+    jq -e --arg cluster "$CLUSTER" --arg intent "$INTENT" '
+      if .variables.cluster_name.value != $cluster then
+        error("The saved plan names a different cluster.")
+      elif (.resource_changes | type == "array" and length == 1) and
+        (.resource_changes[0] |
+          .address == "kind_cluster.pilot" and .mode == "managed" and
+          .provider_name == "registry.terraform.io/elioseverojunior/kind" and
+          .previous_address == null and .deposed == null and .change.importing == null and
+          .change.after.name == $cluster and
+          (if $intent == "create" then .change.actions == ["create"]
+           else .change.actions == ["no-op"] or .change.actions == ["update"] end)) then
+        true
+      else error("The saved plan contains unexpected resource changes.") end
+    ' >/dev/null
   verify_approved_digest
   printf '\n- Approved SHA-256 %s\n- Approver %s\n- Approval UTC %s\n' \
     "$APPROVED_SHA256" "$APPROVED_BY" "$APPROVED_AT" >> "$REVIEW"
@@ -431,18 +490,25 @@ termination. The kind provider allows 180 seconds for cluster readiness.
     tofu -chdir="$PLAN_DIR" apply -no-color -input=false -lock-timeout=30s \
     -state="$STATE_DIR/cluster.tfstate" -state-out="$STATE_DIR/cluster.tfstate" \
     -backup="$STATE_DIR/cluster.tfstate.backup" "$APPROVED_PLAN" > "$PLAN_DIR/apply.log" 2>&1; then
-    record_apply_status complete
+    record_apply_status applied "$EXPECTED_DAEMON"
   else
     rc=$?
     printf 'Apply exited %s. Inspect the private log at %s.\n' "$rc" "$PLAN_DIR/apply.log" >&2
     exit "$rc"
   fi
+  if [[ "$INTENT" == managed ]]; then
+    check_plan_daemon
+    check_managed_target
+    record_apply_status complete "$EXPECTED_UID" "$EXPECTED_DAEMON"
+  fi
 }
 ~~~
 
-The native apply records successful execution in `apply.status`. After a
-create, [register the new cluster](#register-a-new-cluster). For an existing
-registration, go directly to [verify the apply](#verify-the-apply).
+The apply records `applied` in `apply.status` when OpenTofu succeeds. It
+records `complete` with the plan SHA-256, UID and daemon ID after validating
+the registration. After a create, [register the new cluster](#register-a-new-cluster)
+to complete the receipt. For an existing registration, go directly to
+[verify the apply](#verify-the-apply).
 
 ## Check the plan target
 
@@ -451,9 +517,13 @@ verify the registered Docker daemon ID.
 
 ~~~sh
 {
-  DAEMON=$(timeout --kill-after=5s 15s docker --host "$DOCKER_HOST" info --format '{{.ID}}')
-  test "$DAEMON" = "${EXPECTED_DAEMON:?Set the registered Docker daemon ID}" ||
-    { printf '%s\n' 'Docker daemon ID differs from the registration.' >&2; exit 1; }
+  check_plan_daemon() {
+    local daemon
+    daemon=$(timeout --kill-after=5s 15s docker --host "$DOCKER_HOST" info --format '{{.ID}}')
+    test "$daemon" = "${EXPECTED_DAEMON:?Set the registered Docker daemon ID}" ||
+      { printf '%s\n' 'Docker daemon ID differs from the registration.' >&2; exit 1; }
+  }
+  check_plan_daemon
 }
 ~~~
 
@@ -490,40 +560,94 @@ kind_cluster.pilot` for inspection.
 
 ~~~sh
 {
-  STATE_RESOURCES=$(timeout --verbose --kill-after=5s 60s tofu -chdir="$PLAN_DIR" state list -state="$STATE_DIR/cluster.tfstate")
-  test "$STATE_RESOURCES" = kind_cluster.pilot
-  STATE_NAME_MATCH=$(timeout --verbose --kill-after=5s 60s tofu -chdir="$PLAN_DIR" console -no-color -state="$STATE_DIR/cluster.tfstate" \
-    <<< "kind_cluster.pilot.name == var.cluster_name && var.cluster_name == \"$CLUSTER\"")
-  test "$STATE_NAME_MATCH" = true
-  kubectl --kubeconfig "$KCFG" --context "$CTX" --request-timeout=10s \
-    wait --for="jsonpath={.metadata.uid}=${EXPECTED_UID:?Load the registered kube-system UID}" --timeout=1s namespace/kube-system
+  check_managed_target() {
+    local resources name_match
+    resources=$(timeout --verbose --kill-after=5s 60s tofu -chdir="$PLAN_DIR" state list -state="$STATE_DIR/cluster.tfstate")
+    test "$resources" = kind_cluster.pilot
+    name_match=$(timeout --verbose --kill-after=5s 60s tofu -chdir="$PLAN_DIR" console -no-color -state="$STATE_DIR/cluster.tfstate" \
+      <<< "kind_cluster.pilot.name == var.cluster_name && var.cluster_name == \"$CLUSTER\"")
+    test "$name_match" = true
+    kubectl --kubeconfig "$KCFG" --context "$CTX" --request-timeout=10s \
+      wait --for="jsonpath={.metadata.uid}=${EXPECTED_UID:?Load the registered kube-system UID}" --timeout=1s namespace/kube-system
+  }
+  check_managed_target
 }
 ~~~
 
 ## Register a new cluster
 
-Continue in the locked shell after a successful create. The kubeconfig must
-point to the loopback API. Save the observed UID and Docker daemon ID in the
-private registration.
+Continue in the locked shell after a successful create. Before reading the
+UID, compare the dedicated kubeconfig's loopback API endpoint and TLS CA
+with the kubeconfig stored by the provider. The state endpoint must also
+match. Save the verified target's UID and Docker daemon ID in the private
+registration.
 
 ~~~sh
 {
-  DAEMON=$(timeout --kill-after=5s 15s docker --host "$DOCKER_HOST" info --format '{{.ID}}')
-  test "$DAEMON" = "${EXPECTED_DAEMON:?Set the registered Docker daemon ID}"
-  [[ ! -e "$PLAN_DIR/kubeconfig" && ! -L "$PLAN_DIR/kubeconfig" &&
-     ! -e "$PLAN_DIR/identity.json" && ! -L "$PLAN_DIR/identity.json" ]]
-  timeout --kill-after=5s 30s kind get kubeconfig --name "$CLUSTER" > "$PLAN_DIR/kubeconfig"
-  API_SERVER=$(kubectl --kubeconfig "$PLAN_DIR/kubeconfig" --context "$CTX" config view --minify \
-    -o 'jsonpath={.clusters[0].cluster.server}')
-  [[ "$API_SERVER" =~ ^https://127\.0\.0\.1:[0-9]+$ ]]
+  check_plan_daemon
+  RECEIPT="$PLAN_DIR/apply.status"
+  [[ -f "$RECEIPT" && ! -L "$RECEIPT" ]]
+  STATUS=$(cat -- "$RECEIPT")
+  [[ "$STATUS" =~ ^applied\ ([0-9a-f]{64})\ ([^[:space:]]+)$ && "${BASH_REMATCH[2]}" == "$EXPECTED_DAEMON" ]] ||
+    { printf '%s\n' 'The plan has no successful apply receipt for this daemon. Review the recovery steps.' >&2; exit 1; }
+  APPROVED_SHA256=${BASH_REMATCH[1]}
+  verify_approved_digest
+  grep -Fxq -- '- Intent create' "$REVIEW"
+  for file in "$PLAN_DIR/kubeconfig" "$PLAN_DIR/identity.json"; do
+    [[ ! -L "$file" && ( ! -e "$file" || -f "$file" ) ]]
+  done
+  if [[ ! -e "$PLAN_DIR/kubeconfig" ]]; then
+    [[ ! -e "$PLAN_DIR/identity.json" && ! -e "$KCFG" && ! -L "$KCFG" &&
+       ! -e "$STATE_DIR/identity.json" && ! -L "$STATE_DIR/identity.json" ]]
+    timeout --kill-after=5s 30s kind get kubeconfig --name "$CLUSTER" > "$PLAN_DIR/kubeconfig"
+  fi
+  FIELDS='jsonpath={.clusters[0].cluster.server}{" "}{.clusters[0].cluster.certificate-authority-data}'
+  if ! DEDICATED=$(timeout --kill-after=5s 15s kubectl --kubeconfig "$PLAN_DIR/kubeconfig" --context "$CTX" \
+       config view --minify --raw -o "$FIELDS" 2>/dev/null) ||
+     ! STATE_CONFIG=$(jq -er --arg cluster "$CLUSTER" '
+        select(.resources | type == "array" and length == 1) | .resources[0] |
+        select(.mode == "managed" and .type == "kind_cluster" and .name == "pilot" and .module == null and
+          .provider == "provider[\"registry.terraform.io/elioseverojunior/kind\"]" and
+          (.instances | type == "array" and length == 1)) | .instances[0] |
+        select(.index_key == null and .deposed == null and .attributes.name == $cluster) |
+        .attributes.kubeconfig | strings | select(length > 0)
+      ' "$STATE_DIR/cluster.tfstate" 2>/dev/null |
+      timeout --kill-after=5s 15s kubectl --kubeconfig /dev/stdin --context "$CTX" \
+        config view --minify --raw -o "$FIELDS" 2>/dev/null) ||
+     ! ENDPOINT=$(jq -er '.resources[0].instances[0].attributes.endpoint | strings' "$STATE_DIR/cluster.tfstate" 2>/dev/null); then
+    printf '%s\n' 'The saved kubeconfig differs from the dedicated kind kubeconfig.' >&2
+    exit 1
+  fi
+  read -r API_SERVER CA <<< "$DEDICATED"
+  [[ "$API_SERVER" =~ ^https://127\.0\.0\.1:[0-9]+$ && -n "$CA" &&
+     "$DEDICATED" == "$STATE_CONFIG" && "$API_SERVER" == "$ENDPOINT" ]] ||
+    { printf '%s\n' 'The saved kubeconfig differs from the dedicated kind kubeconfig.' >&2; exit 1; }
   NEW_UID=$(kubectl --kubeconfig "$PLAN_DIR/kubeconfig" --context "$CTX" --request-timeout=10s \
     get namespace kube-system -o 'jsonpath={.metadata.uid}')
   test -n "$NEW_UID"
-  jq -n --arg daemon "${EXPECTED_DAEMON:?Set the registered Docker daemon ID}" --arg uid "$NEW_UID" \
-    '{daemon: $daemon, uid: $uid}' > "$PLAN_DIR/identity.json"
-  [[ ! -e "$KCFG" && ! -L "$KCFG" && ! -e "$STATE_DIR/identity.json" && ! -L "$STATE_DIR/identity.json" ]]
-  install -m 600 "$PLAN_DIR/kubeconfig" "$PLAN_DIR/identity.json" "$STATE_DIR/"
+  if [[ -f "$PLAN_DIR/identity.json" ]]; then
+    jq -e --arg daemon "$EXPECTED_DAEMON" --arg uid "$NEW_UID" \
+      '.daemon == $daemon and .uid == $uid' "$PLAN_DIR/identity.json" >/dev/null
+  else
+    [[ ! -e "$KCFG" && ! -L "$KCFG" && ! -e "$STATE_DIR/identity.json" && ! -L "$STATE_DIR/identity.json" ]]
+    jq -n --arg daemon "$EXPECTED_DAEMON" --arg uid "$NEW_UID" \
+      '{daemon: $daemon, uid: $uid}' > "$PLAN_DIR/identity.json"
+  fi
+  MISSING=()
+  for file in kubeconfig identity.json; do
+    if [[ -e "$STATE_DIR/$file" || -L "$STATE_DIR/$file" ]]; then
+      [[ -f "$STATE_DIR/$file" && ! -L "$STATE_DIR/$file" ]] &&
+        cmp -s -- "$PLAN_DIR/$file" "$STATE_DIR/$file" ||
+        { printf '%s\n' 'The installed registration differs from the staged evidence.' >&2; exit 1; }
+    else
+      MISSING+=("$PLAN_DIR/$file")
+    fi
+  done
+  if (( ${#MISSING[@]} )); then install -m 600 -- "${MISSING[@]}" "$STATE_DIR/"; fi
   EXPECTED_UID="$NEW_UID"
+  kubectl --kubeconfig "$KCFG" --context "$CTX" --request-timeout=10s \
+    wait --for="jsonpath={.metadata.uid}=$EXPECTED_UID" --timeout=1s namespace/kube-system
+  record_apply_status complete "$EXPECTED_UID" "$EXPECTED_DAEMON"
 }
 ~~~
 
@@ -534,38 +658,49 @@ An incomplete registration goes to [recovery](#recover-an-interrupted-operation)
 Use the locked shell from apply or [resume verification](#resume-verification)
 in a new shell. The live UID must match. The exact three named
 nodes must be Ready and have the expected placement labels. Keep the native
-node inventory and require exit zero from the repeat plan.
+node inventory and require exit zero from the repeat plan. Both interfaces
+record readiness, inventory and placement diagnostics in private `verify.log`.
 
 ~~~sh
 {
-  kubectl --kubeconfig "$KCFG" --context "$CTX" --request-timeout=10s \
-    wait --for="jsonpath={.metadata.uid}=${EXPECTED_UID:?Load the registered kube-system UID}" --timeout=1s namespace/kube-system
-  kubectl --kubeconfig "$KCFG" --context "$CTX" --request-timeout=90s wait --for=condition=Ready --timeout=90s \
-    "node/$CLUSTER-control-plane" "node/$CLUSTER-worker" "node/$CLUSTER-worker2"
-  NODES=$(kubectl --kubeconfig "$KCFG" --context "$CTX" --request-timeout=10s get nodes -o name | LC_ALL=C sort)
-  test "$NODES" = "$(printf 'node/%s\n' "$CLUSTER-control-plane" "$CLUSTER-worker" "$CLUSTER-worker2")"
-  CONTROL_PLANE=$(kubectl --kubeconfig "$KCFG" --context "$CTX" --request-timeout=10s \
-    get nodes -l workload=control-plane,node-role.kubernetes.io/control-plane -o name)
-  test "$CONTROL_PLANE" = "node/$CLUSTER-control-plane"
-  GENERATOR=$(kubectl --kubeconfig "$KCFG" --context "$CTX" --request-timeout=10s \
-    get nodes -l workload=performance-generator,perfeng.io/node-type=generator -o name)
-  test "$GENERATOR" = "node/$CLUSTER-worker"
-  SUT=$(kubectl --kubeconfig "$KCFG" --context "$CTX" --request-timeout=10s \
-    get nodes -l workload=sut,perfeng.io/node-type=sut -o name)
-  test "$SUT" = "node/$CLUSTER-worker2"
-  for evidence in "$PLAN_DIR/nodes.txt" "$PLAN_DIR/repeat.log"; do
-    [[ ! -L "$evidence" && ( ! -e "$evidence" || -f "$evidence" ) ]]
+  VERIFY_LOG="$PLAN_DIR/verify.log"
+  for evidence in "$VERIFY_LOG" "$PLAN_DIR/nodes.txt" "$PLAN_DIR/repeat.log"; do
+    [[ ! -L "$evidence" && ( ! -e "$evidence" || -f "$evidence" ) ]] ||
+      { printf '%s\n' 'A verification evidence path is redirected or invalid.' >&2; exit 1; }
   done
+  printf '\nChecking cluster identity and nodes\n' >> "$VERIFY_LOG"
   kubectl --kubeconfig "$KCFG" --context "$CTX" --request-timeout=10s \
-    get nodes -L workload,perfeng.io/node-type | tee "$PLAN_DIR/nodes.txt"
+    wait --for="jsonpath={.metadata.uid}=${EXPECTED_UID:?Load the registered kube-system UID}" \
+    --timeout=1s namespace/kube-system >> "$VERIFY_LOG" 2>&1
+  kubectl --kubeconfig "$KCFG" --context "$CTX" --request-timeout=90s wait --for=condition=Ready --timeout=90s \
+    "node/$CLUSTER-control-plane" "node/$CLUSTER-worker" "node/$CLUSTER-worker2" >> "$VERIFY_LOG" 2>&1 ||
+    { printf '%s\n' 'The required nodes did not all become Ready. See verify.log.' >&2; exit 1; }
+  NODES=$(kubectl --kubeconfig "$KCFG" --context "$CTX" --request-timeout=10s \
+    get nodes -o name 2>> "$VERIFY_LOG" | LC_ALL=C sort)
+  printf 'Observed nodes:\n%s\n' "$NODES" >> "$VERIFY_LOG"
+  test "$NODES" = "$(printf 'node/%s\n' "$CLUSTER-control-plane" "$CLUSTER-worker" "$CLUSTER-worker2")" ||
+    { printf '%s\n' 'Unexpected node inventory. See verify.log.' >&2; exit 1; }
+  check_node_placement() {
+    local selected
+    selected=$(kubectl --kubeconfig "$KCFG" --context "$CTX" --request-timeout=10s \
+      get nodes -l "$1" -o name 2>> "$VERIFY_LOG")
+    printf 'Selector %s returned %s\n' "$1" "$selected" >> "$VERIFY_LOG"
+    test "$selected" = "node/$CLUSTER-$2" ||
+      { printf 'Unexpected placement for node/%s-%s. See verify.log.\n' "$CLUSTER" "$2" >&2; exit 1; }
+  }
+  check_node_placement workload=control-plane,node-role.kubernetes.io/control-plane control-plane
+  check_node_placement workload=performance-generator,perfeng.io/node-type=generator worker
+  check_node_placement workload=sut,perfeng.io/node-type=sut worker2
+  kubectl --kubeconfig "$KCFG" --context "$CTX" --request-timeout=10s \
+    get nodes -L workload,perfeng.io/node-type 2>> "$VERIFY_LOG" | tee "$PLAN_DIR/nodes.txt"
+  check_staged_inputs
   if KUBECONFIG="$PLAN_DIR/provider.kubeconfig" timeout --verbose --kill-after=5s 180s \
     tofu -chdir="$PLAN_DIR" plan -no-color -input=false -lock-timeout=30s \
     -state="$STATE_DIR/cluster.tfstate" -detailed-exitcode 2>&1 | tee -a "$PLAN_DIR/repeat.log"; then
-    DAEMON=$(timeout --kill-after=5s 15s docker --host "$DOCKER_HOST" info --format '{{.ID}}')
-    test "$DAEMON" = "${EXPECTED_DAEMON:?Load the registered Docker daemon ID}"
+    check_plan_daemon
     kubectl --kubeconfig "$KCFG" --context "$CTX" --request-timeout=10s \
-      wait --for="jsonpath={.metadata.uid}=$EXPECTED_UID" --timeout=1s namespace/kube-system
-    echo 'Repeat plan reports zero changes.'
+      wait --for="jsonpath={.metadata.uid}=$EXPECTED_UID" --timeout=1s namespace/kube-system >> "$VERIFY_LOG" 2>&1
+    printf '%s\n' 'Repeat plan reports zero changes.' | tee -a "$VERIFY_LOG"
   else
     rc=$?
     printf 'Repeat plan exited %s (2 means changes, 1 means error).\n' "$rc" >&2
@@ -588,7 +723,8 @@ registered target and original staged inputs.
 For native verification, open a new locked session and load the
 registration. [Locate the original approved plan](#locate-the-approved-plan)
 to restore `PLAN_DIR`. Both apply interfaces record a shared
-`apply.status` receipt with the original SHA-256. For older manual applies,
+`apply.status` receipt with the original SHA-256, kube-system UID and Docker
+daemon ID. For older manual applies without a receipt,
 confirm completion in the private evidence and set `APPROVED_SHA256` from
 the original approval record. Use [recovery](#recover-an-interrupted-operation)
 if the status of apply or registration is unclear.
@@ -599,13 +735,13 @@ if the status of apply or registration is unclear.
   if [[ -e "$RECEIPT" || -L "$RECEIPT" ]]; then
     [[ -f "$RECEIPT" && ! -L "$RECEIPT" ]]
     STATUS=$(cat -- "$RECEIPT")
-    [[ "$STATUS" =~ ^complete\ ([0-9a-f]{64})$ ]] ||
+    [[ "$STATUS" =~ ^complete\ ([0-9a-f]{64})\ ([^[:space:]]+)\ ([^[:space:]]+)$ ]] ||
       { printf '%s\n' 'The saved plan has no completed apply receipt. Review the recovery steps.' >&2; exit 1; }
     APPROVED_SHA256=${BASH_REMATCH[1]}
+    [[ "${BASH_REMATCH[2]}" == "$EXPECTED_UID" && "${BASH_REMATCH[3]}" == "$EXPECTED_DAEMON" ]] ||
+      { printf '%s\n' 'The apply receipt differs from the registered target.' >&2; exit 1; }
   fi
-  DIGEST=$(sha256sum < "$APPROVED_PLAN")
-  [[ "${DIGEST%% *}" == "${APPROVED_SHA256:?Load the original approved digest}" ]]
-  grep -Fxq -- "- SHA-256 $APPROVED_SHA256" "$REVIEW"
+  verify_approved_digest
 }
 ~~~
 
@@ -686,17 +822,20 @@ UID when the API is reachable. Keep the plan and partial logs.
 - If `apply.status` records `started`, inspect the private `apply.log`, state
   and inventory before considering a new plan. An attempted plan requires
   recovery review. A fresh plan needs its own approval.
+- If `apply.status` records `applied`, OpenTofu succeeded and the completion
+  receipt is pending. To recover a create, open a locked session, locate
+  the approved plan and check the registered daemon from the Operations
+  host registration. Run the [registration procedure](#register-a-new-cluster)
+  for that plan. It checks any staged UID against the live cluster and
+  finishes installing the matching registration before recording completion.
+  If writing the staged kubeconfig stopped before writing an identity or
+  installing either file, move the incomplete kubeconfig to a private
+  recovery subdirectory inside the plan directory before retrying.
+  If a managed apply could not validate its registration, inspect the
+  registration and original apply evidence before taking further action.
 - If `apply.status` records `complete` and registration is present, resume
   verification of the same plan. Inspect `verify.log`, `nodes.txt` and
   `repeat.log` for any incomplete checks.
-- If the state entry or containers exist and either registration file is
-  missing, preserve the plan directory and any staged kubeconfig and UID
-  file. If both registration files are absent from the target directory,
-  confirm the state and daemon first. Keep any staged files in a private
-  subdirectory of the plan directory, then use the
-  [registration procedure](#register-a-new-cluster) for the same plan.
-  If one registration file is already installed, review it against the
-  staged evidence and the live UID before completing the pair.
 - If bootstrap lacks `RESULT.md`, check the terminal error and any apply,
   rollout and diff logs. An identity or ownership refusal appears before
   any apply log. Repeat bootstrap only after confirming the live UID and
