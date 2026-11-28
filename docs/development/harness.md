@@ -28,6 +28,7 @@ operations and real kubelet/aggregation TLS acceptance remain separate from CI.
 | Toolchain | `make doctor` | Print Git, uv, Python, and Make versions. |
 | Inner loop | `make verify` | Formatting, repository policy, lint, types, unit tests, and local configuration checks. Uses installed dependencies offline. |
 | Kind substrate | `make kind-baseline-check` and `make iac-pilot-check` | OpenTofu formatting, validation and plan-only tests with the [locked provider staged offline](../kind-iac-rehearsal.md#setup). Runs in the PR validation job. |
+| Kind baseline Argo CD overlay | `make kind-baseline-argo-check` | Runs in PR validation. Set `KIND_BASELINE_KUBECTL` to the pinned kubectl v1.35.0 binary and `KIND_BASELINE_ARGO_INSTALL` to the staged upstream `install.yaml` at the overlay's pinned commit. The check verifies the manifest digest, renders locally, and checks ownership, seven controllers, and the Redis image and pull policy. |
 | Local kind recipes | `make kind-plan-check` | Exercises native and Just registration, planning, exact apply and verification recovery, plus compatibility with the reviewed legacy recipes, in the dedicated offline hosted job. Set `KIND_TEST_JUST` to the absolute path of the [pinned just binary](../local-kind-opentofu.md#install-just-on-linux-amd64). |
 | PR metadata | `make pr-event-check` | Reproduce the separate CI check against `GITHUB_EVENT_PATH`; no API calls. |
 | Supply chain | `make supply-chain` | Lock consistency and known vulnerability audit; current advisory data may need network access. |
