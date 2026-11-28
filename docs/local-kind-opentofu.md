@@ -79,8 +79,13 @@ Check the private paths and set the dedicated kubeconfig and context.
 
 ~~~sh
 {
-  [[ ! -L "$STATE_DIR/cluster.tfstate" && ! -L "$STATE_DIR/cluster.tfstate.backup" &&
-     ! -L "$STATE_DIR/plans" && -f "$TF_CLI_CONFIG_FILE" && ! -L "$TF_CLI_CONFIG_FILE" ]] ||
+  STATE="$STATE_DIR/cluster.tfstate"
+  BACKUP="$STATE.backup"
+  PLANS="$STATE_DIR/plans"
+  [[ ! -L "$STATE" && ( ! -e "$STATE" || -f "$STATE" ) &&
+     ! -L "$BACKUP" && ( ! -e "$BACKUP" || -f "$BACKUP" ) &&
+     ! -L "$PLANS" && ( ! -e "$PLANS" || -d "$PLANS" ) &&
+     -f "$TF_CLI_CONFIG_FILE" && ! -L "$TF_CLI_CONFIG_FILE" ]] ||
     { printf '%s\n' 'The state, plan directory or CLI configuration is invalid or redirected.' >&2; exit 1; }
   KCFG="$STATE_DIR/kubeconfig"
   CTX="kind-$CLUSTER"
@@ -752,9 +757,11 @@ staged inputs.
 ## Bootstrap Argo CD
 
 Bootstrap installs or reapplies pinned Argo CD on a registered cluster.
-Use a clean, reviewed infrastructure checkout. Both routes stage the
-overlay from Git `HEAD`, render once and keep the manifest and evidence
-in a new private `bootstrap.XXXXXX` directory under the selected target.
+Use a clean, reviewed infrastructure checkout. Rendering requires HTTPS
+access to `raw.githubusercontent.com` for the pinned upstream Argo CD
+manifest. Both routes stage the overlay from Git `HEAD`, render once and
+keep the manifest and evidence in a new private `bootstrap.XXXXXX`
+directory under the selected target.
 
 ### Bootstrap with just
 
@@ -783,10 +790,12 @@ and load the managed registration. Run the complete block in that shell.
   }
 
   check_uid() {
+    local rc
     run_kubectl 15s "$KCFG" --request-timeout=10s \
       wait --for="jsonpath={.metadata.uid}=$EXPECTED_UID" --timeout=1s namespace/kube-system || {
+      rc=$?
       printf '%s\n' 'The live kube-system UID could not be matched to the registration.' >&2
-      return 1
+      return "$rc"
     }
   }
 

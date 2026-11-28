@@ -115,10 +115,12 @@ _kind OPERATION PROFILE *ARGS:
     }
 
     check_uid() {
+      local rc
       run_kubectl 15s "$KCFG" --request-timeout=10s \
         wait --for="jsonpath={.metadata.uid}=$EXPECTED_UID" --timeout=1s namespace/kube-system || {
+        rc=$?
         printf '%s\n' 'The live kube-system UID could not be matched to the registration.' >&2
-        return 1
+        return "$rc"
       }
     }
 

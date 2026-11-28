@@ -221,6 +221,7 @@ case "$1 $2" in
     if [[ -v FIXTURE_BOOTSTRAP_ACTIVITY ]]; then
       if grep -Fxq diff "$FIXTURE_BOOTSTRAP_ACTIVITY"; then live_uid=$FIXTURE_BOOTSTRAP_FINAL_UID; fi
       printf 'uid\\n' >> "$FIXTURE_BOOTSTRAP_ACTIVITY"
+      if [[ ${FIXTURE_BOOTSTRAP_UID_TIMEOUT:-false} == true ]]; then exit 124; fi
     fi
     [[ $4 == namespace/kube-system && $2 == "--for=jsonpath={.metadata.uid}=$live_uid" ]]
     ;;
@@ -593,6 +594,29 @@ class KindJustTests(unittest.TestCase):
                 self.assertEqual(list(self.state.glob("bootstrap.*")), [])
                 self.assert_lock_released()
 
+    def test_bootstrap_refuses_wrong_private_path_types_before_apply(self):
+        self.prepare_bootstrap()
+        (self.state / "cluster.tfstate").unlink()
+        for filename in ("cluster.tfstate", "cluster.tfstate.backup", "plans"):
+            path = self.state / filename
+            if filename == "plans":
+                path.touch(mode=0o600)
+            else:
+                path.mkdir(mode=0o700)
+            for interface in ("just", "native"):
+                with self.subTest(interface=interface, path=filename):
+                    previous = set(self.state.glob("bootstrap.*"))
+                    result = self.bootstrap(interface)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("invalid or redirected", result.stderr)
+                    self.assertFalse(self.bootstrap_activity.exists())
+                    self.assertEqual(set(self.state.glob("bootstrap.*")), previous)
+                    self.assert_lock_released()
+            if filename == "plans":
+                path.unlink()
+            else:
+                path.rmdir()
+
     def assert_bootstrap_failure(self, interface: str, phase: str, activity: str):
         previous = set(self.state.glob("bootstrap.*"))
         result = self.bootstrap(interface)
@@ -604,6 +628,17 @@ class KindJustTests(unittest.TestCase):
         self.assertFalse((run / "RESULT.md.tmp").exists())
         self.assert_lock_released()
         return run, result
+
+    def test_bootstrap_preserves_the_pre_apply_uid_timeout_status(self):
+        self.prepare_bootstrap()
+        self.env["FIXTURE_BOOTSTRAP_UID_TIMEOUT"] = "true"
+        for interface in ("just", "native"):
+            with self.subTest(interface=interface):
+                run, result = self.assert_bootstrap_failure(
+                    interface, "pre-apply identity", "render uid"
+                )
+                self.assertEqual(result.returncode, 124)
+                self.assertFalse((run / "apply.log").exists())
 
     def test_bootstrap_refuses_wrong_uid_and_foreign_namespace_before_apply(self):
         self.prepare_bootstrap()
