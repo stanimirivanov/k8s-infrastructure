@@ -63,6 +63,9 @@ jobs:
           EOF
           tofu -chdir=clusters/local-kind/iac-pilot init -backend=false -lockfile=readonly -input=false
           make iac-pilot-check
+          export TF_DATA_DIR="$scratch/baseline-module-data"
+          tofu -chdir=clusters/local-kind/kind-baseline init -backend=false -lockfile=readonly -input=false
+          make kind-baseline-check
 
   supply-chain:
     runs-on: ubuntu-latest

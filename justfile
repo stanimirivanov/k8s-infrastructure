@@ -1,456 +1,325 @@
 set positional-arguments
 
+provider_checkout := justfile_directory()
+
 [private]
 @default:
     {{quote(just_executable())}} --list
 
-# Save a private OpenTofu plan for review (create or managed)
-plan PROFILE INTENT: (_kind "plan" PROFILE INTENT)
+# Reserve a reviewed local kind target
+register TARGET ENVIRONMENT CANDIDATE: (_kind provider_checkout "register" TARGET ENVIRONMENT CANDIDATE)
 
-# Apply the exact approved plan and verify the registered cluster
-apply PROFILE INTENT ABSOLUTE_PLAN_PATH SHA256 APPROVER APPROVAL_UTC: (_kind "apply" PROFILE INTENT ABSOLUTE_PLAN_PATH SHA256 APPROVER APPROVAL_UTC)
-
-# Resume readiness and repeat-plan verification after apply and registration
-verify PROFILE ABSOLUTE_PLAN_PATH: (_kind "verify" PROFILE ABSOLUTE_PLAN_PATH)
+# Save a private baseline create plan for a registered kind target
+plan TARGET ENVIRONMENT: (_kind provider_checkout "plan" TARGET ENVIRONMENT)
 
 [private]
-_kind OPERATION PROFILE *ARGS:
+_kind PROVIDER OPERATION TARGET ENVIRONMENT *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
-
-    refuse() {
-      printf '%s\n' "$1" >&2
-      exit 1
-    }
-
-    OPERATION=$1
-    PROFILE=$2
-    case "$PROFILE" in
-      pilot-74)
-        CLUSTER=perfeng-iac-pilot-74
-        STATE_DIR="$HOME/.local/state/perfeng/kind-74"
-        ;;
-      retained-434)
-        CLUSTER=perfeng-retained-434
-        STATE_DIR="$HOME/.local/state/perfeng/kind-434"
-        ;;
-      *) refuse 'Unknown kind profile. Choose pilot-74 or retained-434.' ;;
-    esac
-
-    case "$OPERATION" in
-      plan) INTENT=$3 ;;
-      apply)
-        INTENT=$3
-        PLAN=$4
-        APPROVED_SHA256=$5
-        APPROVED_BY=$6
-        APPROVED_AT=$7
-        ;;
-      verify)
-        INTENT=managed
-        PLAN=$3
-        ;;
-    esac
-    case "$INTENT" in
-      create|managed) ;;
-      *) refuse "${OPERATION^} intent must be create or managed." ;;
-    esac
-
-    check_reviewed_checkout() {
-      SOURCE_REVISION=$(git rev-parse --verify 'HEAD^{commit}')
-      INDEX_FLAGS=$(git ls-files -v | LC_ALL=C awk '/^[a-zS] / {print $1}')
-      [[ -z "$INDEX_FLAGS" ]] ||
-        refuse 'Use a clean, reviewed checkout without assume-unchanged or skip-worktree flags.'
-      CHECKOUT_STATUS=$(git --no-optional-locks status --porcelain=v1 --untracked-files=all --ignore-submodules=none)
-      [[ -z "$CHECKOUT_STATUS" && "$(git rev-parse --verify 'HEAD^{commit}')" == "$SOURCE_REVISION" ]] ||
-        refuse 'Plan from a clean, reviewed checkout at a stable HEAD.'
-    }
-
-    if [[ "$OPERATION" == plan ]]; then
-      check_reviewed_checkout
-    fi
-
-    export PATH="$HOME/.local/state/perfeng/kind-74/bin:$PATH"
-    export DOCKER_HOST=unix:///var/run/docker.sock KIND_EXPERIMENTAL_PROVIDER=docker
-    export TF_CLI_CONFIG_FILE="$STATE_DIR/opentofu.tfrc" TF_WORKSPACE=default
-    unset DOCKER_CONTEXT TF_DATA_DIR TF_CLI_ARGS TF_CLI_ARGS_init TF_CLI_ARGS_apply \
-      TF_CLI_ARGS_state TF_CLI_ARGS_state_list TF_CLI_ARGS_console TF_CLI_ARGS_plan TF_CLI_ARGS_show \
-      TF_LOG TF_LOG_PATH TF_LOG_CORE TF_LOG_PROVIDER
     umask 077
 
-    LOCK="$STATE_DIR/operation.lock"
-    [[ -d "$STATE_DIR" && "$(realpath -e -- "$STATE_DIR")" == "$STATE_DIR" &&
-       ! -L "$LOCK" && ( ! -e "$LOCK" || -f "$LOCK" ) ]] ||
-      refuse 'The registered state directory or lock path is missing or redirected.'
-    exec 9>>"$LOCK"
-    flock -w 15 9 || refuse 'The target lock is busy. Use the runbook recovery steps.'
+    refuse() { printf '%s\n' "$1" >&2; exit 1; }
+    digest() { sha256sum | cut -d ' ' -f 1; }
+    private_dir() {
+      [[ -d "$1" && -O "$1" && "$(realpath -e -- "$1")" == "$1" &&
+         "$(stat -c '%a' -- "$1")" == 700 ]] || refuse "Use a canonical, private directory: $1"
+    }
+    outside_checkouts() {
+      case "$1" in
+        "$ENVIRONMENT"|"$ENVIRONMENT"/*|"$PROVIDER"|"$PROVIDER"/*)
+          refuse 'Keep private Operations paths outside both checkouts.' ;;
+      esac
+    }
+    private_file() {
+      [[ -f "$1" && ! -L "$1" && -O "$1" && "$(stat -c '%a %h' -- "$1")" == '600 1' ]] ||
+        refuse "Use a dedicated mode-0600 file: $1"
+    }
+    read_record() {
+      jq -ces 'select(length == 1) | .[0] | objects' "$1"
+    }
+    # Prevent Git redirection or replacement objects from overriding the selected commit.
+    unset GIT_DIR GIT_COMMON_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_NAMESPACE \
+      GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+    export GIT_NO_LAZY_FETCH=1
+    git_at() {
+      local checkout=$1
+      shift
+      timeout --kill-after=5s 30s git --no-replace-objects --literal-pathspecs \
+        -C "$checkout" -c core.fsmonitor=false "$@"
+    }
+    stage_blob() {
+      local checkout=$1 revision=$2 path=$3 entry
+      entry=$(git_at "$checkout" ls-tree "$revision" -- "$path")
+      [[ "$entry" == '100644 blob '* || "$entry" == '100755 blob '* ]] &&
+        git_at "$checkout" cat-file blob "$revision:$path" ||
+        refuse "A reviewed, regular Git input is required: $path"
+    }
+    clean_revision() {
+      local revision flags status
+      [[ "$(git_at "$ENVIRONMENT" rev-parse --show-toplevel)" == "$ENVIRONMENT" ]] ||
+        refuse 'Select the environment checkout root.'
+      revision=$(git_at "$ENVIRONMENT" rev-parse --verify 'HEAD^{commit}') || refuse 'The environment has no reviewed HEAD.'
+      flags=$(git_at "$ENVIRONMENT" ls-files -v | LC_ALL=C awk '/^[a-zS] / {print $1}') || refuse 'Could not read the environment index.'
+      status=$(git_at "$ENVIRONMENT" --no-optional-locks status --porcelain=v1 --untracked-files=all --ignore-submodules=none) ||
+        refuse 'Could not check the environment checkout for modifications.'
+      [[ -z "$flags$status" && "$(git_at "$ENVIRONMENT" rev-parse --verify 'HEAD^{commit}')" == "$revision" ]] ||
+        refuse 'Use a clean, reviewed environment checkout at a stable HEAD.'
+      printf '%s\n' "$revision"
+    }
+    record_paths() {
+      # OpenTofu's local backend strips one leading dot from the state filename.
+      jq -er '[.state, .lock, .kubeconfig, (.state + ".backup"),
+        (.state | split("/") | .[-1] |= ("." + ltrimstr(".") + ".lock.info") | join("/"))]
+        | select(length == (unique | length)) | .[]' <<< "$1" ||
+        refuse 'The state, lock, kubeconfig, and backend sidecar paths must be distinct.'
+    }
+    canonical_private_path() {
+      local path=$1 parent leaf
+      leaf=${path##*/}
+      [[ "$path" == /* && -n "$leaf" && "$leaf" != . && "$leaf" != .. ]] ||
+        refuse 'State, target lock and kubeconfig need dedicated absolute paths.'
+      parent=$(realpath -e -- "${path%/*}") || refuse 'Create the private parent directory first.'
+      private_dir "$parent"
+      path="$parent/$leaf"
+      [[ "$path" != *[[:cntrl:]]* ]] || refuse 'Use paths without control characters.'
+      outside_checkouts "$path"
+      case "$path" in
+        "$REGISTRY"|"$REGISTRY"/*)
+          refuse 'Keep state, lock and kubeconfig outside the registry.' ;;
+      esac
+      if [[ -e "$path" || -L "$path" ]]; then private_file "$path"; fi
+      printf '%s\n' "$path"
+    }
+    observe_daemon() {
+      local daemon
+      daemon=$(timeout --kill-after=5s 15s docker --host "$1" info --format '{{{{.ID}}') ||
+        refuse 'Could not observe the selected Docker daemon.'
+      [[ "$daemon" =~ ^[a-zA-Z0-9][a-zA-Z0-9:._-]*$ ]] || refuse 'Docker did not report a daemon ID.'
+      printf '%s\n' "$daemon"
+    }
+    load_registration() {
+      local file=$1 key=$2 row paths path
+      private_file "$file"
+      row=$(read_record "$file")
+      jq -e --arg target "$key" '
+        def text: strings | length > 0 and (test("[[:cntrl:]]") | not);
+        keys == ["clusterName", "context", "daemonId", "declaration", "dockerHost", "environment", "kubeconfig", "lock", "schemaVersion", "state", "target"]
+        and .schemaVersion == 1 and .target == $target
+        and (.clusterName | strings | test("^[a-z]([a-z0-9-]{0,47}[a-z0-9])?$"))
+        and .context == ("kind-" + .clusterName)
+        and (.daemonId | strings | test("^[a-zA-Z0-9][a-zA-Z0-9:._-]*$"))
+        and (.declaration | text) and (.dockerHost | text) and (.environment | text and startswith("/"))
+        and ([.state, .lock, .kubeconfig] | all(.[]; text and startswith("/")))
+        ' <<< "$row" >/dev/null || refuse "Invalid target registration: $file"
+      paths=$(record_paths "$row")
+      while IFS= read -r path; do
+        [[ "$(canonical_private_path "$path")" == "$path" ]] ||
+          refuse "A registered path is redirected: $path"
+      done <<< "$paths"
+      printf '%s\n' "$row"
+    }
 
-    STATE="$STATE_DIR/cluster.tfstate"
-    BACKUP="$STATE.backup"
-    PLANS="$STATE_DIR/plans"
-    KCFG="$STATE_DIR/kubeconfig"
-    IDENTITY="$STATE_DIR/identity.json"
-    CTX="kind-$CLUSTER"
-    [[ ! -L "$STATE" && ( ! -e "$STATE" || -f "$STATE" ) &&
-       ! -L "$BACKUP" && ( ! -e "$BACKUP" || -f "$BACKUP" ) &&
-       ! -L "$PLANS" && ( ! -e "$PLANS" || -d "$PLANS" ) ]] ||
-      refuse 'The state file or plan directory is invalid or redirected.'
-    [[ -f "$TF_CLI_CONFIG_FILE" && ! -L "$TF_CLI_CONFIG_FILE" ]] ||
-      refuse 'The registered OpenTofu CLI configuration is missing or redirected.'
+    [[ $# -ge 4 ]] || refuse 'Select register TARGET ENVIRONMENT CANDIDATE or plan TARGET ENVIRONMENT.'
+    PROVIDER=$(realpath -e -- "$1")
+    [[ "$(git_at "$PROVIDER" rev-parse --show-toplevel)" == "$PROVIDER" ]] ||
+      refuse 'Select the provider checkout root.'
+    OPERATION=$2
+    TARGET=$3
+    ENVIRONMENT=$(realpath -e -- "$4")
+    [[ "$TARGET" =~ ^[a-z0-9]+(-[a-z0-9]+)*/[a-z0-9]+(-[a-z0-9]+)*$ ]] ||
+      refuse 'Select an explicit owner/target key.'
+    REGISTRY=${KIND_REGISTRATIONS:?Set KIND_REGISTRATIONS to the Operations registry}
+    private_dir "$REGISTRY"
+    outside_checkouts "$REGISTRY"
+    OWNER=${TARGET%/*}
+    REGISTRATION="$REGISTRY/$TARGET.json"
+    case "$OPERATION:$#" in
+      register:5)
+        private_file "$5"
+        CANDIDATE=$(canonical_private_path "$5")
+        INPUT=$(read_record "$CANDIDATE")
+        jq -e --arg target "$TARGET" '
+          keys == ["declaration", "dockerHost", "kubeconfig", "lock", "state", "target"] and .target == $target
+          and ([.declaration, .dockerHost, .state, .lock, .kubeconfig]
+            | all(.[]; strings | length > 0 and (test("[[:cntrl:]]") | not)))
+          ' <<< "$INPUT" >/dev/null || refuse 'Invalid registration candidate.'
+        STATE=$(canonical_private_path "$(jq -r .state <<< "$INPUT")")
+        LOCK=$(canonical_private_path "$(jq -r .lock <<< "$INPUT")")
+        KUBECONFIG_PATH=$(canonical_private_path "$(jq -r .kubeconfig <<< "$INPUT")")
+        ;;
+      plan:4)
+        [[ -e "$REGISTRATION" || -L "$REGISTRATION" ]] || refuse 'No registration exists for this target.'
+        private_dir "$REGISTRY/$OWNER"
+        INPUT=$(load_registration "$REGISTRATION" "$TARGET")
+        [[ "$(jq -r .environment <<< "$INPUT")" == "$ENVIRONMENT" ]] ||
+          refuse 'Use the environment checkout originally selected for this registration.'
+        LOCK=$(jq -r .lock <<< "$INPUT")
+        exec 9>>"$LOCK"
+        flock -w 15 9 || refuse 'The target lock is busy.'
+        [[ "$(load_registration "$REGISTRATION" "$TARGET")" == "$INPUT" ]] ||
+          refuse 'The registration changed while acquiring the target lock.'
+        STATE=$(jq -r .state <<< "$INPUT")
+        ;;
+      *) refuse 'Select register TARGET ENVIRONMENT CANDIDATE or plan TARGET ENVIRONMENT.' ;;
+    esac
+
+    DOCKER_HOST=$(jq -r .dockerHost <<< "$INPUT")
+    DECLARATION_PATH=$(jq -r .declaration <<< "$INPUT")
+    relative_json_path='^([A-Za-z0-9_-][A-Za-z0-9_.-]*/)*[A-Za-z0-9_-][A-Za-z0-9_.-]*\.json$'
+    [[ "$DECLARATION_PATH" =~ $relative_json_path ]] || refuse 'Select a repository-relative JSON declaration path.'
+    [[ "$DOCKER_HOST" =~ ^unix:///[^[:space:][:cntrl:]]+$ ]] ||
+      refuse 'Use an explicit local Unix Docker socket.'
+    unset DOCKER_CONTEXT DOCKER_TLS DOCKER_TLS_VERIFY DOCKER_CERT_PATH
+
+    ENV_REVISION=$(clean_revision)
+    DECLARATION=$(stage_blob "$ENVIRONMENT" "$ENV_REVISION" "$DECLARATION_PATH")
+    jq -es '
+      length == 1 and (.[0] |
+        keys == ["clusterName", "disposable", "profile", "providerPin"]
+        and .profile == "kind-baseline" and (.disposable | type == "boolean")
+        and (.clusterName | strings | test("^[a-z]([a-z0-9-]{0,47}[a-z0-9])?$"))
+        and (.providerPin | type == "string" and (test("[[:cntrl:]]") | not)))
+      ' <<< "$DECLARATION" >/dev/null || refuse 'Invalid declaration or unsupported kind-baseline inputs.'
+    CLUSTER=$(jq -r .clusterName <<< "$DECLARATION")
+    PIN_PATH=$(jq -r .providerPin <<< "$DECLARATION")
+    [[ "$PIN_PATH" =~ $relative_json_path ]] || refuse 'Select a repository-relative JSON provider pin.'
+    PIN=$(stage_blob "$ENVIRONMENT" "$ENV_REVISION" "$PIN_PATH")
+    PROVIDER_REVISION=$(jq -esr '
+      select(length == 1) | .[0] |
+      select(.schemaVersion == 1 and .source.repository == "https://github.com/stanimirivanov/k8s-infrastructure.git") |
+      .source.revision | strings | select(test("^([a-f0-9]{40}|[a-f0-9]{64})$"))
+      ' <<< "$PIN") || refuse 'The provider pin must select an exact k8s-infrastructure commit.'
+    [[ "$(git_at "$PROVIDER" rev-parse --verify "$PROVIDER_REVISION^{commit}")" == "$PROVIDER_REVISION" ]] ||
+      refuse 'The exact pinned provider commit is unavailable in this checkout.'
+    MODULE=clusters/local-kind/kind-baseline
+    PROFILE_FILES=(main.tf .terraform.lock.hcl)
+    # Refuse pins whose deployed root would differ from the staged root.
+    git_at "$PROVIDER" ls-tree -z --name-only "$PROVIDER_REVISION:$MODULE" |
+      while IFS= read -r -d '' file; do
+        case "$file" in
+          main.tf) ;;
+          *.tf|*.tf.json|*.tofu|*.tofu.json|terraform.tfvars|terraform.tfvars.json|*.auto.tfvars|*.auto.tfvars.json)
+            refuse 'Unsupported configuration in the pinned baseline root. Review the profile before using this pin.' ;;
+        esac
+      done
+    for file in "${PROFILE_FILES[@]}"; do
+      stage_blob "$PROVIDER" "$PROVIDER_REVISION" "$MODULE/$file" >/dev/null
+    done
+    [[ "$(clean_revision)" == "$ENV_REVISION" ]] || refuse 'The environment changed while staging its inputs.'
+    DAEMON=$(observe_daemon "$DOCKER_HOST")
+
+    if [[ "$OPERATION" == register ]]; then
+      PROPOSED=$(jq -cS --arg environment "$ENVIRONMENT" --arg cluster "$CLUSTER" --arg daemon "$DAEMON" --arg state "$STATE" \
+        --arg lock "$LOCK" --arg kubeconfig "$KUBECONFIG_PATH" '
+        . + {schemaVersion: 1, clusterName: $cluster, context: ("kind-" + $cluster),
+          daemonId: $daemon, environment: $environment, state: $state, lock: $lock, kubeconfig: $kubeconfig}
+        ' <<< "$INPUT")
+      PROPOSED_PATHS=$(record_paths "$PROPOSED")
+      while IFS= read -r path; do canonical_private_path "$path" >/dev/null; done <<< "$PROPOSED_PATHS"
+
+      directory_lock="$REGISTRY/.registry.lock"
+      if [[ -e "$directory_lock" || -L "$directory_lock" ]]; then private_file "$directory_lock"; fi
+      exec 8>>"$directory_lock"
+      flock -w 15 8 || refuse 'The registration directory lock is busy.'
+
+      shopt -s nullglob
+      for owner_dir in "$REGISTRY"/*/; do
+        owner_dir=${owner_dir%/}
+        private_dir "$owner_dir"
+        for file in "$owner_dir"/*.json; do
+          key=${file#"$REGISTRY/"}
+          row=$(load_registration "$file" "${key%.json}")
+          if [[ "$file" == "$REGISTRATION" ]]; then
+            [[ "$(jq -cS . <<< "$row")" == "$PROPOSED" ]] || refuse 'The target key already has a different registration.'
+            continue
+          fi
+          jq -e --arg daemon "$DAEMON" --arg cluster "$CLUSTER" \
+            '.daemonId != $daemon or .clusterName != $cluster' <<< "$row" >/dev/null ||
+            refuse 'This Docker daemon and cluster name are already reserved.'
+          paths=$(record_paths "$row")
+          if grep -Fxq -f <(printf '%s\n' "$paths") <<< "$PROPOSED_PATHS"; then
+            refuse 'Another target already reserves a canonical path.'
+          fi
+        done
+      done
+      if [[ -e "$REGISTRATION" ]]; then printf '%s\n' "$REGISTRATION"; exit 0; fi
+      mkdir -p -- "$REGISTRY/$OWNER"
+      private_dir "$REGISTRY/$OWNER"
+      temporary=$(mktemp "$REGISTRY/$OWNER/.reservation.XXXXXX")
+      trap 'rm -f -- "$temporary"' EXIT
+      printf '%s\n' "$PROPOSED" > "$temporary"
+      mv -T -- "$temporary" "$REGISTRATION"
+      printf '%s\n' "$REGISTRATION"
+      exit 0
+    fi
+
+    [[ "$CLUSTER" == "$(jq -r .clusterName <<< "$INPUT")" ]] ||
+      refuse 'The declaration changes the reserved cluster name.'
+    [[ "$DAEMON" == "$(jq -r .daemonId <<< "$INPUT")" ]] ||
+      refuse 'Docker daemon ID differs from the registration.'
+    paths=$(record_paths "$INPUT")
+    while IFS= read -r path; do
+      [[ "$path" == "$LOCK" || ( ! -e "$path" && ! -L "$path" ) ]] ||
+        refuse 'A create plan requires vacant state, kubeconfig and backend sidecar paths.'
+    done <<< "$paths"
+    for filter in "label=io.x-k8s.kind.cluster=$CLUSTER" "name=^/$CLUSTER-(control-plane|worker)$"; do
+      containers=$(timeout --kill-after=5s 15s docker --host "$DOCKER_HOST" ps -a \
+        --filter "$filter" --format '{{{{.Names}}')
+      [[ -z "$containers" ]] || refuse 'The reserved kind name is already in use.'
+    done
+    MIRROR=${KIND_PROVIDER_MIRROR:?Set KIND_PROVIDER_MIRROR to the qualified local provider mirror}
+    [[ -d "$MIRROR" && "$(realpath -e -- "$MIRROR")" == "$MIRROR" && "$MIRROR" != *[[:cntrl:]]* ]] ||
+      refuse 'Use a canonical directory path for the local provider mirror.'
+
+    for directory in "$REGISTRY/.plans" "$REGISTRY/.plans/$OWNER" "$REGISTRY/.plans/$TARGET"; do
+      mkdir -p -- "$directory"
+      private_dir "$directory"
+    done
+    PLAN_DIR=$(mktemp -d "$REGISTRY/.plans/$TARGET/plan.XXXXXX")
+    trap 'if (( $? != 0 )); then printf "Planning stopped. Private diagnostics are in %s\n" "$PLAN_DIR" >&2; fi' EXIT
+    PROVIDER_ADDRESS=registry.terraform.io/elioseverojunior/kind
+    TOFU_CONFIG="$PLAN_DIR/opentofu.tfrc"
+    jq -n --arg mirror "$MIRROR" --arg provider "$PROVIDER_ADDRESS" \
+      '{provider_installation: [{filesystem_mirror: [{path: $mirror, include: [$provider]}]}]}' > "$TOFU_CONFIG"
+    for file in "${PROFILE_FILES[@]}"; do
+      stage_blob "$PROVIDER" "$PROVIDER_REVISION" "$MODULE/$file" > "$PLAN_DIR/$file"
+    done
+    stage_blob "$ENVIRONMENT" "$ENV_REVISION" "$DECLARATION_PATH" > "$PLAN_DIR/declaration.json"
+    stage_blob "$ENVIRONMENT" "$ENV_REVISION" "$PIN_PATH" > "$PLAN_DIR/provider-pin.json"
+    cp -- "$REGISTRATION" "$PLAN_DIR/registration.json"
+    jq -nS --arg target "$TARGET" --arg environment "$ENV_REVISION" --arg provider "$PROVIDER_REVISION" \
+      --arg registration "$(digest < "$PLAN_DIR/registration.json")" \
+      --arg declaration "$(digest < "$PLAN_DIR/declaration.json")" \
+      --arg pin "$(digest < "$PLAN_DIR/provider-pin.json")" \
+      '{schemaVersion: 1, target: $target, profile: "kind-baseline", intent: "create",
+        environmentRevision: $environment, providerRevision: $provider, registrationSha256: $registration,
+        declarationSha256: $declaration, providerPinSha256: $pin}' > "$PLAN_DIR/binding.json"
+    BINDING_SHA256=$(digest < "$PLAN_DIR/binding.json")
+    jq -n --arg name "$CLUSTER" --arg digest "$BINDING_SHA256" \
+      '{cluster_name: $name, plan_binding_sha256: $digest}' > "$PLAN_DIR/target.auto.tfvars.json"
 
     run_tofu() {
       local deadline=$1
       shift
-      timeout --verbose --kill-after=5s "$deadline" tofu -chdir="$PLAN_DIR" "$@"
+      timeout --verbose --kill-after=5s "$deadline" env -i PATH="$PATH" HOME="$PLAN_DIR" \
+        DOCKER_HOST="$DOCKER_HOST" KIND_EXPERIMENTAL_PROVIDER=docker TF_CLI_CONFIG_FILE="$TOFU_CONFIG" \
+        TF_WORKSPACE=default CHECKPOINT_DISABLE=1 KUBECONFIG="$PLAN_DIR/provider.kubeconfig" \
+        tofu -chdir="$PLAN_DIR" "$@"
     }
-
-    run_kubectl() {
-      local deadline=$1 config=$2
-      shift 2
-      timeout --kill-after=5s "$deadline" kubectl --kubeconfig "$config" --context "$CTX" "$@"
-    }
-
-    check_uid() {
-      run_kubectl 15s "$KCFG" --request-timeout=10s \
-        wait --for="jsonpath={.metadata.uid}=$EXPECTED_UID" --timeout=1s namespace/kube-system ||
-        refuse 'The live kube-system UID could not be matched to the registration.'
-    }
-
-    require_vacant_registration() {
-      [[ ! -e "$KCFG" && ! -L "$KCFG" && ! -e "$IDENTITY" && ! -L "$IDENTITY" ]] ||
-        refuse 'The selected target already has a registration file.'
-    }
-
-    check_daemon() {
-      DAEMON=$(timeout --kill-after=5s 15s docker --host "$DOCKER_HOST" info --format '{{{{.ID}}')
-      [[ "$DAEMON" == "$EXPECTED_DAEMON" ]] || refuse 'Docker daemon ID differs from the registration.'
-    }
-
-    check_target_registration() {
-      if [[ "$INTENT" == managed ]]; then
-        [[ -f "$KCFG" && ! -L "$KCFG" && -f "$IDENTITY" && ! -L "$IDENTITY" ]] ||
-          refuse 'The kubeconfig or identity record is missing or redirected.'
-        EXPECTED_DAEMON=$(jq -er '.daemon | strings | select(length > 0)' "$IDENTITY") ||
-          refuse 'The identity record has no valid Docker daemon ID.'
-        EXPECTED_UID=$(jq -er '.uid | strings | select(length > 0)' "$IDENTITY") ||
-          refuse 'The identity record has no valid kube-system UID.'
-      else
-        : "${EXPECTED_DAEMON:?Set the registered Docker daemon ID}"
-        require_vacant_registration
-      fi
-
-      check_daemon
-      if [[ "$INTENT" == create ]]; then
-        CLUSTER_LABELS=$(timeout --kill-after=5s 15s docker --host "$DOCKER_HOST" ps -a \
-          --filter "label=io.x-k8s.kind.cluster=$CLUSTER" --format '{{{{.Names}}')
-        CLUSTER_NAMES=$(timeout --kill-after=5s 15s docker --host "$DOCKER_HOST" ps -a \
-          --filter "name=^/$CLUSTER-" --format '{{{{.Names}}')
-        [[ -z "$CLUSTER_LABELS$CLUSTER_NAMES" ]] || refuse 'The selected kind name is already in use.'
-      fi
-    }
-
-    check_target_state() {
-      if [[ "$INTENT" == managed ]]; then
-        STATE_RESOURCES=$(run_tofu 60s state list -state="$STATE")
-        [[ "$STATE_RESOURCES" == kind_cluster.pilot ]] || refuse 'The registered state must contain only kind_cluster.pilot.'
-        NAME_MATCH=$(run_tofu 60s console -no-color -state="$STATE" \
-          <<< "kind_cluster.pilot.name == var.cluster_name && var.cluster_name == \"$CLUSTER\"")
-        [[ "$NAME_MATCH" == true ]] || refuse 'The state or staged cluster name differs from the registration.'
-        check_uid
-      else
-        if [[ -e "$STATE" ]]; then
-          STATE_RESOURCES=$(run_tofu 60s state list -state="$STATE")
-          [[ -z "$STATE_RESOURCES" ]] || refuse 'The selected state already contains resources.'
-        fi
-        NAME_MATCH=$(run_tofu 60s console -no-color -state="$STATE" <<< "var.cluster_name == \"$CLUSTER\"")
-        [[ "$NAME_MATCH" == true ]] || refuse 'The staged cluster name differs from the registration.'
-      fi
-    }
-
-    SOURCE=clusters/local-kind/iac-pilot
-    PROFILE_SOURCE="$SOURCE/profiles/$PROFILE"
-    INPUTS=("$SOURCE/main.tf" "$SOURCE/.terraform.lock.hcl" "$PROFILE_SOURCE/target.auto.tfvars")
-    STAGED_INPUTS=(main.tf .terraform.lock.hcl target.auto.tfvars)
-    if [[ "$PROFILE" == retained-434 ]]; then
-      INPUTS+=("$PROFILE_SOURCE/retained-lifecycle.tf")
-      STAGED_INPUTS+=(retained_override.tf)
-    fi
-
-    save_plan() {
-      check_target_registration
-      # Archive only the tracked inputs belonging to this profile.
-      install -d -m 700 "$PLANS"
-      PLAN_DIR=$(mktemp -d "$PLANS/plan.XXXXXX")
-      git archive --format=tar "$SOURCE_REVISION" -- "${INPUTS[@]}" |
-        tar -xf - --strip-components=3 --no-same-owner --no-same-permissions -C "$PLAN_DIR"
-      for INPUT in "${INPUTS[@]}"; do
-        STAGED="$PLAN_DIR/${INPUT#"$SOURCE/"}"
-        [[ -f "$STAGED" && ! -L "$STAGED" ]] || refuse 'A reviewed input is missing or redirected.'
-        chmod 600 -- "$STAGED"
-      done
-      mv -- "$PLAN_DIR/profiles/$PROFILE/target.auto.tfvars" "$PLAN_DIR/target.auto.tfvars"
-      if [[ "$PROFILE" == retained-434 ]]; then
-        mv -- "$PLAN_DIR/profiles/$PROFILE/retained-lifecycle.tf" "$PLAN_DIR/retained_override.tf"
-      fi
-      rmdir -- "$PLAN_DIR/profiles/$PROFILE" "$PLAN_DIR/profiles"
-      printf '%s\n' "$SOURCE_REVISION" > "$PLAN_DIR/source-revision.txt"
-      export KUBECONFIG="$PLAN_DIR/provider.kubeconfig"
-      run_tofu 120s init -no-color -input=false -lockfile=readonly -backend-config="path=$STATE"
-      check_target_state
-      PLAN="$PLAN_DIR/saved.tfplan"
-      run_tofu 180s plan -no-color -input=false -lock-timeout=30s -out="$PLAN" 2>&1 |
-        tee "$PLAN_DIR/plan.log"
-      run_tofu 60s show -no-color "$PLAN" > "$PLAN_DIR/plan.txt"
-      sha256sum -- "$PLAN" > "$PLAN_DIR/SHA256SUMS"
-      read -r PLAN_SHA256 _ < "$PLAN_DIR/SHA256SUMS"
-      cat "$PLAN_DIR/plan.txt" "$PLAN_DIR/SHA256SUMS"
-      printf '# Plan review\n\n- Profile %s\n- Intent %s\n- Source revision %s\n- Plan %s\n- SHA-256 %s\n' \
-        "$PROFILE" "$INTENT" "$SOURCE_REVISION" "$PLAN" "${PLAN_SHA256#\\}" > "$PLAN_DIR/REVIEW.md.tmp"
-      mv -- "$PLAN_DIR/REVIEW.md.tmp" "$PLAN_DIR/REVIEW.md"
-    }
-
-    bind_saved_plan() {
-      PLAN_DIR=${PLAN%/*}
-      [[ "${PLAN_DIR%/*}" == "$PLANS" && "${PLAN_DIR##*/}" == plan.* &&
-         "$PLAN" == "$PLAN_DIR/saved.tfplan" && -f "$PLAN" &&
-         "$(realpath -e -- "$PLAN")" == "$PLAN" ]] ||
-        refuse 'Use the canonical saved plan under the selected profile plans directory.'
-      local input
-      for input in main.tf .terraform.lock.hcl target.auto.tfvars source-revision.txt REVIEW.md; do
-        [[ -f "$PLAN_DIR/$input" && ! -L "$PLAN_DIR/$input" ]] ||
-          refuse 'The saved plan snapshot or review evidence is incomplete or redirected.'
-      done
-      if [[ "$PROFILE" == retained-434 ]]; then
-        [[ -f "$PLAN_DIR/retained_override.tf" && ! -L "$PLAN_DIR/retained_override.tf" ]] ||
-          refuse 'The saved plan snapshot is missing the retained lifecycle override.'
-      fi
-      [[ ! -L "$PLAN_DIR/provider.kubeconfig" && ! -L "$PLAN_DIR/.terraform" ]] ||
-        refuse 'The saved provider paths are redirected.'
-
-      REVIEW="$PLAN_DIR/REVIEW.md"
-      grep -Fxq -- "- Profile $PROFILE" "$REVIEW" &&
-        grep -Fxq -- "- Plan $PLAN" "$REVIEW" ||
-        refuse 'The review record differs from the selected profile or plan.'
-      export KUBECONFIG="$PLAN_DIR/provider.kubeconfig"
-      check_staged_inputs
-    }
-
-    check_staged_inputs() {
-      local revision index staged path
-      revision=$(cat -- "$PLAN_DIR/source-revision.txt")
-      [[ "$revision" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ &&
-         "$(git rev-parse --verify "$revision^{commit}" 2>/dev/null)" == "$revision" ]] &&
-        grep -Fxq -- "- Source revision $revision" "$REVIEW" ||
-        refuse 'The staged source revision does not match the review or is unavailable.'
-      for index in "${!INPUTS[@]}"; do
-        staged="$PLAN_DIR/${STAGED_INPUTS[index]}"
-        if [[ ! -f "$staged" || -L "$staged" ]] ||
-           ! git archive --format=tar "$revision" -- "${INPUTS[index]}" |
-             tar -xOf - "${INPUTS[index]}" | cmp -s -- "$staged" -; then
-          refuse "Staged input ${STAGED_INPUTS[index]} differs from the reviewed source."
-        fi
-      done
-      for path in "$PLAN_DIR"/{*,.*}.{tf,tofu,tfvars,tf.json,tofu.json,tfvars.json}; do
-        [[ -e "$path" || -L "$path" ]] || continue
-        case "${path##*/}" in
-          main.tf|target.auto.tfvars) continue ;;
-          retained_override.tf) [[ "$PROFILE" == retained-434 ]] && continue ;;
-        esac
-        refuse 'Unexpected OpenTofu input in the saved plan directory.'
-      done
-    }
-
-    check_digest() {
-      local recorded
-      recorded=$(sha256sum < "$PLAN")
-      [[ "${recorded%% *}" == "$1" ]] ||
-        refuse 'The saved plan differs from the approved SHA-256.'
-      grep -Fxq -- "- SHA-256 $1" "$REVIEW" ||
-        refuse 'The review record differs from the approved SHA-256.'
-    }
-
-    write_apply_status() {
-      local status=$1 receipt
-      shift
-      receipt=$(mktemp "$PLAN_DIR/apply.status.XXXXXX")
-      {
-        printf '%s %s' "$status" "$APPROVED_SHA256"
-        if (( $# )); then printf ' %s' "$@"; fi
-        printf '\n'
-      } > "$receipt"
-      mv -T -- "$receipt" "$PLAN_DIR/apply.status"
-    }
-
-    report_failure() {
-      local result=$?
-      if (( result != 0 )); then
-        printf 'The %s phase stopped. Private evidence is in %s. %s\n' \
-          "$PHASE" "$PLAN_DIR" "$RECOVERY" >&2
-      fi
-    }
-
-    apply_plan() {
-      check_digest "$APPROVED_SHA256"
-      grep -Fxq -- "- Intent $INTENT" "$REVIEW" ||
-        refuse 'The review record differs from the selected apply intent.'
-      [[ -n "${APPROVED_BY//[[:space:]]/}" && "$APPROVED_BY" != *$'\n'* && "$APPROVED_BY" != *$'\r'* ]] ||
-        refuse 'Use a single-line approver name from the approval record.'
-      [[ "$APPROVED_AT" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ &&
-         "$(date -u -d "$APPROVED_AT" +%Y-%m-%dT%H:%M:%SZ)" == "$APPROVED_AT" ]] ||
-        refuse 'Use the UTC approval time in YYYY-MM-DDTHH:MM:SSZ form.'
-      [[ ! -e "$PLAN_DIR/apply.status" && ! -L "$PLAN_DIR/apply.status" &&
-         ! -e "$PLAN_DIR/apply.log" && ! -L "$PLAN_DIR/apply.log" ]] ||
-        refuse 'An apply was already attempted for this plan. Use the runbook recovery steps.'
-
-      check_target_registration
-      check_target_state
-      run_tofu 60s show -json "$PLAN" |
-        jq -e --arg cluster "$CLUSTER" --arg intent "$INTENT" '
-          if .variables.cluster_name.value != $cluster then
-            error("The saved plan names a different cluster.")
-          elif (.resource_changes | type == "array" and length == 1) and
-            (.resource_changes[0] |
-              .address == "kind_cluster.pilot" and .mode == "managed" and
-              .provider_name == "registry.terraform.io/elioseverojunior/kind" and
-              .previous_address == null and .deposed == null and .change.importing == null and
-              .change.after.name == $cluster and
-              (if $intent == "create" then .change.actions == ["create"]
-               else .change.actions == ["no-op"] or .change.actions == ["update"] end)) then
-            true
-          else error("The saved plan contains unexpected resource changes.") end
-        ' >/dev/null
-      PHASE=apply
-      RECOVERY='Inspect apply.log, state and inventory before attempting another operation.'
-      printf '\n- Approved SHA-256 %s\n- Approver %s\n- Approval UTC %s\n' \
-        "$APPROVED_SHA256" "$APPROVED_BY" "$APPROVED_AT" >> "$REVIEW"
-      write_apply_status started
-      check_digest "$APPROVED_SHA256"
-      run_tofu 300s apply -no-color -input=false -lock-timeout=30s \
-        -state="$STATE" -state-out="$STATE" -backup="$BACKUP" "$PLAN" \
-        > "$PLAN_DIR/apply.log" 2>&1
-      write_apply_status applied "$EXPECTED_DAEMON"
-    }
-
-    register_cluster() {
-      PHASE=registration
-      RECOVERY='Review the partial registration before resuming verification.'
-      check_daemon
-      local config="$PLAN_DIR/kubeconfig" identity="$PLAN_DIR/identity.json"
-      local fields='jsonpath={.clusters[0].cluster.server}{" "}{.clusters[0].cluster.certificate-authority-data}'
-      local dedicated state_config endpoint api_server ca
-      local mismatch='The saved kubeconfig differs from the dedicated kind kubeconfig.'
-      [[ ! -e "$config" && ! -L "$config" && ! -e "$identity" && ! -L "$identity" ]] ||
-        refuse 'The saved plan already has staged registration files.'
-      timeout --kill-after=5s 30s kind get kubeconfig --name "$CLUSTER" > "$config"
-      if ! dedicated=$(run_kubectl 15s "$config" config view --minify --raw -o "$fields" 2>/dev/null) ||
-         ! state_config=$(jq -er --arg cluster "$CLUSTER" '
-            select(.resources | type == "array" and length == 1) | .resources[0] |
-            select(.mode == "managed" and .type == "kind_cluster" and .name == "pilot" and .module == null and
-              .provider == "provider[\"registry.terraform.io/elioseverojunior/kind\"]" and
-              (.instances | type == "array" and length == 1)) | .instances[0] |
-            select(.index_key == null and .deposed == null and .attributes.name == $cluster) |
-            .attributes.kubeconfig | strings | select(length > 0)
-          ' "$STATE" 2>/dev/null |
-          run_kubectl 15s /dev/stdin config view --minify --raw -o "$fields" 2>/dev/null) ||
-         ! endpoint=$(jq -er '.resources[0].instances[0].attributes.endpoint | strings' "$STATE" 2>/dev/null); then
-        refuse "$mismatch"
-      fi
-      read -r api_server ca <<< "$dedicated"
-      [[ "$api_server" =~ ^https://127\.0\.0\.1:[0-9]+$ && -n "$ca" &&
-         "$dedicated" == "$state_config" && "$api_server" == "$endpoint" ]] ||
-        refuse "$mismatch"
-      EXPECTED_UID=$(run_kubectl 15s "$config" --request-timeout=10s \
-        get namespace kube-system -o 'jsonpath={.metadata.uid}')
-      [[ -n "$EXPECTED_UID" ]] || refuse 'The new kube-system namespace has no UID.'
-      jq -n --arg daemon "$EXPECTED_DAEMON" --arg uid "$EXPECTED_UID" \
-        '{daemon: $daemon, uid: $uid}' > "$identity"
-      require_vacant_registration
-      install -m 600 "$config" "$identity" "$STATE_DIR/"
-      INTENT=managed
-    }
-
-    check_placement() {
-      local selected
-      selected=$(run_kubectl 15s "$KCFG" --request-timeout=10s get nodes -l "$1" -o name 2>> "$VERIFY_LOG")
-      printf 'Selector %s returned %s\n' "$1" "$selected" >> "$VERIFY_LOG"
-      [[ "$selected" == "node/$CLUSTER-$2" ]] ||
-        refuse "Unexpected placement for node/$CLUSTER-$2. See verify.log."
-    }
-
-    verify_plan() {
-      PHASE=verification
-      RECOVERY='After registration is confirmed, resume verification of the same plan.'
-      local VERIFY_LOG="$PLAN_DIR/verify.log" nodes evidence rc
-      for evidence in "$VERIFY_LOG" "$PLAN_DIR/nodes.txt" "$PLAN_DIR/repeat.log"; do
-        [[ ! -L "$evidence" && ( ! -e "$evidence" || -f "$evidence" ) ]] ||
-          refuse 'A verification evidence path is redirected or invalid.'
-      done
-      printf '\nChecking cluster identity and nodes\n' >> "$VERIFY_LOG"
-      check_uid
-      run_kubectl 100s "$KCFG" --request-timeout=90s wait --for=condition=Ready --timeout=90s \
-        "node/$CLUSTER-control-plane" "node/$CLUSTER-worker" "node/$CLUSTER-worker2" >> "$VERIFY_LOG" 2>&1 ||
-        refuse 'The required nodes did not all become Ready. See verify.log.'
-      nodes=$(run_kubectl 15s "$KCFG" --request-timeout=10s get nodes -o name 2>> "$VERIFY_LOG" | LC_ALL=C sort)
-      printf 'Observed nodes:\n%s\n' "$nodes" >> "$VERIFY_LOG"
-      [[ "$nodes" == "$(printf 'node/%s\n' "$CLUSTER-control-plane" "$CLUSTER-worker" "$CLUSTER-worker2")" ]] ||
-        refuse 'Unexpected node inventory. See verify.log.'
-      check_placement workload=control-plane,node-role.kubernetes.io/control-plane control-plane
-      check_placement workload=performance-generator,perfeng.io/node-type=generator worker
-      check_placement workload=sut,perfeng.io/node-type=sut worker2
-      run_kubectl 15s "$KCFG" --request-timeout=10s get nodes -L workload,perfeng.io/node-type \
-        > "$PLAN_DIR/nodes.txt" 2>> "$VERIFY_LOG"
-      check_staged_inputs
-      if run_tofu 180s plan -no-color -input=false -lock-timeout=30s -state="$STATE" -detailed-exitcode \
-        >> "$PLAN_DIR/repeat.log" 2>&1; then
-        check_daemon
-        check_uid
-        printf '%s\n' 'Repeat plan reports zero changes.' | tee -a "$VERIFY_LOG"
-      else
-        rc=$?
-        printf 'Repeat plan exited %s (2 means changes, 1 means error). See repeat.log.\n' "$rc" >&2
-        exit "$rc"
-      fi
-    }
-
-    check_completed_apply() {
-      local receipt="$PLAN_DIR/apply.status" status
-      [[ -f "$receipt" && ! -L "$receipt" ]] ||
-        refuse 'The saved plan has no completed apply receipt. Use the runbook recovery steps.'
-      status=$(cat -- "$receipt")
-      [[ "$status" =~ ^complete\ ([0-9a-f]{64})\ ([^[:space:]]+)\ ([^[:space:]]+)$ ]] ||
-        refuse 'The saved plan has no completed apply receipt. Use the runbook recovery steps.'
-      local digest=${BASH_REMATCH[1]} uid=${BASH_REMATCH[2]} daemon=${BASH_REMATCH[3]}
-      check_digest "$digest"
-      check_target_registration
-      [[ "$uid" == "$EXPECTED_UID" && "$daemon" == "$EXPECTED_DAEMON" ]] ||
-        refuse 'The apply receipt differs from the registered target.'
-      check_target_state
-    }
-
-    if [[ "$OPERATION" == plan ]]; then
-      save_plan
-      exit
-    fi
-
-    bind_saved_plan
-    PHASE=preflight
-    RECOVERY='Check the selected plan, approval and target registration.'
-    trap report_failure EXIT
-    trap 'exit 130' INT
-    trap 'exit 143' TERM
-    if [[ "$OPERATION" == apply ]]; then
-      apply_plan
-      PHASE=registration
-      RECOVERY='Review the registration before resuming verification.'
-      if [[ "$INTENT" == create ]]; then
-        register_cluster
-      fi
-      check_daemon
-      check_target_state
-      write_apply_status complete "$EXPECTED_UID" "$EXPECTED_DAEMON"
-    else
-      PHASE=verification
-      RECOVERY='Confirm that the original apply and registration completed.'
-      check_completed_apply
-    fi
-    verify_plan
+    PLAN="$PLAN_DIR/saved.tfplan"
+    run_tofu 120s init -no-color -input=false -get=false -lockfile=readonly -backend-config="path=$STATE" > "$PLAN_DIR/init.log" 2>&1
+    run_tofu 180s plan -no-color -input=false -refresh=false -lock-timeout=30s -out="$PLAN" > "$PLAN_DIR/plan.log" 2>&1
+    run_tofu 60s show -json "$PLAN" 2>"$PLAN_DIR/show.log" |
+      jq -e --arg cluster "$CLUSTER" --arg binding "$BINDING_SHA256" --arg provider "$PROVIDER_ADDRESS" '
+        .variables.cluster_name.value == $cluster and .variables.plan_binding_sha256.value == $binding
+        and (.resource_changes | length == 1 and (.[0] |
+          .address == "kind_cluster.baseline" and .provider_name == $provider
+          and .change.actions == ["create"] and .change.after.name == $cluster))
+      ' >/dev/null || refuse 'OpenTofu did not save the expected bound baseline create plan.'
+    run_tofu 60s show -no-color "$PLAN" > "$PLAN_DIR/plan.txt" 2>>"$PLAN_DIR/show.log"
+    PLAN_SHA256=$(digest < "$PLAN")
+    printf '%s  saved.tfplan\n' "$PLAN_SHA256" > "$PLAN_DIR/SHA256SUMS"
+    printf '# Plan review\n\n- Target %s\n- Profile kind-baseline\n- Intent create\n- Environment revision %s\n- Provider revision %s\n- Binding SHA-256 %s\n- Plan %s\n- SHA-256 %s\n' \
+      "$TARGET" "$ENV_REVISION" "$PROVIDER_REVISION" "$BINDING_SHA256" "$PLAN" "$PLAN_SHA256" > "$PLAN_DIR/.review"
+    mv -T -- "$PLAN_DIR/.review" "$PLAN_DIR/REVIEW.md"
+    printf '%s\n' "$PLAN_DIR/REVIEW.md"
