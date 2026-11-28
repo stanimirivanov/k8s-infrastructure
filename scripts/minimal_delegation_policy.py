@@ -70,6 +70,7 @@ class Operation:
     deadline: int
     pod: dict
     digest: str
+    observer: dict | None = None
 
     @property
     def launcher(self) -> str:
@@ -78,6 +79,10 @@ class Operation:
     @property
     def runtime(self) -> str:
         return self.launcher.replace("launch", "run", 1)
+
+    @property
+    def observer_binding(self) -> str:
+        return f"{self.launcher}-observer"
 
     def job(self) -> dict:
         return {
@@ -102,10 +107,43 @@ class Operation:
         }
 
 
+def observer_subject(target: Target, subject: object) -> dict:
+    if isinstance(subject, dict) and isinstance(name := subject.get("name"), str):
+        if (
+            set(subject) == {"kind", "name"}
+            and subject["kind"] == "User"
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9@._:+/-]{0,252}", name)
+            and not name.startswith("system:")
+        ):
+            return {**subject, "apiGroup": "rbac.authorization.k8s.io"}
+        namespace = subject.get("namespace")
+        dns_label = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+        if (
+            set(subject) == {"kind", "name", "namespace"}
+            and subject["kind"] == "ServiceAccount"
+            and isinstance(namespace, str)
+            and re.fullmatch(dns_label, namespace)
+            and len(name) <= 253
+            and re.fullmatch(rf"{dns_label}(?:\.{dns_label})*", name)
+            and name != "default"
+            and not (namespace == operations_namespace(target) and name == RECONCILER)
+            and not (
+                namespace in (*namespaces(target), operations_namespace(target))
+                and (
+                    name == ROUTINE_RUNTIME
+                    or re.fullmatch(r"demo-(?:launch|run)-[0-9a-f]{24}", name)
+                )
+            )
+        ):
+            return dict(subject)
+    raise ValueError("Select one existing individual deployment observer User or ServiceAccount")
+
+
 def load_operation(target: Target, value: dict) -> Operation:
+    required = {"name", "namespace", "deadlineSeconds", "podSpec"}
     if (
         not isinstance(value, dict)
-        or set(value) != {"name", "namespace", "deadlineSeconds", "podSpec"}
+        or not required <= value.keys() <= required | {"observer"}
         or not isinstance(value["name"], str)
         or not re.fullmatch(r"[a-z][a-z0-9-]{0,48}[a-z0-9]", value["name"])
         or value["namespace"] not in namespaces(target)[:2]
@@ -151,7 +189,10 @@ def load_operation(target: Target, value: dict) -> Operation:
     ):
         raise ValueError("Reviewed Job Pod security context must use unprivileged IDs")
     digest = host_admission.digest({"consumer": target.consumer, **value})
-    operation = Operation(value["name"], value["namespace"], value["deadlineSeconds"], pod, digest)
+    observer = observer_subject(target, value["observer"]) if "observer" in value else None
+    operation = Operation(
+        value["name"], value["namespace"], value["deadlineSeconds"], pod, digest, observer
+    )
     pod.update(
         serviceAccountName=operation.runtime,
         automountServiceAccountToken=False,
@@ -618,6 +659,37 @@ def render(target: Target, operation: Operation | None = None) -> list[dict]:
     )
     if operation:
         ns, actor = operation.namespace, operation.launcher
+        # Enable observation before the launcher gains submission rights.
+        if operation.observer:
+            observer = operation.observer_binding
+            documents.extend(
+                [
+                    resource(
+                        "Role",
+                        observer,
+                        ns,
+                        rules=[
+                            rule(
+                                "batch",
+                                ["jobs"],
+                                ["get", "list", "watch"],
+                                resourceNames=[operation.name],
+                            )
+                        ],
+                    ),
+                    resource(
+                        "RoleBinding",
+                        observer,
+                        ns,
+                        roleRef={
+                            "apiGroup": "rbac.authorization.k8s.io",
+                            "kind": "Role",
+                            "name": observer,
+                        },
+                        subjects=[dict(operation.observer)],
+                    ),
+                ]
+            )
         documents.extend(
             [
                 resource("ServiceAccount", actor, ops, automountServiceAccountToken=False),
@@ -649,6 +721,7 @@ def render(target: Target, operation: Operation | None = None) -> list[dict]:
                 in {
                     operation.launcher,
                     operation.runtime,
+                    operation.observer_binding,
                     f"{target.consumer}-{operation.launcher}-job",
                     f"{target.consumer}-{operation.launcher}-job-marker",
                 }
