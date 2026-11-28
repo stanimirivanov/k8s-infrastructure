@@ -8,8 +8,9 @@ separate cutover.
 
 - Pick an operator task below and use the laptop's existing Docker daemon,
   pinned provider mirror and private state.
-- Save and review a plan, then open a new locked shell to apply the exact
-  approved file. Verify the cluster and the zero-change repeat plan.
+- Save a plan with native commands or the optional `just plan` recipe.
+  Review the plan, then open a locked shell to apply the exact approved
+  file. Verify the cluster and the zero-change repeat plan.
 - Bootstrap the pinned Argo CD overlay only after verifying the registered
   cluster UID. Record success after rollouts, an empty diff and a final UID check.
 - Use [GitHub-hosted CI](kind-iac-rehearsal.md#github-hosted-rehearsal) for
@@ -17,11 +18,12 @@ separate cutover.
 
 ## Choose an operator task
 
-Start each task with [a locked session](#open-a-locked-session).
+Planning acquires the lock in the chosen procedure. For the other tasks,
+start with [a locked session](#open-a-locked-session).
 
 | Situation | Task | Completion evidence |
 | --- | --- | --- |
-| Plan a vacant pilot or a change to a managed cluster | [Save a plan for review](#save-a-plan-for-review) | Private plan path, readable plan, and SHA-256 |
+| Plan a vacant pilot or a change to a managed cluster | [Save a plan for review](#save-a-plan-for-review) | Private plan path, readable plan, source revision and SHA-256 |
 | Resume with an approved plan | [Apply the approved plan](#apply-the-approved-plan), [register a new cluster](#register-a-new-cluster) after a create, then [verify the apply](#verify-the-apply) | Apply log, exact Ready node inventory, and a zero-change repeat plan |
 | The apply and registration finished but verification stopped | [Resume verification](#resume-verification) | Exact Ready node inventory and a zero-change repeat plan |
 | Install or reapply Argo CD on a registered cluster | [Bootstrap Argo CD](#bootstrap-argo-cd) | Private result, manifest checksum, rollout and diff logs |
@@ -46,12 +48,13 @@ cutover is approved, with the profile, cluster and directory from the table.
 ~~~sh
 export PROFILE=pilot-74 CLUSTER=perfeng-iac-pilot-74
 export STATE_DIR="$HOME/.local/state/perfeng/kind-74"
-export SOURCE="$PWD/clusters/local-kind/iac-pilot"
 export OVERLAY="$PWD/clusters/local-kind/perfeng-local/addons/argocd"
 export PATH="$HOME/.local/state/perfeng/kind-74/bin:$PATH"
-export DOCKER_HOST=unix:///var/run/docker.sock
+export DOCKER_HOST=unix:///var/run/docker.sock KIND_EXPERIMENTAL_PROVIDER=docker
 export TF_CLI_CONFIG_FILE="$STATE_DIR/opentofu.tfrc"
-unset DOCKER_CONTEXT TF_WORKSPACE TF_DATA_DIR TF_CLI_ARGS TF_CLI_ARGS_init TF_CLI_ARGS_plan TF_CLI_ARGS_apply KUBECTL_EXTERNAL_DIFF
+unset DOCKER_CONTEXT TF_WORKSPACE TF_DATA_DIR TF_CLI_ARGS TF_CLI_ARGS_init \
+  TF_CLI_ARGS_state TF_CLI_ARGS_state_list TF_CLI_ARGS_console TF_CLI_ARGS_plan TF_CLI_ARGS_show \
+  TF_CLI_ARGS_apply KUBECTL_EXTERNAL_DIFF
 umask 077
 if [[ -d "$STATE_DIR" && "$(realpath -e -- "$STATE_DIR")" == "$STATE_DIR" && ! -L "$STATE_DIR/operation.lock" ]]; then
   flock -w 15 "$STATE_DIR/operation.lock" bash --noprofile --norc -e -o pipefail
@@ -97,42 +100,196 @@ and continue to the selected task.
 
 ## Save a plan for review
 
-Create a private directory for the plan. The reviewed root module is a
-single `main.tf` and each profile supplies `target.auto.tfvars`. The
-retained override preserves the existing state address and refuses
-replacement. Keep the staged configuration, dependency lock and saved plan
-fixed between review and apply.
+Choose a registered profile from the table above and an explicit intent.
+Use `create` for a vacant target and supply `EXPECTED_DAEMON` from the
+Operations host registration. Use `managed` for a registered target with
+state, a dedicated kubeconfig and `identity.json`.
+
+Either planning path takes the target's `operation.lock`, archives the
+selected tracked inputs from the clean, reviewed Git `HEAD`, and saves the
+result in a new private `plans/plan.*` directory. It releases the lock on
+exit so the plan can be reviewed separately from apply.
+
+Use a checkout without Git `assume-unchanged` or `skip-worktree` flags,
+which can hide local changes. Both paths require GNU `timeout`. The OpenTofu
+deadlines are 120 seconds for initialization, 180 seconds for planning, and
+60 seconds each for state listing, console checks, and rendering the plan.
+A process still running five seconds after its deadline is killed. The plan
+can wait up to 30 seconds for the OpenTofu state lock.
+
+### Plan with just
+
+After the [one-time installation](#install-just-on-linux-amd64), run `just`
+from the checkout to list available recipes. To plan a vacant pilot after
+setting `EXPECTED_DAEMON` from Operations, run this command.
 
 ~~~sh
-{
-  install -d -m 700 "$STATE_DIR/plans"
-  PLAN_DIR=$(mktemp -d "$STATE_DIR/plans/plan.XXXXXX")
-  install -m 600 "$SOURCE/main.tf" "$SOURCE/.terraform.lock.hcl" "$SOURCE/profiles/$PROFILE/target.auto.tfvars" "$PLAN_DIR/"
-  if [[ "$PROFILE" == retained-434 ]]; then
-    install -m 600 "$SOURCE/profiles/retained-434/retained-lifecycle.tf" "$PLAN_DIR/retained_override.tf"
+EXPECTED_DAEMON="$EXPECTED_DAEMON" just plan pilot-74 create
+~~~
+
+For an existing pilot registration, run `just plan pilot-74 managed`.
+Select `retained-434` only through the separate approved cutover.
+
+### Plan with native commands
+
+In Bash at the checkout root, set `PROFILE` to the registered profile and
+`INTENT` to `create` or `managed`. For a vacant pilot, set
+`PROFILE=pilot-74` and `INTENT=create`, and set `EXPECTED_DAEMON` from
+Operations. Run the whole block.
+
+~~~bash
+(
+  set -euo pipefail
+
+  refuse() {
+    printf '%s\n' "$1" >&2
+    exit 1
+  }
+
+  PROFILE=${PROFILE:?Select a registered profile}
+  INTENT=${INTENT:?Select create or managed}
+  case "$PROFILE" in
+    pilot-74)
+      CLUSTER=perfeng-iac-pilot-74
+      STATE_DIR="$HOME/.local/state/perfeng/kind-74"
+      ;;
+    retained-434)
+      CLUSTER=perfeng-retained-434
+      STATE_DIR="$HOME/.local/state/perfeng/kind-434"
+      ;;
+    *) refuse 'Unknown kind profile. Choose pilot-74 or retained-434.' ;;
+  esac
+  case "$INTENT" in
+    create|managed) ;;
+    *) refuse 'Plan intent must be create or managed.' ;;
+  esac
+
+  SOURCE_REVISION=$(git rev-parse --verify 'HEAD^{commit}')
+  INDEX_FLAGS=$(git ls-files -v | LC_ALL=C awk '/^[a-zS] / {print $1}')
+  [[ -z "$INDEX_FLAGS" ]] ||
+    refuse 'Use a clean, reviewed checkout without assume-unchanged or skip-worktree flags.'
+  CHECKOUT_STATUS=$(git --no-optional-locks status --porcelain=v1 --untracked-files=all --ignore-submodules=none)
+  [[ -z "$CHECKOUT_STATUS" && "$(git rev-parse --verify 'HEAD^{commit}')" == "$SOURCE_REVISION" ]] ||
+    refuse 'Plan from a clean, reviewed checkout at a stable HEAD.'
+
+  export PATH="$HOME/.local/state/perfeng/kind-74/bin:$PATH"
+  export DOCKER_HOST=unix:///var/run/docker.sock KIND_EXPERIMENTAL_PROVIDER=docker
+  export TF_CLI_CONFIG_FILE="$STATE_DIR/opentofu.tfrc"
+  unset DOCKER_CONTEXT TF_WORKSPACE TF_DATA_DIR TF_CLI_ARGS TF_CLI_ARGS_init \
+    TF_CLI_ARGS_state TF_CLI_ARGS_state_list TF_CLI_ARGS_console TF_CLI_ARGS_plan TF_CLI_ARGS_show \
+    TF_LOG TF_LOG_PATH TF_LOG_CORE TF_LOG_PROVIDER
+  umask 077
+
+  LOCK="$STATE_DIR/operation.lock"
+  [[ -d "$STATE_DIR" && "$(realpath -e -- "$STATE_DIR")" == "$STATE_DIR" &&
+     ! -L "$LOCK" && ( ! -e "$LOCK" || -f "$LOCK" ) ]] ||
+    refuse 'The registered state directory or lock path is missing or redirected.'
+  exec 9>>"$LOCK"
+  flock -w 15 9 || refuse 'The target lock is busy. Use the runbook recovery steps.'
+
+  STATE="$STATE_DIR/cluster.tfstate"
+  PLANS="$STATE_DIR/plans"
+  KCFG="$STATE_DIR/kubeconfig"
+  IDENTITY="$STATE_DIR/identity.json"
+  CTX="kind-$CLUSTER"
+  [[ ! -L "$STATE" && ( ! -e "$STATE" || -f "$STATE" ) &&
+     ! -L "$PLANS" && ( ! -e "$PLANS" || -d "$PLANS" ) ]] ||
+    refuse 'The state file or plan directory is invalid or redirected.'
+  [[ -f "$TF_CLI_CONFIG_FILE" && ! -L "$TF_CLI_CONFIG_FILE" ]] ||
+    refuse 'The registered OpenTofu CLI configuration is missing or redirected.'
+
+  if [[ "$INTENT" == managed ]]; then
+    [[ -f "$KCFG" && ! -L "$KCFG" && -f "$IDENTITY" && ! -L "$IDENTITY" ]] ||
+      refuse 'The kubeconfig or identity record is missing or redirected.'
+    EXPECTED_DAEMON=$(jq -er '.daemon | strings | select(length > 0)' "$IDENTITY") ||
+      refuse 'The identity record has no valid Docker daemon ID.'
+    EXPECTED_UID=$(jq -er '.uid | strings | select(length > 0)' "$IDENTITY") ||
+      refuse 'The identity record has no valid kube-system UID.'
+  else
+    : "${EXPECTED_DAEMON:?Set the registered Docker daemon ID}"
+    [[ ! -e "$KCFG" && ! -L "$KCFG" && ! -e "$IDENTITY" && ! -L "$IDENTITY" ]] ||
+      refuse 'The selected target already has a registration file.'
   fi
-  git rev-parse HEAD > "$PLAN_DIR/source-revision.txt"
-  tofu -chdir="$PLAN_DIR" init -no-color -input=false -lockfile=readonly -backend-config="path=$STATE_DIR/cluster.tfstate"
-}
-~~~
 
-Run the [daemon check](#check-the-plan-target) and the [vacant](#vacant-target)
-or [managed](#managed-target) checks in this shell. Save the plan with a
-separate kubeconfig for provider operations. A failed plan leaves no review
-record.
+  DAEMON=$(timeout 15s docker --host "$DOCKER_HOST" info --format '{{.ID}}')
+  [[ "$DAEMON" == "$EXPECTED_DAEMON" ]] || refuse 'Docker daemon ID differs from the registration.'
+  if [[ "$INTENT" == create ]]; then
+    CLUSTER_LABELS=$(timeout 15s docker --host "$DOCKER_HOST" ps -a \
+      --filter "label=io.x-k8s.kind.cluster=$CLUSTER" --format '{{.Names}}')
+    CLUSTER_NAMES=$(timeout 15s docker --host "$DOCKER_HOST" ps -a \
+      --filter "name=^/$CLUSTER-" --format '{{.Names}}')
+    [[ -z "$CLUSTER_LABELS$CLUSTER_NAMES" ]] || refuse 'The selected kind name is already in use.'
+  fi
 
-~~~sh
-{
-  KUBECONFIG="$PLAN_DIR/provider.kubeconfig" tofu -chdir="$PLAN_DIR" plan \
-    -no-color -input=false -lock-timeout=30s -out="$PLAN_DIR/saved.tfplan"
-  tofu -chdir="$PLAN_DIR" show -no-color "$PLAN_DIR/saved.tfplan" > "$PLAN_DIR/plan.txt"
-  sha256sum "$PLAN_DIR/saved.tfplan" > "$PLAN_DIR/SHA256SUMS"
-  SOURCE_REVISION=$(cat "$PLAN_DIR/source-revision.txt")
-  printf '# Plan review\n\n- Profile %s\n- Source revision %s\n- Plan %s\n' \
-    "$PROFILE" "$SOURCE_REVISION" "$PLAN_DIR/saved.tfplan" > "$PLAN_DIR/REVIEW.md"
+  # Archive only the tracked inputs belonging to this profile.
+  SOURCE=clusters/local-kind/iac-pilot
+  PROFILE_SOURCE="$SOURCE/profiles/$PROFILE"
+  INPUTS=("$SOURCE/main.tf" "$SOURCE/.terraform.lock.hcl" "$PROFILE_SOURCE/target.auto.tfvars")
+  if [[ "$PROFILE" == retained-434 ]]; then
+    INPUTS+=("$PROFILE_SOURCE/retained-lifecycle.tf")
+  fi
+  install -d -m 700 "$PLANS"
+  PLAN_DIR=$(mktemp -d "$PLANS/plan.XXXXXX")
+  git archive --format=tar "$SOURCE_REVISION" -- "${INPUTS[@]}" |
+    tar -xf - --strip-components=3 --no-same-owner --no-same-permissions -C "$PLAN_DIR"
+  for INPUT in "${INPUTS[@]}"; do
+    STAGED="$PLAN_DIR/${INPUT#"$SOURCE/"}"
+    [[ -f "$STAGED" && ! -L "$STAGED" ]] || refuse 'A reviewed input is missing or redirected.'
+    chmod 600 -- "$STAGED"
+  done
+  mv -- "$PLAN_DIR/profiles/$PROFILE/target.auto.tfvars" "$PLAN_DIR/target.auto.tfvars"
+  if [[ "$PROFILE" == retained-434 ]]; then
+    mv -- "$PLAN_DIR/profiles/$PROFILE/retained-lifecycle.tf" "$PLAN_DIR/retained_override.tf"
+  fi
+  rmdir -- "$PLAN_DIR/profiles/$PROFILE" "$PLAN_DIR/profiles"
+  printf '%s\n' "$SOURCE_REVISION" > "$PLAN_DIR/source-revision.txt"
+  export KUBECONFIG="$PLAN_DIR/provider.kubeconfig"
+  run_tofu() {
+    local deadline=$1
+    shift
+    timeout --verbose --kill-after=5s "$deadline" tofu -chdir="$PLAN_DIR" "$@"
+  }
+  run_tofu 120s init -no-color -input=false -lockfile=readonly -backend-config="path=$STATE"
+
+  if [[ "$INTENT" == managed ]]; then
+    STATE_RESOURCES=$(run_tofu 60s state list -state="$STATE")
+    [[ "$STATE_RESOURCES" == kind_cluster.pilot ]] || refuse 'The registered state must contain only kind_cluster.pilot.'
+    NAME_MATCH=$(run_tofu 60s console -no-color -state="$STATE" \
+      <<< "kind_cluster.pilot.name == var.cluster_name && var.cluster_name == \"$CLUSTER\"")
+    [[ "$NAME_MATCH" == true ]] || refuse 'The state or staged cluster name differs from the registration.'
+    kubectl --kubeconfig "$KCFG" --context "$CTX" --request-timeout=10s \
+      wait --for="jsonpath={.metadata.uid}=$EXPECTED_UID" --timeout=1s namespace/kube-system ||
+      refuse 'The live kube-system UID could not be matched to the registration.'
+  else
+    if [[ -e "$STATE" ]]; then
+      STATE_RESOURCES=$(run_tofu 60s state list -state="$STATE")
+      [[ -z "$STATE_RESOURCES" ]] || refuse 'The selected state already contains resources.'
+    fi
+    NAME_MATCH=$(run_tofu 60s console -no-color -state="$STATE" <<< "var.cluster_name == \"$CLUSTER\"")
+    [[ "$NAME_MATCH" == true ]] || refuse 'The staged cluster name differs from the registration.'
+  fi
+
+  PLAN="$PLAN_DIR/saved.tfplan"
+  run_tofu 180s plan -no-color -input=false -lock-timeout=30s -out="$PLAN" 2>&1 |
+    tee "$PLAN_DIR/plan.log"
+  run_tofu 60s show -no-color "$PLAN" > "$PLAN_DIR/plan.txt"
+  sha256sum -- "$PLAN" > "$PLAN_DIR/SHA256SUMS"
+  read -r PLAN_SHA256 _ < "$PLAN_DIR/SHA256SUMS"
   cat "$PLAN_DIR/plan.txt" "$PLAN_DIR/SHA256SUMS"
-}
+  printf '# Plan review\n\n- Profile %s\n- Intent %s\n- Source revision %s\n- Plan %s\n- SHA-256 %s\n' \
+    "$PROFILE" "$INTENT" "$SOURCE_REVISION" "$PLAN" "${PLAN_SHA256#\\}" > "$PLAN_DIR/REVIEW.md.tmp"
+  mv -- "$PLAN_DIR/REVIEW.md.tmp" "$PLAN_DIR/REVIEW.md"
+)
 ~~~
+
+### Review the saved plan
+
+Keep the staged root module, selected profile, provider lock and saved plan
+fixed between review and apply. The plan directory contains the source
+revision, readable `plan.txt`, checksum file `SHA256SUMS`, and `REVIEW.md`
+with the profile, intent, revision, absolute saved-plan path and digest.
+A failed or timed-out `plan` command leaves `plan.log` for diagnosis. Use
+a new plan directory when the review record is missing.
 
 Review the whole plan. An unchanged managed target reports zero changes.
 For a fresh pilot, check each item:
@@ -142,9 +299,41 @@ For a fresh pilot, check each item:
 - One control plane and two workers with generator and SUT placement labels
 - A loopback API at `127.0.0.1`
 
-Exit the locked shell while the plan is in review. Record approval against
-the absolute plan path and SHA-256. Keep the plan, approval and state on the
-laptop.
+Record approval against the absolute plan path and SHA-256 after planning
+releases the lock. Keep the plan, approval and state on the laptop.
+
+### Install just on Linux AMD64
+
+The optional recipe uses the [just 1.59.0 Linux AMD64 release](https://github.com/casey/just/releases/tag/1.59.0).
+Run this once from the reviewed checkout root in Bash. The repository's
+[checksum pin](../clusters/local-kind/iac-pilot/just-linux-amd64.sha256)
+verifies the archive before extraction.
+
+~~~bash
+(
+  set -euo pipefail
+  [[ "$(uname -s)" == Linux && "$(uname -m)" == x86_64 ]]
+  TOOL_DIR="$HOME/.local/share/perfeng/kind-tools/just-1.59.0/bin"
+  CHECKSUM="$PWD/clusters/local-kind/iac-pilot/just-linux-amd64.sha256"
+  ARCHIVE=just-1.59.0-x86_64-unknown-linux-musl.tar.gz
+  DOWNLOAD=$(mktemp -d)
+  trap 'rm -f -- "$DOWNLOAD/$ARCHIVE" "$DOWNLOAD/just"; rmdir -- "$DOWNLOAD"' EXIT
+  cd -- "$DOWNLOAD"
+  curl -fsSL --proto '=https' --max-time 60 \
+    "https://github.com/casey/just/releases/download/1.59.0/$ARCHIVE" -o "$ARCHIVE"
+  sha256sum --check --strict "$CHECKSUM"
+  tar -xzf "$ARCHIVE" just
+  mkdir -p -- "$TOOL_DIR"
+  install -m 0755 just "$TOOL_DIR/just"
+  "$TOOL_DIR/just" --version
+)
+~~~
+
+Add the pinned tool directory to `PATH` in the operator shell.
+
+~~~sh
+export PATH="$HOME/.local/share/perfeng/kind-tools/just-1.59.0/bin:$PATH"
+~~~
 
 ## Apply the approved plan
 
@@ -218,7 +407,7 @@ paths must be vacant. Existing resources or registration files need
   test -z "$CLUSTER_LABELS$CLUSTER_NAMES" ||
     { printf '%s\n' 'The selected kind name is already in use.' >&2; exit 1; }
   if [[ -e "$STATE_DIR/cluster.tfstate" ]]; then
-    STATE_RESOURCES=$(tofu -chdir="$PLAN_DIR" state list)
+    STATE_RESOURCES=$(tofu -chdir="$PLAN_DIR" state list -state="$STATE_DIR/cluster.tfstate")
     test -z "$STATE_RESOURCES" ||
       { printf '%s\n' 'The selected state already contains resources.' >&2; exit 1; }
   fi
@@ -233,7 +422,7 @@ kind_cluster.pilot` for inspection.
 
 ~~~sh
 {
-  STATE_RESOURCES=$(tofu -chdir="$PLAN_DIR" state list)
+  STATE_RESOURCES=$(tofu -chdir="$PLAN_DIR" state list -state="$STATE_DIR/cluster.tfstate")
   test "$STATE_RESOURCES" = kind_cluster.pilot
   STATE_NAME_MATCH=$(tofu -chdir="$PLAN_DIR" console -no-color -state="$STATE_DIR/cluster.tfstate" \
     <<< "kind_cluster.pilot.name == var.cluster_name && var.cluster_name == \"$CLUSTER\"")

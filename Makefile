@@ -1,7 +1,7 @@
 UV_RUN := uv run --locked --offline
 TOFU ?= tofu
 
-.PHONY: help bootstrap doctor fmt fmt-check docs docs-check check test configuration-check workflows-asset-check delegated-argo-asset-check network-asset-check database-asset-check metrics-check iac-pilot-check pr-event-check verify supply-chain validate
+.PHONY: help bootstrap doctor fmt fmt-check docs docs-check check test configuration-check workflows-asset-check delegated-argo-asset-check network-asset-check database-asset-check metrics-check iac-pilot-check kind-plan-check pr-event-check verify supply-chain validate
 
 help:
 	@echo k8s-infrastructure engineering command surface
@@ -19,6 +19,7 @@ help:
 	@echo "  make database-asset-check  Verify pinned CNPG, Barman, cert-manager and kind storage assets"
 	@echo "  make metrics-check  Strictly lint/render the verified-TLS resource metrics chart"
 	@echo "  make iac-pilot-check  Format-check, validate and test the initialized kind module offline"
+	@echo "  make kind-plan-check  Exercise local kind planning offline with the supplied KIND_TEST_JUST"
 	@echo "  make pr-event-check  Validate issue linkage in the GitHub PR event"
 	@echo "  make verify     Run all offline repository-local checks"
 	@echo "  make supply-chain  Check the lock and known vulnerabilities"
@@ -73,6 +74,10 @@ iac-pilot-check:
 	$(TOFU) -chdir=clusters/local-kind/iac-pilot fmt -check -recursive
 	$(TOFU) -chdir=clusters/local-kind/iac-pilot validate
 	$(TOFU) -chdir=clusters/local-kind/iac-pilot test
+
+kind-plan-check:
+	@test -n "$$KIND_TEST_JUST" || { echo 'Set KIND_TEST_JUST to the absolute path to the pinned just binary.' >&2; exit 1; }
+	python3 -m unittest discover -s tests -p 'test_kind_just.py' -v
 
 pr-event-check:
 	$(UV_RUN) python -m scripts.repository_policy --pr-event
