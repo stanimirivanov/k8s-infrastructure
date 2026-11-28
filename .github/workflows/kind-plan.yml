@@ -56,7 +56,7 @@ jobs:
           tar -xzf "$archive" just
           "$tools/just" --version
           printf 'KIND_TEST_JUST=%s/just\n' "$tools" >> "$GITHUB_ENV"
-      - name: Exercise registered planning and reviewed legacy fixtures without cluster access
+      - name: Exercise registered lifecycle and reviewed legacy fixtures without cluster access
         env:
           KIND_TEST_LEGACY_JUSTFILE: ${{ github.workspace }}/.local/kind-plan-legacy/justfile
         run: make kind-plan-check
