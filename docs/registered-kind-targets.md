@@ -1,4 +1,4 @@
-# Register and plan a kind target
+# Operate a registered kind target
 
 ## TL;DR
 
@@ -6,8 +6,11 @@
   reviewed infrastructure pin.
 - Operations uses a private registry shared by all kind targets on the Docker
   daemon. Register the target before making a plan.
-- Save a private create plan from the selected clean environment checkout.
-  Both entry points save the same snapshot and review files.
+- Save a private creation plan from the selected clean environment checkout. Obtain
+  separate approval for its exact absolute path and SHA-256 before applying it.
+- Use `verify` to finish identity registration, check baseline readiness, and
+  record a zero-change repeat plan after OpenTofu confirms apply. Both entry
+  points accept the same plans and receipts.
 - Use the [reviewed legacy revision](https://github.com/stanimirivanov/k8s-infrastructure/tree/86ddee734de4903136459f7c6369d3610c1f7242)
   and its [runbook](https://github.com/stanimirivanov/k8s-infrastructure/blob/86ddee734de4903136459f7c6369d3610c1f7242/docs/local-kind-opentofu.md)
   for existing targets until their individual cutovers are reviewed.
@@ -38,14 +41,14 @@ settings are the cluster name and whether the environment declares the target
 disposable. Use a lowercase cluster name of at most 49 characters, beginning
 with a letter and ending with a letter or digit.
 
-Both commands require a pin whose baseline root uses `main.tf` and the
+This procedure requires a pin whose baseline root uses `main.tf` and the
 dependency lock. A pin with additional root OpenTofu or Terraform
 configuration, including overrides and automatically loaded variable files,
 requires a reviewed profile change.
 
 ## Reserve the target
 
-On the Operations host, use Bash, Git, Docker, jq, and GNU coreutils and flock.
+On the Operations host, use Bash, Git, Docker, jq, GNU coreutils, and flock.
 Prepare an absolute, canonical directory with mode `0700` and export its path
 as `KIND_REGISTRATIONS`. All kind targets sharing a Docker daemon must use
 this one Operations-owned registry. Choose an explicit lowercase
@@ -91,9 +94,12 @@ filesystem mirror](kind-iac-rehearsal.md#setup). Export `KIND_PROVIDER_MIRROR`
 as the canonical absolute path to the mirror directory. Each attempt writes a
 private CLI configuration that installs only the locked kind provider from
 that mirror. The target lock stays held while the procedure checks the
-registration, verifies the daemon and vacancy, stages the inputs, and saves
-the plan. Vacancy covers the exact kind cluster label and the two baseline
-container names, `<cluster>-control-plane` and `<cluster>-worker`.
+registration, verifies the daemon, stages the inputs, and saves the plan.
+Creation requires a reservation without a UID and vacancy of the registered
+state, kubeconfig, backend sidecars, exact kind cluster label, and both baseline
+container names. Once a UID is registered, use `verify` with the applied plan.
+OpenTofu embeds prior state in a saved plan, and the kind state holds kubeconfig
+credentials. Verification runs a repeat plan without writing a saved plan.
 
 ```bash
 just plan stargazer/sandbox "$ENVIRONMENT"
@@ -116,6 +122,52 @@ failed attempt once diagnosis is complete. Retain only the required non-secret
 review or diagnostic evidence in Operations storage and keep plan contents out
 of Git and shared logs.
 
+## Apply the exact approved plan and verify readiness
+
+The approver reviews `REVIEW.md` and `plan.txt` and approves the absolute
+`saved.tfplan` path and its SHA-256. Capture the approver name and UTC time
+from the approval record. Set `PLAN`, `PLAN_SHA256`, `APPROVER`, and
+`APPROVAL_UTC` to those values. Use the pinned kind and kubectl tools from the
+[rehearsal setup](kind-iac-rehearsal.md#setup) and install `unzip` for inspecting
+the saved plan archive.
+
+```bash
+just apply stargazer/sandbox "$PLAN" "$PLAN_SHA256" "$APPROVER" "$APPROVAL_UTC"
+```
+
+The apply procedure holds the target lock while checking the plan bytes,
+reviewed commit snapshots, registration, daemon, and state paths. It checks
+the plan archive's embedded module and provider lock against the reviewed
+provider snapshot. The approved plan must use the locked provider with the
+registered Docker socket and a loopback API endpoint. The pinned OpenTofu
+1.13.10 `graph` command checks the saved plan against the current backend
+state. The procedure reads the native JSON trace in memory and matches the
+exact read, write, and backup paths. It checks the daemon and target vacancy
+after that graph check, before recording the apply attempt. OpenTofu receives
+the exact state paths explicitly and uses a fresh private directory for its
+scratch kubeconfig. Plans from the initial registered-target planning procedure
+remain compatible. The original reviewed commits must still be available in
+the local checkouts. Resumed verification checks the state digest in the
+successful apply receipt.
+
+After OpenTofu confirms success, the procedure checks that the exact context,
+loopback API endpoint, and CA in the Docker-derived kubeconfig match state.
+It then installs the private kubeconfig and reads the live `kube-system` UID
+through the dedicated path and context. First creation adds that UID to the
+registration under the registry lock. Verification requires the registered UID
+before and after the repeat plan.
+
+Verification waits for the expected nodes to become Ready and checks that a
+refreshed OpenTofu repeat plan reports zero changes. It then records a fresh
+node inventory that matches the names and role labels from the saved plan
+and shows each expected node as Ready. The separately approved live
+qualification covers DNS and PVC read/write. If the identity or verification
+phase stops after a confirmed apply, use the same plan.
+
+```bash
+just verify stargazer/sandbox "$PLAN"
+```
+
 ## Run with native commands
 
 Use the same prerequisites, candidate, and paths. Start a Bash shell and
@@ -129,8 +181,18 @@ set -- "$PROVIDER_CHECKOUT" register stargazer/sandbox "$ENVIRONMENT" "$CANDIDAT
 ```
 
 ```bash
-# Save a plan after reservation.
+# Save a plan for the registered target.
 set -- "$PROVIDER_CHECKOUT" plan stargazer/sandbox "$ENVIRONMENT"
+```
+
+```bash
+# Apply the exact separately approved plan.
+set -- "$PROVIDER_CHECKOUT" apply stargazer/sandbox "$PLAN" "$PLAN_SHA256" "$APPROVER" "$APPROVAL_UTC"
+```
+
+```bash
+# Resume verification after a confirmed apply.
+set -- "$PROVIDER_CHECKOUT" verify stargazer/sandbox "$PLAN"
 ```
 
 Run the complete block below after setting arguments for one task. The
@@ -141,6 +203,7 @@ subshell releases both types of lock when the task exits.
 (
   set -euo pipefail
   umask 077
+  unset RUNTIME EXPORTED_CONFIG TRACE_PLAN_BACKEND
 
   refuse() { printf '%s\n' "$1" >&2; exit 1; }
   digest() { sha256sum | cut -d ' ' -f 1; }
@@ -227,7 +290,9 @@ subshell releases both types of lock when the task exits.
     row=$(read_record "$file")
     jq -e --arg target "$key" '
       def text: strings | length > 0 and (test("[[:cntrl:]]") | not);
-      keys == ["clusterName", "context", "daemonId", "declaration", "dockerHost", "environment", "kubeconfig", "lock", "schemaVersion", "state", "target"]
+      (del(.kubeSystemUid) | keys == ["clusterName", "context", "daemonId", "declaration", "dockerHost",
+        "environment", "kubeconfig", "lock", "schemaVersion", "state", "target"])
+      and (if has("kubeSystemUid") then (.kubeSystemUid | strings | test("^[a-zA-Z0-9][a-zA-Z0-9-]*$")) else true end)
       and .schemaVersion == 1 and .target == $target
       and (.clusterName | strings | test("^[a-z]([a-z0-9-]{0,47}[a-z0-9])?$"))
       and .context == ("kind-" + .clusterName)
@@ -243,22 +308,354 @@ subshell releases both types of lock when the task exits.
     printf '%s\n' "$row"
   }
 
-  [[ $# -ge 4 ]] || refuse 'Select register TARGET ENVIRONMENT CANDIDATE or plan TARGET ENVIRONMENT.'
+  path_exists() { [[ -e "$1" || -L "$1" ]]; }
+  lock_registry() {
+    local directory_lock="$REGISTRY/.registry.lock"
+    if path_exists "$directory_lock"; then private_file "$directory_lock"; fi
+    exec 8>>"$directory_lock"
+    flock -w 15 8 || refuse 'The registration directory lock is busy.'
+  }
+  check_daemon() {
+    [[ "$(observe_daemon "$DOCKER_HOST")" == "$DAEMON" ]] ||
+      refuse 'Docker daemon ID differs from the registration.'
+  }
+  check_vacancy() {
+    local path containers filter
+    while IFS= read -r path; do
+      [[ "$path" == "$LOCK" ]] || ! path_exists "$path" ||
+        refuse 'A create plan requires vacant state, kubeconfig and backend sidecar paths.'
+    done <<< "$(record_paths "$INPUT")"
+    for filter in "label=io.x-k8s.kind.cluster=$CLUSTER" "name=^/$CLUSTER-(control-plane|worker)$"; do
+      containers=$(timeout --kill-after=5s 15s docker --host "$DOCKER_HOST" ps -a \
+        --filter "$filter" --format '{{.Names}}')
+      [[ -z "$containers" ]] || refuse 'The reserved kind name is already in use.'
+    done
+  }
+  run_tofu() {
+    local deadline=$1
+    shift
+    local -a logging=()
+    if [[ ${TRACE_PLAN_BACKEND:-} == yes ]]; then logging=(TF_LOG=JSON TF_LOG_PROVIDER=OFF); fi
+    # Use kind's single default kubeconfig path in the new private runtime or plan directory.
+    timeout --verbose --kill-after=5s "$deadline" env -i PATH="$PATH" HOME="${RUNTIME:-$PLAN_DIR}" \
+      DOCKER_HOST="$DOCKER_HOST" KIND_EXPERIMENTAL_PROVIDER=docker TF_CLI_CONFIG_FILE="$TOFU_CONFIG" \
+      TF_DATA_DIR="${RUNTIME:-$PLAN_DIR/.terraform}" TF_WORKSPACE=default CHECKPOINT_DISABLE=1 \
+      "${logging[@]}" tofu -chdir="$PLAN_DIR" "$@"
+  }
+  check_plan_shape() {
+    run_tofu 60s show -json "$PLAN" |
+      jq -ce --arg cluster "$CLUSTER" --arg binding "$BINDING_SHA256" --arg provider "$PROVIDER_ADDRESS" '
+        select(.variables.cluster_name.value == $cluster and .variables.plan_binding_sha256.value == $binding)
+        | select(.configuration.provider_config ==
+            {kind: {name: "kind", full_name: $provider, version_constraint: "0.0.4"}})
+        | select(any(.configuration.root_module.resources[]?;
+            .address == "kind_cluster.baseline" and .provider_config_key == "kind"))
+        | select((.resource_drift // []) == [] and (.deferred_changes // []) == [])
+        | .resource_changes | select(type == "array" and length == 1) | .[0]
+        | select(.address == "kind_cluster.baseline" and .mode == "managed" and .provider_name == $provider
+          and .previous_address == null and .deposed == null and .change.importing == null
+          and .change.after.name == $cluster
+          and .change.after.networking.api_server_address == "127.0.0.1"
+          and .change.actions == ["create"])
+        | .change.after.node
+        | select(map(.role) == ["control-plane", "worker"])
+        | map({name: ($cluster + "-" + .role), role: .role,
+               labels: ((.labels // {}) + (if .role == "control-plane"
+                 then {"node-role.kubernetes.io/control-plane": ""} else {} end))})
+    '
+  }
+  check_backend() {
+    # OpenTofu 1.13.10 graph checks the embedded plan backend and state freshness read-only.
+    local trace backend
+    backend=$(printf 'backend/local: state manager for workspace "default" will:\n - read initial snapshot from %s\n - write new snapshots to %s\n - create any backup at %s.backup' \
+      "$STATE" "$STATE" "$STATE")
+    trace=$(TRACE_PLAN_BACKEND=yes run_tofu 60s graph -no-color -plan="$PLAN" 2>&1 >/dev/null) ||
+      refuse 'OpenTofu could not validate the saved backend and state. Check for a stale plan.'
+    jq -eRn --arg backend "$backend" '
+      [inputs | fromjson? | select(."@level" == "trace") | ."@message"] as $messages
+      | ($messages | index("Meta.BackendForLocalPlan: instantiated backend of type *local.Local")) != null
+        and ($messages | index($backend)) != null
+    ' <<< "$trace" >/dev/null || refuse 'The saved plan backend differs from the registered local state.'
+  }
+  check_snapshot() {
+    local path file
+    for file in declaration.json provider-pin.json registration.json binding.json main.tf \
+      .terraform.lock.hcl target.auto.tfvars.json opentofu.tfrc; do
+      private_file "$PLAN_DIR/$file"
+    done
+    [[ "$(digest < "$PLAN_DIR/declaration.json")" == "$(jq -r .declarationSha256 <<< "$BINDING")" &&
+       "$(digest < "$PLAN_DIR/provider-pin.json")" == "$(jq -r .providerPinSha256 <<< "$BINDING")" &&
+       "$(digest < "$PLAN_DIR/registration.json")" == "$(jq -r .registrationSha256 <<< "$BINDING")" ]] ||
+      refuse 'The saved registration or declaration snapshot differs from its binding.'
+    stage_blob "$ENVIRONMENT" "$ENV_REVISION" "$DECLARATION_PATH" | cmp -s - "$PLAN_DIR/declaration.json" &&
+      stage_blob "$ENVIRONMENT" "$ENV_REVISION" "$PIN_PATH" | cmp -s - "$PLAN_DIR/provider-pin.json" ||
+      refuse 'The saved declaration or provider pin differs from the reviewed environment commit.'
+    for file in "${PROFILE_FILES[@]}"; do
+      stage_blob "$PROVIDER" "$PROVIDER_REVISION" "$MODULE/$file" | cmp -s - "$PLAN_DIR/$file" ||
+        refuse 'The staged module differs from the reviewed provider commit.'
+    done
+    for path in "$PLAN_DIR"/* "$PLAN_DIR"/.[!.]*; do
+      case "${path##*/}" in
+        main.tf|target.auto.tfvars.json) ;;
+        *.tf|*.tf.json|*.tofu|*.tofu.json|terraform.tfvars|terraform.tfvars.json|*.auto.tfvars|*.auto.tfvars.json)
+          if path_exists "$path"; then refuse 'Unexpected configuration in the saved plan directory.'; fi ;;
+      esac
+    done
+    jq -e --arg cluster "$CLUSTER" --arg binding "$BINDING_SHA256" '
+      . == {cluster_name: $cluster, plan_binding_sha256: $binding}
+    ' "$PLAN_DIR/target.auto.tfvars.json" >/dev/null || refuse 'The staged inputs differ from the saved binding.'
+    local mirror
+    mirror=$(jq -er --arg provider "$PROVIDER_ADDRESS" '
+      .provider_installation[0].filesystem_mirror[0].path as $path
+      | select(. == {provider_installation: [{filesystem_mirror: [{path: $path, include: [$provider]}]}]})
+      | $path | strings
+    ' "$TOFU_CONFIG") || refuse 'The saved CLI configuration must install only the locked kind provider from its mirror.'
+    [[ -d "$mirror" && "$(realpath -e -- "$mirror")" == "$mirror" && "$mirror" != *[[:cntrl:]]* ]] ||
+      refuse 'The saved provider mirror is redirected or unavailable.'
+  }
+  check_digest() {
+    private_file "$PLAN"
+    private_file "$PLAN_DIR/SHA256SUMS"
+    [[ "$PLAN_SHA256" =~ ^[a-f0-9]{64}$ && "$(digest < "$PLAN")" == "$PLAN_SHA256" &&
+       "$(cat -- "$PLAN_DIR/SHA256SUMS")" == "$PLAN_SHA256  saved.tfplan" ]] ||
+      refuse 'The saved plan SHA-256 does not match the exact approved file.'
+  }
+  read_plan_archive() {
+    timeout --kill-after=5s 15s env -i PATH="$PATH" unzip "$@"
+  }
+  check_plan_archive() {
+    # OpenTofu 1.13.10 embeds the configuration and serializes its dependency lock.
+    local members expected
+    expected=$(printf '%s\n' .terraform.lock.hcl tfconfig/m-/main.tf tfconfig/modules.json tfplan tfschemas tfstate tfstate-prev)
+    members=$(read_plan_archive -Z1 -- "$PLAN" | LC_ALL=C sort)
+    [[ "$members" == "$expected" ]] || refuse 'The saved plan archive has unexpected or duplicate members.'
+    read_plan_archive -p -- "$PLAN" tfconfig/m-/main.tf | cmp -s - "$PLAN_DIR/main.tf" ||
+      refuse 'The embedded module differs from the staged and reviewed provider module.'
+    read_plan_archive -p -- "$PLAN" tfconfig/modules.json |
+      jq -es '. == [[{Key: "", Dir: "."}]]' >/dev/null ||
+      refuse 'The saved plan archive does not contain a single root module.'
+    read_plan_archive -p -- "$PLAN" .terraform.lock.hcl |
+      cmp -s - <(sed '1s/by "terraform init"/by "tofu init"/' "$PLAN_DIR/.terraform.lock.hcl") ||
+      refuse 'The embedded dependency lock differs from the reviewed provider lock.'
+  }
+  write_record() {
+    local file=$1 contents=$2 temporary
+    [[ -n "$contents" ]] || refuse 'Could not prepare the private operation record.'
+    temporary=$(mktemp "${file%/*}/.record.XXXXXX")
+    printf '%s\n' "$contents" > "$temporary"
+    mv -T -- "$temporary" "$file"
+    sync -f -- "$file"
+  }
+  operation_record() {
+    jq -nS --arg target "$TARGET" --arg plan "$PLAN" --arg digest "$PLAN_SHA256" \
+      --arg binding "$BINDING_SHA256" --arg daemon "$DAEMON" --arg state "$STATE" '
+      {schemaVersion: 1, target: $target, plan: $plan, planSha256: $digest,
+        bindingSha256: $binding, daemonId: $daemon, state: $state}'
+  }
+  evidence() {
+    private_file "$1"
+    read_record "$1"
+  }
+  may_write_log() {
+    if path_exists "$1"; then private_file "$1"; fi
+  }
+  run_kubectl() {
+    local deadline=$1 config=$2
+    shift 2
+    timeout --kill-after=5s "$deadline" env -i PATH="$PATH" HOME="$RUNTIME" \
+      kubectl --kubeconfig "$config" --context "$CONTEXT" "$@"
+  }
+  config_identity() {
+    run_kubectl 15s "$1" config view --minify --raw -o json 2>/dev/null |
+      jq -ce --arg context "$CONTEXT" '
+        select(.contexts | length == 1 and .[0].name == $context)
+        | .contexts[0].context as $selected
+        | select(.clusters | length == 1 and .[0].name == $selected.cluster)
+        | select(.users | length == 1 and .[0].name == $selected.user
+            and (.[0].user | keys == ["client-certificate-data", "client-key-data"]))
+        | .clusters[0].cluster
+        | select(.server | strings | test("^https://127\\.0\\.0\\.1:[0-9]+$"))
+        | select(."certificate-authority-data" | strings | test("^[A-Za-z0-9+/]+={0,2}$"))
+        | select((."insecure-skip-tls-verify" // false) == false and ."proxy-url" == null
+                 and ."tls-server-name" == null and ."certificate-authority" == null)
+        | {server, ca: ."certificate-authority-data"}
+      '
+  }
+  state_attributes() {
+    private_file "$STATE"
+    jq -ce --arg cluster "$CLUSTER" --arg provider "provider[\"$PROVIDER_ADDRESS\"]" '
+      select(.resources | type == "array" and length == 1) | .resources[0]
+      | select(.mode == "managed" and .type == "kind_cluster" and .name == "baseline"
+               and .module == null and .provider == $provider and (.instances | length == 1))
+      | .instances[0] | select(.index_key == null and .deposed == null and .attributes.name == $cluster)
+      | .attributes | select(.kubeconfig | strings | length > 0)
+    ' "$STATE" || refuse 'The registered state must contain only the expected baseline kind cluster.'
+  }
+  check_config() {
+    local attributes=$1 config=$2 state_config dedicated endpoint
+    endpoint=$(jq -er '.endpoint | strings' <<< "$attributes")
+    state_config=$(jq -er .kubeconfig <<< "$attributes" | config_identity /dev/stdin) &&
+      dedicated=$(config_identity "$config") &&
+      [[ "$state_config" == "$dedicated" && "$(jq -r .server <<< "$dedicated")" == "$endpoint" ]] ||
+      refuse 'The dedicated kubeconfig context, endpoint or CA differs from the registered state.'
+  }
+  live_uid() {
+    local uid
+    uid=$(run_kubectl 15s "$KUBECONFIG_PATH" --request-timeout=10s \
+      get namespace kube-system -o 'jsonpath={.metadata.uid}') || refuse 'Could not read the live kube-system UID.'
+    [[ "$uid" =~ ^[a-zA-Z0-9][a-zA-Z0-9-]*$ ]] || refuse 'The live kube-system UID is invalid.'
+    printf '%s\n' "$uid"
+  }
+  check_uid() {
+    [[ "$(live_uid)" == "$EXPECTED_UID" ]] || refuse 'The live kube-system UID differs from the registration.'
+  }
+  record_identity() {
+    local attributes uid observation recorded
+    check_daemon
+    attributes=$(state_attributes)
+    if ! path_exists "$KUBECONFIG_PATH"; then
+      [[ -z "$EXPECTED_UID" && ! -e "$PLAN_DIR/identity-observed.json" ]] ||
+        refuse 'The registered kubeconfig is missing.'
+      EXPORTED_CONFIG=$(mktemp "${KUBECONFIG_PATH%/*}/.kind-config.XXXXXX")
+      timeout --kill-after=5s 30s env -i PATH="$PATH" HOME="$RUNTIME" DOCKER_HOST="$DOCKER_HOST" \
+        KIND_EXPERIMENTAL_PROVIDER=docker kind get kubeconfig --name "$CLUSTER" > "$EXPORTED_CONFIG"
+      check_config "$attributes" "$EXPORTED_CONFIG"
+      mv -T -- "$EXPORTED_CONFIG" "$KUBECONFIG_PATH"
+      EXPORTED_CONFIG=''
+      sync -f -- "$KUBECONFIG_PATH"
+    fi
+    private_file "$KUBECONFIG_PATH"
+    check_config "$attributes" "$KUBECONFIG_PATH"
+    uid=$(live_uid)
+    [[ -z "$EXPECTED_UID" || "$EXPECTED_UID" == "$uid" ]] ||
+      refuse 'The live kube-system UID differs from the registration.'
+    observation=$(jq -cS --arg uid "$uid" '. + {kubeSystemUid: $uid}' <<< "$APPLIED")
+    if path_exists "$PLAN_DIR/identity-observed.json"; then
+      recorded=$(evidence "$PLAN_DIR/identity-observed.json")
+      [[ "$(jq -cS . <<< "$recorded")" == "$observation" ]] ||
+        refuse 'The observed live identity differs from the original apply evidence.'
+    else
+      [[ -z "$EXPECTED_UID" ]] || refuse 'The original UID observation is missing.'
+      write_record "$PLAN_DIR/identity-observed.json" "$observation"
+    fi
+    if [[ -z "$EXPECTED_UID" ]]; then
+      (
+        lock_registry
+        [[ "$(load_registration "$REGISTRATION" "$TARGET")" == "$INPUT" ]] ||
+          refuse 'The registration changed before the live UID could be recorded.'
+        write_record "$REGISTRATION" "$(jq -cS --arg uid "$uid" '. + {kubeSystemUid: $uid}' <<< "$INPUT")"
+      )
+    fi
+    EXPECTED_UID=$uid
+  }
+  verify_plan() {
+    local file nodes observed attributes rc
+    local -a expected=()
+    for file in verify.log nodes.json repeat.log verified.json; do may_write_log "$PLAN_DIR/$file"; done
+    mapfile -t expected < <(jq -r '.[] | "node/" + .name' <<< "$TOPOLOGY")
+    run_kubectl 100s "$KUBECONFIG_PATH" --request-timeout=90s wait --for=condition=Ready --timeout=90s \
+      "${expected[@]}" >> "$PLAN_DIR/verify.log" 2>&1 || refuse 'The required baseline nodes did not become Ready.'
+    check_snapshot
+    if run_tofu 180s plan -no-color -input=false -lock-timeout=30s -state="$STATE" -detailed-exitcode \
+      >> "$PLAN_DIR/repeat.log" 2>&1; then
+      check_daemon
+      attributes=$(state_attributes)
+      [[ "$(digest < "$STATE")" == "$(jq -r .stateSha256 <<< "$APPLIED")" ]] ||
+        refuse 'The registered state changed after the completed apply.'
+      check_config "$attributes" "$KUBECONFIG_PATH"
+      check_uid
+      observed=$(run_kubectl 15s "$KUBECONFIG_PATH" --request-timeout=10s get nodes -o json 2>> "$PLAN_DIR/verify.log")
+      nodes=$(jq -ce --argjson expected "$TOPOLOGY" '
+        [.items[] | {name: .metadata.name, labels: .metadata.labels,
+          ready: any(.status.conditions[]?; .type == "Ready" and .status == "True")}]
+        | select((map(.name) | sort) == ($expected | map(.name) | sort))
+        | select(. as $nodes | all($expected[]; . as $node |
+          any($nodes[]; .name == $node.name and .ready and
+            (.labels as $labels | all($node.labels | to_entries[]; $labels[.key] == .value)) and
+            ($node.role == "control-plane" or (.labels | has("node-role.kubernetes.io/control-plane") | not)))))
+      ' <<< "$observed") || refuse 'Unexpected baseline node inventory, role placement, or readiness.'
+      write_record "$PLAN_DIR/nodes.json" "$nodes"
+      write_record "$PLAN_DIR/verified.json" "$(jq -cS --arg uid "$EXPECTED_UID" \
+        '. + {kubeSystemUid: $uid, repeatPlanExit: 0}' <<< "$APPLIED")"
+      if path_exists "$PENDING"; then rm -- "$PENDING"; sync -f -- "$PLAN_ROOT"; fi
+      printf '%s\n' 'Repeat plan reports zero changes.' | tee -a "$PLAN_DIR/verify.log"
+    else
+      rc=$?
+      printf 'Repeat plan exited %s (2 means changes, 1 means error). See repeat.log.\n' "$rc" >&2
+      exit "$rc"
+    fi
+  }
+  apply_or_resume() {
+    local attempts applied state_sha
+    local attempted_file="$PLAN_DIR/apply-attempted.json" applied_file="$PLAN_DIR/applied.json"
+    if [[ "$OPERATION" == apply ]]; then
+      [[ "$APPROVER" =~ [^[:space:]] && "$APPROVER" != *[[:cntrl:]]* ]] ||
+        refuse 'Use a single-line approver name from the approval record.'
+      [[ "$APPROVAL_UTC" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ &&
+         "$(date -u -d "$APPROVAL_UTC" +%Y-%m-%dT%H:%M:%SZ)" == "$APPROVAL_UTC" ]] ||
+        refuse 'Use the UTC approval time in YYYY-MM-DDTHH:MM:SSZ form.'
+      [[ ! -e "$attempted_file" && ! -L "$attempted_file" && ! -e "$applied_file" && ! -L "$applied_file" ]] &&
+        ! path_exists "$PENDING" && ! path_exists "$PLAN_DIR/apply.log" ||
+        refuse 'An apply was already attempted. Resume verification or use explicit Operations recovery.'
+      check_backend
+      check_daemon
+      check_digest
+      check_vacancy
+      attempts=$(operation_record | jq -cS --arg approver "$APPROVER" --arg time "$APPROVAL_UTC" \
+        '. + {approver: $approver, approvalUtc: $time}')
+      write_record "$PENDING" "$attempts"
+      write_record "$attempted_file" "$attempts"
+      check_digest
+      run_tofu 300s apply -no-color -input=false -lock-timeout=30s \
+        -state="$STATE" -state-out="$STATE" -backup="$STATE.backup" "$PLAN" \
+        > "$PLAN_DIR/apply.log" 2>&1 || refuse 'OpenTofu apply did not confirm success. Use explicit Operations recovery.'
+      private_file "$STATE"
+      state_sha=$(digest < "$STATE")
+      write_record "$applied_file" "$(jq -cS --arg state_sha "$state_sha" '. + {stateSha256: $state_sha}' <<< "$attempts")"
+    fi
+    path_exists "$applied_file" || refuse 'There is no confirmed apply. Inspect the attempt and use explicit Operations recovery.'
+    attempts=$(evidence "$attempted_file")
+    applied=$(evidence "$applied_file")
+    [[ "$(jq -cS 'del(.approver, .approvalUtc)' <<< "$attempts")" == "$(operation_record | jq -cS .)" &&
+       "$(jq -cS 'del(.stateSha256)' <<< "$applied")" == "$(jq -cS . <<< "$attempts")" ]] ||
+      refuse 'The apply evidence differs from the exact saved plan and target.'
+    if path_exists "$PENDING"; then
+      [[ "$(evidence "$PENDING" | jq -cS .)" == "$(jq -cS . <<< "$attempts")" ]] ||
+        refuse 'Another apply is pending for this registered target.'
+    else
+      evidence "$PLAN_DIR/verified.json" >/dev/null
+    fi
+    private_file "$STATE"
+    [[ "$(digest < "$STATE")" == "$(jq -r .stateSha256 <<< "$applied")" ]] ||
+      refuse 'The registered state changed after the completed apply.'
+    APPLIED=$applied
+    record_identity
+    verify_plan
+  }
+  clean_runtime() {
+    local status=$?
+    if [[ -n "${RUNTIME:-}" ]]; then rm -rf -- "$RUNTIME"; fi
+    if [[ -n "${EXPORTED_CONFIG:-}" ]]; then rm -f -- "$EXPORTED_CONFIG"; fi
+    if (( status != 0 )); then printf 'Operation stopped. Private evidence is in %s\n' "$PLAN_DIR" >&2; fi
+  }
+
+  USAGE='Select register TARGET ENVIRONMENT CANDIDATE, plan TARGET ENVIRONMENT, apply TARGET PLAN SHA256 APPROVER APPROVAL_UTC, or verify TARGET PLAN.'
+  [[ $# -ge 4 ]] || refuse "$USAGE"
   PROVIDER=$(realpath -e -- "$1")
   [[ "$(git_at "$PROVIDER" rev-parse --show-toplevel)" == "$PROVIDER" ]] ||
     refuse 'Select the provider checkout root.'
   OPERATION=$2
   TARGET=$3
-  ENVIRONMENT=$(realpath -e -- "$4")
   [[ "$TARGET" =~ ^[a-z0-9]+(-[a-z0-9]+)*/[a-z0-9]+(-[a-z0-9]+)*$ ]] ||
     refuse 'Select an explicit owner/target key.'
   REGISTRY=${KIND_REGISTRATIONS:?Set KIND_REGISTRATIONS to the Operations registry}
   private_dir "$REGISTRY"
-  outside_checkouts "$REGISTRY"
   OWNER=${TARGET%/*}
   REGISTRATION="$REGISTRY/$TARGET.json"
   case "$OPERATION:$#" in
     register:5)
+      ENVIRONMENT=$(realpath -e -- "$4")
+      outside_checkouts "$REGISTRY"
       private_file "$5"
       CANDIDATE=$(canonical_private_path "$5")
       INPUT=$(read_record "$CANDIDATE")
@@ -271,20 +668,32 @@ subshell releases both types of lock when the task exits.
       LOCK=$(canonical_private_path "$(jq -r .lock <<< "$INPUT")")
       KUBECONFIG_PATH=$(canonical_private_path "$(jq -r .kubeconfig <<< "$INPUT")")
       ;;
-    plan:4)
+    plan:4|apply:7|verify:4)
       [[ -e "$REGISTRATION" || -L "$REGISTRATION" ]] || refuse 'No registration exists for this target.'
       private_dir "$REGISTRY/$OWNER"
+      private_file "$REGISTRATION"
+      ENVIRONMENT=$(jq -er '.environment | strings' "$REGISTRATION")
+      [[ -d "$ENVIRONMENT" && "$(realpath -e -- "$ENVIRONMENT")" == "$ENVIRONMENT" && "$ENVIRONMENT" != / ]] ||
+        refuse 'The registered environment checkout path is unavailable or redirected.'
+      outside_checkouts "$REGISTRY"
       INPUT=$(load_registration "$REGISTRATION" "$TARGET")
-      [[ "$(jq -r .environment <<< "$INPUT")" == "$ENVIRONMENT" ]] ||
+      if [[ "$OPERATION" == plan && "$(realpath -e -- "$4")" != "$ENVIRONMENT" ]]; then
         refuse 'Use the environment checkout originally selected for this registration.'
+      fi
       LOCK=$(jq -r .lock <<< "$INPUT")
       exec 9>>"$LOCK"
       flock -w 15 9 || refuse 'The target lock is busy.'
       [[ "$(load_registration "$REGISTRATION" "$TARGET")" == "$INPUT" ]] ||
         refuse 'The registration changed while acquiring the target lock.'
       STATE=$(jq -r .state <<< "$INPUT")
+      KUBECONFIG_PATH=$(jq -r .kubeconfig <<< "$INPUT")
+      CONTEXT=$(jq -r .context <<< "$INPUT")
+      EXPECTED_UID=$(jq -r '.kubeSystemUid // empty' <<< "$INPUT")
+      if [[ "$OPERATION" != verify && -n "$EXPECTED_UID" ]]; then
+        refuse 'The reserved cluster already has a registered UID. Use verify with its applied plan.'
+      fi
       ;;
-    *) refuse 'Select register TARGET ENVIRONMENT CANDIDATE or plan TARGET ENVIRONMENT.' ;;
+    *) refuse "$USAGE" ;;
   esac
 
   DOCKER_HOST=$(jq -r .dockerHost <<< "$INPUT")
@@ -295,7 +704,46 @@ subshell releases both types of lock when the task exits.
     refuse 'Use an explicit local Unix Docker socket.'
   unset DOCKER_CONTEXT DOCKER_TLS DOCKER_TLS_VERIFY DOCKER_CERT_PATH
 
-  ENV_REVISION=$(clean_revision)
+  MODULE=clusters/local-kind/kind-baseline
+  PROFILE_FILES=(main.tf .terraform.lock.hcl)
+  PROVIDER_ADDRESS=registry.terraform.io/elioseverojunior/kind
+  PLAN_ROOT="$REGISTRY/.plans/$TARGET"
+  PENDING="$PLAN_ROOT/active-apply.json"
+  if [[ "$OPERATION" == apply || "$OPERATION" == verify ]]; then
+    PLAN=$4
+    PLAN_DIR=${PLAN%/*}
+    [[ "$PLAN" == "$PLAN_ROOT/plan."*/saved.tfplan && "${PLAN_DIR%/*}" == "$PLAN_ROOT" ]] ||
+      refuse 'The absolute saved plan path must belong to the selected registered target.'
+    for directory in "$REGISTRY/.plans" "$REGISTRY/.plans/$OWNER" "$PLAN_ROOT" "$PLAN_DIR"; do private_dir "$directory"; done
+    private_file "$PLAN_DIR/REVIEW.md"
+    private_file "$PLAN_DIR/binding.json"
+    BINDING=$(read_record "$PLAN_DIR/binding.json")
+    jq -e --arg target "$TARGET" '
+      def sha: strings | test("^[a-f0-9]{64}$");
+      def commit: strings | test("^([a-f0-9]{40}|[a-f0-9]{64})$");
+      keys == ["declarationSha256", "environmentRevision", "intent", "profile", "providerPinSha256",
+        "providerRevision", "registrationSha256", "schemaVersion", "target"]
+      and .schemaVersion == 1 and .target == $target and .profile == "kind-baseline"
+      and .intent == "create"
+      and (.environmentRevision | commit) and (.providerRevision | commit)
+      and ([.declarationSha256, .providerPinSha256, .registrationSha256] | all(.[]; sha))
+    ' <<< "$BINDING" >/dev/null || refuse 'The plan binding is invalid or differs from the registered target.'
+    BINDING_SHA256=$(digest < "$PLAN_DIR/binding.json")
+    ENV_REVISION=$(jq -r .environmentRevision <<< "$BINDING")
+    [[ "$(git_at "$ENVIRONMENT" rev-parse --show-toplevel)" == "$ENVIRONMENT" &&
+       "$(git_at "$ENVIRONMENT" rev-parse --verify "$ENV_REVISION^{commit}")" == "$ENV_REVISION" ]] ||
+      refuse 'The exact saved environment revision is unavailable.'
+    if [[ "$OPERATION" == apply ]]; then
+      PLAN_SHA256=$5 APPROVER=$6 APPROVAL_UTC=$7
+    else
+      path_exists "$PLAN_DIR/applied.json" || refuse 'There is no confirmed apply. Inspect the attempt and use explicit Operations recovery.'
+      PLAN_SHA256=$(evidence "$PLAN_DIR/applied.json" | jq -er .planSha256)
+    fi
+    check_digest
+    TOFU_CONFIG="$PLAN_DIR/opentofu.tfrc"
+  else
+    ENV_REVISION=$(clean_revision)
+  fi
   DECLARATION=$(stage_blob "$ENVIRONMENT" "$ENV_REVISION" "$DECLARATION_PATH")
   jq -es '
     length == 1 and (.[0] |
@@ -315,8 +763,6 @@ subshell releases both types of lock when the task exits.
     ' <<< "$PIN") || refuse 'The provider pin must select an exact k8s-infrastructure commit.'
   [[ "$(git_at "$PROVIDER" rev-parse --verify "$PROVIDER_REVISION^{commit}")" == "$PROVIDER_REVISION" ]] ||
     refuse 'The exact pinned provider commit is unavailable in this checkout.'
-  MODULE=clusters/local-kind/kind-baseline
-  PROFILE_FILES=(main.tf .terraform.lock.hcl)
   # Refuse pins whose deployed root would differ from the staged root.
   git_at "$PROVIDER" ls-tree -z --name-only "$PROVIDER_REVISION:$MODULE" |
     while IFS= read -r -d '' file; do
@@ -329,7 +775,9 @@ subshell releases both types of lock when the task exits.
   for file in "${PROFILE_FILES[@]}"; do
     stage_blob "$PROVIDER" "$PROVIDER_REVISION" "$MODULE/$file" >/dev/null
   done
-  [[ "$(clean_revision)" == "$ENV_REVISION" ]] || refuse 'The environment changed while staging its inputs.'
+  if [[ "$OPERATION" == register || "$OPERATION" == plan ]]; then
+    [[ "$(clean_revision)" == "$ENV_REVISION" ]] || refuse 'The environment changed while staging its inputs.'
+  fi
   DAEMON=$(observe_daemon "$DOCKER_HOST")
 
   if [[ "$OPERATION" == register ]]; then
@@ -341,10 +789,7 @@ subshell releases both types of lock when the task exits.
     PROPOSED_PATHS=$(record_paths "$PROPOSED")
     while IFS= read -r path; do canonical_private_path "$path" >/dev/null; done <<< "$PROPOSED_PATHS"
 
-    directory_lock="$REGISTRY/.registry.lock"
-    if [[ -e "$directory_lock" || -L "$directory_lock" ]]; then private_file "$directory_lock"; fi
-    exec 8>>"$directory_lock"
-    flock -w 15 8 || refuse 'The registration directory lock is busy.'
+    lock_registry
 
     shopt -s nullglob
     for owner_dir in "$REGISTRY"/*/; do
@@ -354,7 +799,7 @@ subshell releases both types of lock when the task exits.
         key=${file#"$REGISTRY/"}
         row=$(load_registration "$file" "${key%.json}")
         if [[ "$file" == "$REGISTRATION" ]]; then
-          [[ "$(jq -cS . <<< "$row")" == "$PROPOSED" ]] || refuse 'The target key already has a different registration.'
+          [[ "$(jq -cS 'del(.kubeSystemUid)' <<< "$row")" == "$PROPOSED" ]] || refuse 'The target key already has a different registration.'
           continue
         fi
         jq -e --arg daemon "$DAEMON" --arg cluster "$CLUSTER" \
@@ -381,16 +826,29 @@ subshell releases both types of lock when the task exits.
     refuse 'The declaration changes the reserved cluster name.'
   [[ "$DAEMON" == "$(jq -r .daemonId <<< "$INPUT")" ]] ||
     refuse 'Docker daemon ID differs from the registration.'
-  paths=$(record_paths "$INPUT")
-  while IFS= read -r path; do
-    [[ "$path" == "$LOCK" || ( ! -e "$path" && ! -L "$path" ) ]] ||
-      refuse 'A create plan requires vacant state, kubeconfig and backend sidecar paths.'
-  done <<< "$paths"
-  for filter in "label=io.x-k8s.kind.cluster=$CLUSTER" "name=^/$CLUSTER-(control-plane|worker)$"; do
-    containers=$(timeout --kill-after=5s 15s docker --host "$DOCKER_HOST" ps -a \
-      --filter "$filter" --format '{{.Names}}')
-    [[ -z "$containers" ]] || refuse 'The reserved kind name is already in use.'
-  done
+  if [[ "$OPERATION" == apply || "$OPERATION" == verify ]]; then
+    [[ "$(jq -r .providerRevision <<< "$BINDING")" == "$PROVIDER_REVISION" ]] ||
+      refuse 'The saved provider revision differs from the reviewed environment pin.'
+    check_snapshot
+    STAGED_REGISTRATION=$(load_registration "$PLAN_DIR/registration.json" "$TARGET")
+    [[ "$(jq -cS 'del(.kubeSystemUid)' <<< "$INPUT")" == "$(jq -cS . <<< "$STAGED_REGISTRATION")" ]] ||
+      refuse 'The current registration differs from the saved target binding or UID.'
+    check_plan_archive
+    RUNTIME=$(mktemp -d "$PLAN_DIR/.runtime.XXXXXX")
+    trap clean_runtime EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    may_write_log "$PLAN_DIR/operation-init.log"
+    # Reinstall using the reviewed lock and a fresh CLI data directory before using the plan.
+    run_tofu 120s init -no-color -input=false -get=false -lockfile=readonly -backend-config="path=$STATE" \
+      >> "$PLAN_DIR/operation-init.log" 2>&1
+    TOPOLOGY=$(check_plan_shape) || refuse 'OpenTofu did not save the expected bound baseline create plan.'
+    apply_or_resume
+    exit 0
+  fi
+
+  ! path_exists "$PENDING" || refuse 'An apply is pending. Resume verification or use explicit Operations recovery.'
+  check_vacancy
   MIRROR=${KIND_PROVIDER_MIRROR:?Set KIND_PROVIDER_MIRROR to the qualified local provider mirror}
   [[ -d "$MIRROR" && "$(realpath -e -- "$MIRROR")" == "$MIRROR" && "$MIRROR" != *[[:cntrl:]]* ]] ||
     refuse 'Use a canonical directory path for the local provider mirror.'
@@ -401,7 +859,6 @@ subshell releases both types of lock when the task exits.
   done
   PLAN_DIR=$(mktemp -d "$REGISTRY/.plans/$TARGET/plan.XXXXXX")
   trap 'if (( $? != 0 )); then printf "Planning stopped. Private diagnostics are in %s\n" "$PLAN_DIR" >&2; fi' EXIT
-  PROVIDER_ADDRESS=registry.terraform.io/elioseverojunior/kind
   TOFU_CONFIG="$PLAN_DIR/opentofu.tfrc"
   jq -n --arg mirror "$MIRROR" --arg provider "$PROVIDER_ADDRESS" \
     '{provider_installation: [{filesystem_mirror: [{path: $mirror, include: [$provider]}]}]}' > "$TOFU_CONFIG"
@@ -422,24 +879,10 @@ subshell releases both types of lock when the task exits.
   jq -n --arg name "$CLUSTER" --arg digest "$BINDING_SHA256" \
     '{cluster_name: $name, plan_binding_sha256: $digest}' > "$PLAN_DIR/target.auto.tfvars.json"
 
-  run_tofu() {
-    local deadline=$1
-    shift
-    timeout --verbose --kill-after=5s "$deadline" env -i PATH="$PATH" HOME="$PLAN_DIR" \
-      DOCKER_HOST="$DOCKER_HOST" KIND_EXPERIMENTAL_PROVIDER=docker TF_CLI_CONFIG_FILE="$TOFU_CONFIG" \
-      TF_WORKSPACE=default CHECKPOINT_DISABLE=1 KUBECONFIG="$PLAN_DIR/provider.kubeconfig" \
-      tofu -chdir="$PLAN_DIR" "$@"
-  }
   PLAN="$PLAN_DIR/saved.tfplan"
   run_tofu 120s init -no-color -input=false -get=false -lockfile=readonly -backend-config="path=$STATE" > "$PLAN_DIR/init.log" 2>&1
   run_tofu 180s plan -no-color -input=false -refresh=false -lock-timeout=30s -out="$PLAN" > "$PLAN_DIR/plan.log" 2>&1
-  run_tofu 60s show -json "$PLAN" 2>"$PLAN_DIR/show.log" |
-    jq -e --arg cluster "$CLUSTER" --arg binding "$BINDING_SHA256" --arg provider "$PROVIDER_ADDRESS" '
-      .variables.cluster_name.value == $cluster and .variables.plan_binding_sha256.value == $binding
-      and (.resource_changes | length == 1 and (.[0] |
-        .address == "kind_cluster.baseline" and .provider_name == $provider
-        and .change.actions == ["create"] and .change.after.name == $cluster))
-    ' >/dev/null || refuse 'OpenTofu did not save the expected bound baseline create plan.'
+  check_plan_shape >/dev/null 2>"$PLAN_DIR/show.log" || refuse 'The saved plan differs from the selected profile. See show.log.'
   run_tofu 60s show -no-color "$PLAN" > "$PLAN_DIR/plan.txt" 2>>"$PLAN_DIR/show.log"
   PLAN_SHA256=$(digest < "$PLAN")
   printf '%s  saved.tfplan\n' "$PLAN_SHA256" > "$PLAN_DIR/SHA256SUMS"
@@ -471,3 +914,20 @@ subshell releases both types of lock when the task exits.
   under its attempt directory. A completed review has `REVIEW.md`,
   `plan.txt`, `saved.tfplan`, and `SHA256SUMS`. After correcting the
   failure, run a fresh plan and use its own review and digest.
+
+- An apply attempt writes `active-apply.json` in the target's private plan
+  directory and `apply-attempted.json` in the selected `plan.*` attempt before
+  starting OpenTofu. If `applied.json` is absent, preserve those files along
+  with `apply.log`, state, and Docker inventory for explicit Operations
+  recovery. An error or interruption can leave partial infrastructure. Have
+  Operations establish the native outcome under the target lock and review
+  the next action. Retrying the same or another plan is blocked while the
+  outstanding attempt is unconfirmed.
+- If `applied.json` exists, `verify` can finish identity registration and retry
+  readiness and the repeat plan using the same saved snapshot. Review
+  `identity-observed.json`, `verify.log`, `nodes.json`, and `repeat.log` as
+  available. If state, daemon, kubeconfig endpoint, CA, or UID changed, preserve
+  the evidence and have Operations review the binding before proceeding.
+- `verified.json` records the exact approved plan and live UID after the
+  repeat plan succeeds and the final node inventory passes. The active apply
+  record is cleared after verification.
