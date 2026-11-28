@@ -28,7 +28,7 @@ operations and real kubelet/aggregation TLS acceptance remain separate from CI.
 | Toolchain | `make doctor` | Print Git, uv, Python, and Make versions. |
 | Inner loop | `make verify` | Formatting, repository policy, lint, types, unit tests, and local configuration checks. Uses installed dependencies offline. |
 | Kind substrate | `make iac-pilot-check` | OpenTofu formatting, validation and plan-only tests with the [locked provider staged offline](../kind-iac-rehearsal.md#setup). Runs in the PR validation job. |
-| Local kind recipes | `make kind-plan-check` | Exercises plan, apply and verification across native commands and recipes with offline fixtures in the dedicated hosted job. Set `KIND_TEST_JUST` to the absolute path of the [pinned just binary](../local-kind-opentofu.md#install-just-on-linux-amd64). |
+| Local kind recipes | `make kind-plan-check` | Exercises plan, apply, verification and Argo CD bootstrap across native commands and recipes in the dedicated hosted job using offline fixtures. Set `KIND_TEST_JUST` to the absolute path of the [pinned just binary](../local-kind-opentofu.md#install-just-on-linux-amd64). |
 | PR metadata | `make pr-event-check` | Reproduce the separate CI check against `GITHUB_EVENT_PATH`; no API calls. |
 | Supply chain | `make supply-chain` | Lock consistency and known vulnerability audit; current advisory data may need network access. |
 | Non-live acceptance | `make validate` | Aggregate inner loop and supply-chain checks. |

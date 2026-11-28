@@ -14,6 +14,8 @@ REPO = Path(__file__).resolve().parents[1]
 JUST = os.environ.get("KIND_TEST_JUST")
 MODULE = Path("clusters/local-kind/iac-pilot")
 RUNBOOK = Path("docs/local-kind-opentofu.md")
+OVERLAY = Path("clusters/local-kind/perfeng-local/addons/argocd")
+BOOTSTRAP_MANIFEST = b"apiVersion: v1\nkind: Namespace\nmetadata:\n  name: argocd\n"
 PROFILE_FILES = (
     "main.tf",
     ".terraform.lock.hcl",
@@ -135,6 +137,22 @@ exec "$FIXTURE_REAL_TIMEOUT" "$@"
 
 KUBECTL = """#!/bin/bash
 set -eu
+change_manifest() {
+  local manifest
+  manifest=$(cat -- "$FIXTURE_BOOTSTRAP_STAGED_MANIFEST")
+  printf 'fixture altered manifest\\n' > "$manifest"
+  (cd "${manifest%/*}" && sha256sum -- argocd.yaml > SHA256SUMS)
+}
+if [[ $1 == kustomize ]]; then
+  [[ $# == 2 && $2 == "$FIXTURE_STATE"/bootstrap.*/"$FIXTURE_OVERLAY" ]]
+  if flock -n "$FIXTURE_STATE/operation.lock" true; then exit 99; fi
+  grep -Fq 'argo-cd/v3.5.2/manifests/install.yaml' "$2/kustomization.yaml"
+  [[ -f $2/namespace.yaml && -f $2/redis-pull-policy.yaml ]]
+  printf 'render\\n' >> "$FIXTURE_BOOTSTRAP_ACTIVITY"
+  printf '%s/argocd.yaml\\n' "${2%/"$FIXTURE_OVERLAY"}" > "$FIXTURE_BOOTSTRAP_STAGED_MANIFEST"
+  printf '%s' "$FIXTURE_BOOTSTRAP_MANIFEST"
+  exit 0
+fi
 [[ $1 == --kubeconfig ]]
 config=$2
 case "$2" in
@@ -156,6 +174,14 @@ case "$1 $2" in
     fi
     ;;
   'get namespace')
+    if [[ $3 == argocd ]]; then
+      [[ $# == 6 && $4 == --ignore-not-found && $5 == -o ]]
+      [[ $6 == 'jsonpath={.metadata.name}{" "}{.metadata.labels.app\\.kubernetes\\.io/name}{" "}{.metadata.labels.app\\.kubernetes\\.io/managed-by}{" "}{.metadata.labels.app\\.kubernetes\\.io/part-of}' ]]
+      printf 'owner\\n' >> "$FIXTURE_BOOTSTRAP_ACTIVITY"
+      if [[ $FIXTURE_BOOTSTRAP_TAMPER == before-apply ]]; then change_manifest; fi
+      if [[ -e $FIXTURE_ARGO_OWNER ]]; then cat -- "$FIXTURE_ARGO_OWNER"; fi
+      exit 0
+    fi
     [[ $3 == kube-system ]]
     touch "$FIXTURE_UID_READ"
     printf '%s' "$FIXTURE_LIVE_UID"
@@ -191,7 +217,40 @@ case "$1 $2" in
     esac
     ;;
   "wait "--for=jsonpath*)
-    [[ $4 == namespace/kube-system && $2 == "--for=jsonpath={.metadata.uid}=$FIXTURE_LIVE_UID" ]]
+    live_uid=$FIXTURE_LIVE_UID
+    if [[ -v FIXTURE_BOOTSTRAP_ACTIVITY ]]; then
+      if grep -Fxq diff "$FIXTURE_BOOTSTRAP_ACTIVITY"; then live_uid=$FIXTURE_BOOTSTRAP_FINAL_UID; fi
+      printf 'uid\\n' >> "$FIXTURE_BOOTSTRAP_ACTIVITY"
+      if [[ ${FIXTURE_BOOTSTRAP_UID_TIMEOUT:-false} == true ]]; then exit 124; fi
+    fi
+    [[ $4 == namespace/kube-system && $2 == "--for=jsonpath={.metadata.uid}=$live_uid" ]]
+    ;;
+  'apply --server-side'|'diff --server-side')
+    [[ ! -v KUBECTL_EXTERNAL_DIFF ]]
+    [[ $# == 5 && $3 == --field-manager=k8s-infrastructure && $4 == -f ]]
+    [[ $5 == "$FIXTURE_STATE"/bootstrap.*/argocd.yaml && ! -L $5 ]]
+    cmp -- "$5" <(printf '%s' "$FIXTURE_BOOTSTRAP_MANIFEST")
+    printf '%s\\n' "$1" >> "$FIXTURE_BOOTSTRAP_ACTIVITY"
+    if [[ $1 == apply ]]; then
+      printf 'argocd argocd k8s-infrastructure kubernetes-substrate' > "$FIXTURE_ARGO_OWNER"
+      printf 'fixture Argo CD applied\\n'
+    else
+      case "$FIXTURE_BOOTSTRAP_DIFF" in
+        changes) printf '%s\\n' 'fixture diff changes'; exit 1 ;;
+        error) printf '%s\\n' 'fixture diff error' >&2; exit 2 ;;
+        unexpected-output) printf '%s\\n' 'fixture diff output' ;;
+      esac
+    fi
+    ;;
+  '-n argocd')
+    [[ $* == '-n argocd rollout status --timeout=240s deployment/argocd-applicationset-controller deployment/argocd-dex-server deployment/argocd-notifications-controller deployment/argocd-redis deployment/argocd-repo-server deployment/argocd-server statefulset/argocd-application-controller' ]]
+    printf 'rollout\\n' >> "$FIXTURE_BOOTSTRAP_ACTIVITY"
+    if [[ $FIXTURE_BOOTSTRAP_ROLLOUT == failed ]]; then
+      printf 'fixture rollout failed\\n' >&2
+      exit 1
+    fi
+    if [[ $FIXTURE_BOOTSTRAP_TAMPER == before-diff ]]; then change_manifest; fi
+    printf 'fixture Argo CD rolled out\\n'
     ;;
   *) exit 99 ;;
 esac
@@ -223,6 +282,7 @@ class KindJustTests(unittest.TestCase):
             "plan PROFILE INTENT",
             "apply PROFILE INTENT ABSOLUTE_PLAN_PATH SHA256 APPROVER APPROVAL_UTC",
             "verify PROFILE ABSOLUTE_PLAN_PATH",
+            "bootstrap PROFILE",
         ):
             with self.subTest(recipe=signature):
                 self.assertRegex(result.stdout, rf"(?m)^\s+{signature}\b")
@@ -263,7 +323,12 @@ class KindJustTests(unittest.TestCase):
     def prepare_checkout(self, profile: str):
         self.checkout = self.root / "checkout"
         self.checkout.mkdir()
-        for path in (Path("justfile"), RUNBOOK, *(MODULE / name for name in PROFILE_FILES)):
+        for path in (
+            Path("justfile"),
+            RUNBOOK,
+            *(MODULE / name for name in PROFILE_FILES),
+            *(path.relative_to(REPO) for path in (REPO / OVERLAY).iterdir()),
+        ):
             destination = self.checkout / path
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(REPO / path, destination)
@@ -450,6 +515,199 @@ class KindJustTests(unittest.TestCase):
             "### Managed target",
             "## Verify the apply",
         )
+
+    def prepare_bootstrap(self):
+        self.prepare_checkout("pilot-74")
+        self.register_existing_cluster()
+        self.bootstrap_activity = self.root / "bootstrap-activity"
+        self.argo_owner = self.root / "argo-owner"
+        self.env.update(
+            FIXTURE_BOOTSTRAP_ACTIVITY=str(self.bootstrap_activity),
+            FIXTURE_BOOTSTRAP_MANIFEST=BOOTSTRAP_MANIFEST.decode(),
+            FIXTURE_BOOTSTRAP_STAGED_MANIFEST=str(self.root / "bootstrap-manifest-path"),
+            FIXTURE_BOOTSTRAP_FINAL_UID="fixture-uid",
+            FIXTURE_BOOTSTRAP_DIFF="empty",
+            FIXTURE_BOOTSTRAP_ROLLOUT="ready",
+            FIXTURE_BOOTSTRAP_TAMPER="none",
+            FIXTURE_ARGO_OWNER=str(self.argo_owner),
+            FIXTURE_OVERLAY=str(OVERLAY),
+            KUBECONFIG="/dev/null",
+            KUBECTL_EXTERNAL_DIFF="false",
+        )
+
+    def bootstrap(self, interface: str):
+        self.bootstrap_activity.unlink(missing_ok=True)
+        if interface == "just":
+            return self.command(JUST or "just", "bootstrap", "pilot-74", cwd=self.checkout)
+        return self.native_operation("### Bootstrap with native commands")
+
+    def test_bootstrap_and_repeat_share_the_same_private_evidence(self):
+        self.prepare_bootstrap()
+        previous = set()
+        digest = hashlib.sha256(BOOTSTRAP_MANIFEST).hexdigest()
+        for interface in ("just", "native"):
+            with self.subTest(interface=interface):
+                result = self.bootstrap(interface)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                (run,) = set(self.state.glob("bootstrap.*")) - previous
+                previous.add(run)
+                self.assertEqual(
+                    self.bootstrap_activity.read_text().splitlines(),
+                    ["render", "uid", "owner", "apply", "rollout", "diff", "uid"],
+                )
+                self.assertEqual(run.stat().st_mode & 0o777, 0o700)
+                for name, contents in (
+                    ("source-revision.txt", self.revision + "\n"),
+                    ("SHA256SUMS", digest + "  argocd.yaml\n"),
+                    ("argocd.yaml", BOOTSTRAP_MANIFEST.decode()),
+                    ("apply.log", "fixture Argo CD applied\n"),
+                    ("rollout.log", "fixture Argo CD rolled out\n"),
+                    ("diff.log", ""),
+                    ("diff.stderr.log", ""),
+                    ("render.log", ""),
+                    ("identity.log", ""),
+                ):
+                    evidence = run / name
+                    self.assertEqual(evidence.read_text(), contents)
+                    self.assertEqual(evidence.stat().st_mode & 0o777, 0o600)
+                receipt = run / "RESULT.md"
+                self.assertEqual(
+                    receipt.read_text(),
+                    "# Argo CD bootstrap\n\n"
+                    f"- Profile pilot-74\n- Source revision {self.revision}\n- Manifest SHA-256 {digest}\n"
+                    "- All seven rollouts passed\n- Server-side diff is empty\n- Registered UID rechecked\n",
+                )
+                self.assertEqual(receipt.stat().st_mode & 0o777, 0o600)
+                self.assertFalse((run / "RESULT.md.tmp").exists())
+                self.assertNotIn("fixture Argo CD", result.stdout + result.stderr)
+                self.assert_lock_released()
+
+    def test_bootstrap_refuses_a_dirty_checkout(self):
+        self.prepare_bootstrap()
+        (self.checkout / OVERLAY / "namespace.yaml").write_text("dirty overlay\n")
+        for interface in ("just", "native"):
+            with self.subTest(interface=interface):
+                result = self.bootstrap(interface)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("clean, reviewed checkout", result.stderr)
+                self.assertFalse(self.bootstrap_activity.exists())
+                self.assertEqual(list(self.state.glob("bootstrap.*")), [])
+                self.assert_lock_released()
+
+    def test_bootstrap_refuses_wrong_private_path_types_before_apply(self):
+        self.prepare_bootstrap()
+        (self.state / "cluster.tfstate").unlink()
+        for filename in ("cluster.tfstate", "cluster.tfstate.backup", "plans"):
+            path = self.state / filename
+            if filename == "plans":
+                path.touch(mode=0o600)
+            else:
+                path.mkdir(mode=0o700)
+            for interface in ("just", "native"):
+                with self.subTest(interface=interface, path=filename):
+                    previous = set(self.state.glob("bootstrap.*"))
+                    result = self.bootstrap(interface)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("invalid or redirected", result.stderr)
+                    self.assertFalse(self.bootstrap_activity.exists())
+                    self.assertEqual(set(self.state.glob("bootstrap.*")), previous)
+                    self.assert_lock_released()
+            if filename == "plans":
+                path.unlink()
+            else:
+                path.rmdir()
+
+    def assert_bootstrap_failure(self, interface: str, phase: str, activity: str):
+        previous = set(self.state.glob("bootstrap.*"))
+        result = self.bootstrap(interface)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f"bootstrap stopped during {phase}", result.stderr)
+        (run,) = set(self.state.glob("bootstrap.*")) - previous
+        self.assertEqual(self.bootstrap_activity.read_text().split(), activity.split())
+        self.assertFalse((run / "RESULT.md").exists())
+        self.assertFalse((run / "RESULT.md.tmp").exists())
+        self.assert_lock_released()
+        return run, result
+
+    def test_bootstrap_preserves_the_pre_apply_uid_timeout_status(self):
+        self.prepare_bootstrap()
+        self.env["FIXTURE_BOOTSTRAP_UID_TIMEOUT"] = "true"
+        for interface in ("just", "native"):
+            with self.subTest(interface=interface):
+                run, result = self.assert_bootstrap_failure(
+                    interface, "pre-apply identity", "render uid"
+                )
+                self.assertEqual(result.returncode, 124)
+                self.assertFalse((run / "apply.log").exists())
+
+    def test_bootstrap_refuses_wrong_uid_and_foreign_namespace_before_apply(self):
+        self.prepare_bootstrap()
+        for interface in ("just", "native"):
+            with self.subTest(interface=interface, scenario="wrong uid"):
+                self.register_existing_cluster(uid="wrong-uid")
+                run, _ = self.assert_bootstrap_failure(
+                    interface, "pre-apply identity", "render uid"
+                )
+                self.assertFalse((run / "apply.log").exists())
+            self.register_existing_cluster()
+            for owner in (
+                "argocd   ",
+                "argocd argocd foreign-manager kubernetes-substrate",
+                "argocd argocd k8s-infrastructure other-part",
+            ):
+                with self.subTest(interface=interface, owner=owner):
+                    self.argo_owner.write_text(owner)
+                    run, _ = self.assert_bootstrap_failure(
+                        interface, "namespace ownership", "render uid owner"
+                    )
+                    self.assertFalse((run / "apply.log").exists())
+
+    def test_bootstrap_refuses_a_manifest_rewrite_even_if_its_checksum_is_replaced(self):
+        self.prepare_bootstrap()
+        for interface in ("just", "native"):
+            for when, phase, activity in (
+                ("before-apply", "apply", "render uid owner"),
+                ("before-diff", "diff", "render uid owner apply rollout"),
+            ):
+                with self.subTest(interface=interface, when=when):
+                    self.env["FIXTURE_BOOTSTRAP_TAMPER"] = when
+                    _, result = self.assert_bootstrap_failure(interface, phase, activity)
+                    self.assertIn("differs from its recorded SHA-256", result.stderr)
+
+    def test_bootstrap_records_no_success_on_rollout_diff_or_final_identity_failure(self):
+        self.prepare_bootstrap()
+        for interface in ("just", "native"):
+            with self.subTest(interface=interface, scenario="rollout"):
+                self.env["FIXTURE_BOOTSTRAP_ROLLOUT"] = "failed"
+                run, result = self.assert_bootstrap_failure(
+                    interface, "rollout", "render uid owner apply rollout"
+                )
+                self.assertEqual((run / "rollout.log").read_text(), "fixture rollout failed\n")
+                self.assertFalse((run / "diff.log").exists())
+                self.assertNotIn("fixture rollout failed", result.stderr)
+            self.env["FIXTURE_BOOTSTRAP_ROLLOUT"] = "ready"
+            for diff, status, log, contents in (
+                ("changes", 1, "diff.log", "fixture diff changes\n"),
+                ("error", 2, "diff.stderr.log", "fixture diff error\n"),
+                ("unexpected-output", 1, "diff.log", "fixture diff output\n"),
+            ):
+                with self.subTest(interface=interface, scenario=diff):
+                    self.env["FIXTURE_BOOTSTRAP_DIFF"] = diff
+                    run, result = self.assert_bootstrap_failure(
+                        interface, "diff", "render uid owner apply rollout diff"
+                    )
+                    self.assertEqual(result.returncode, status)
+                    self.assertEqual((run / log).read_text(), contents)
+                    self.assertNotIn(contents.strip(), result.stdout + result.stderr)
+            self.env["FIXTURE_BOOTSTRAP_DIFF"] = "empty"
+            with self.subTest(interface=interface, scenario="final identity"):
+                self.env["FIXTURE_BOOTSTRAP_FINAL_UID"] = "changed-uid"
+                run, _ = self.assert_bootstrap_failure(
+                    interface, "final identity", "render uid owner apply rollout diff uid"
+                )
+                self.assertEqual((run / "diff.log").read_text(), "")
+                self.assertIn("UID could not be matched", (run / "identity.log").read_text())
+            self.env["FIXTURE_BOOTSTRAP_FINAL_UID"] = "fixture-uid"
 
     def test_native_apply_of_a_recipe_plan_can_resume_with_the_recipe(self):
         profile = "pilot-74"
