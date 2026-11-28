@@ -215,13 +215,13 @@ set -eu
 plan_dir=${1#-chdir=}
 shift
 [[ $KUBECONFIG == "$plan_dir/provider.kubeconfig" && $TF_WORKSPACE == default ]]
-[[ ${TF_CLI_CONFIG_FILE##*/} == opentofu.tfrc ]]
+[[ $TF_CLI_CONFIG_FILE == "$plan_dir/opentofu.tfrc" ]]
 lock=$(jq -er .lock "$plan_dir/registration.json")
 if flock -n "$lock" true; then exit 99; fi
 case "$1" in
   init)
     state=$(jq -er .state "$plan_dir/registration.json")
-    [[ $# == 5 && $* == *-lockfile=readonly* && $5 == "-backend-config=path=$state" ]]
+    [[ $# == 6 && $* == *-lockfile=readonly* && $* == *-get=false* && $6 == "-backend-config=path=$state" ]]
     ;;
   plan)
     [[ $# == 6 && $* == *-refresh=false* && $* == *-lock-timeout=30s* && $6 == "-out=$plan_dir/saved.tfplan" ]]
@@ -1120,12 +1120,16 @@ class RegisteredKindTests(unittest.TestCase):
         self.home.mkdir(mode=0o700)
         self.config = self.root / "opentofu.tfrc"
         self.config.touch(mode=0o600)
+        self.mirror = self.root / 'provider "mirror"'
+        self.mirror.mkdir(mode=0o700)
         self.env = {
             "HOME": str(self.home),
             "PATH": f"{self.bin}:{os.defpath}",
             "GIT_CONFIG_NOSYSTEM": "1",
             "KIND_REGISTRATIONS": str(self.registrations),
             "KIND_TOFU_CONFIG": str(self.config),
+            "KIND_PROVIDER_MIRROR": str(self.mirror),
+            "TF_CLI_CONFIG_FILE": str(self.config),
             "TF_CLI_ARGS": "would redirect tofu",
             "TF_LOG": "TRACE",
             "TF_VAR_cluster_name": "unexpected-cluster",
@@ -1141,7 +1145,16 @@ case "$3 $4" in
     if [[ -f "$0.id" ]]; then cat "$0.id"; else printf '%s\\n' fixture-daemon; fi ;;
   'ps -a')
     [[ $5 == --filter && $7 == --format && $8 == '{{.Names}}' ]]
-    if [[ -f "$0.containers" ]]; then cat "$0.containers"; fi ;;
+    if [[ -f "$0.containers" ]]; then
+      while read -r name cluster_label; do
+        case "$6" in
+          label=io.x-k8s.kind.cluster=*) [[ "$cluster_label" == "${6##*=}" ]] || continue ;;
+          name=*) [[ /$name =~ ${6#name=} ]] || continue ;;
+          *) exit 99 ;;
+        esac
+        printf '%s\\n' "$name"
+      done < "$0.containers"
+    fi ;;
   *) exit 99 ;;
 esac
 """,
@@ -1252,7 +1265,7 @@ esac
     def plan(self, interface: str, target: str, directory: Path):
         return self.operation(interface, "plan", target, str(directory))
 
-    def operation(self, interface: str, *args: str):
+    def operation(self, interface: str, *args: str, provider_checkout: Path | None = None):
         if interface == "just":
             return self.command(JUST or "just", *args, cwd=self.provider)
         runbook = (REPO / REGISTERED_RUNBOOK).read_text(encoding="utf-8")
@@ -1264,7 +1277,7 @@ esac
             "--norc",
             "-s",
             "--",
-            str(self.provider),
+            str(provider_checkout or self.provider),
             *args,
             input_text=native,
         )
@@ -1356,6 +1369,26 @@ esac
         self.assertIn("outside both checkouts", result.stderr)
         self.assertEqual(list(registry.iterdir()), [])
 
+    def test_native_requires_the_provider_checkout_root(self):
+        subdirectory = self.provider / "nested"
+        shutil.copytree(self.provider / BASELINE, subdirectory / BASELINE)
+        self.provider_revision = self.commit(self.provider)
+        registry = self.provider / "registrations"
+        registry.mkdir(mode=0o700)
+        self.env["KIND_REGISTRATIONS"] = str(registry)
+        target, environment, candidate = self.prepare_target("stargazer", "stargazer-sandbox")
+        result = self.operation(
+            "native",
+            "register",
+            target,
+            str(environment),
+            str(candidate),
+            provider_checkout=subdirectory,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Select the provider checkout root", result.stderr)
+        self.assertEqual(list(registry.iterdir()), [])
+
     def test_concurrent_reservations_for_one_daemon_and_name_publish_one_record(self):
         targets = [
             self.prepare_target("stargazer", "shared-sandbox"),
@@ -1405,6 +1438,35 @@ esac
         self.assertEqual(list(self.registrations.glob("*/*.json")), [registration])
         self.assertEqual(registration.read_bytes(), original)
 
+    def test_reserves_and_checks_the_backend_lock_for_hidden_state(self):
+        target, environment, candidate = self.prepare_target("stargazer", "stargazer-sandbox")
+        hidden_state = candidate.parent / ".cluster.tfstate"
+        source = json.loads(candidate.read_text())
+        self.write_json(candidate, source | {"state": str(hidden_state)})
+        published = self.register("just", target, environment, candidate)
+        self.assertEqual(published.returncode, 0, published.stderr)
+
+        other_target, other_environment, other_candidate = self.prepare_target(
+            "observatory", "observatory-sandbox"
+        )
+        other_source = json.loads(other_candidate.read_text())
+        self.write_json(other_candidate, other_source | {"state": source["state"]})
+        result = self.register("native", other_target, other_environment, other_candidate)
+        with self.subTest("shared backend lock path"):
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("already reserves a canonical path", result.stderr)
+
+        sidecar = candidate.parent / ".cluster.tfstate.lock.info"
+        self.write_json(sidecar, {"fixture": "retained lock metadata"})
+        for interface in ("just", "native"):
+            with self.subTest(interface=interface):
+                result = self.plan(interface, target, environment)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(
+                    "requires vacant state, kubeconfig and backend sidecar paths", result.stderr
+                )
+        self.assertEqual(json.loads(sidecar.read_text()), {"fixture": "retained lock metadata"})
+
     def test_refuses_unsupported_inputs_and_unavailable_pins_before_reservation(self):
         target, environment, candidate = self.prepare_target("stargazer", "stargazer-sandbox")
         declaration = environment / "targets/sandbox.json"
@@ -1431,6 +1493,30 @@ esac
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("exact pinned provider commit is unavailable", result.stderr)
         self.assertEqual(list(self.registrations.iterdir()), [])
+
+    def test_refuses_to_omit_configuration_from_the_pinned_root(self):
+        configurations = (
+            ("just", "extra.tf", "locals { extra = true }\n"),
+            ("native", "override.tf.json", "{}\n"),
+            ("just", "main.tofu", "locals { extra = true }\n"),
+            ("native", "override.tofu.json", "{}\n"),
+            ("just", "terraform.tfvars", 'cluster_name = "other"\n'),
+            ("native", "extra.auto.tfvars.json", '{"cluster_name":"other"}\n'),
+        )
+        for index, (interface, filename, content) in enumerate(configurations):
+            with self.subTest(interface=interface, filename=filename):
+                extra = self.provider / BASELINE / filename
+                extra.write_text(content, encoding="utf-8")
+                self.provider_revision = self.commit(self.provider)
+                extra.unlink()
+                owner = f"stargazer-{index}"
+                target, environment, candidate = self.prepare_target(owner, f"{owner}-sandbox")
+                result = self.register(interface, target, environment, candidate)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(
+                    "Unsupported configuration in the pinned baseline root", result.stderr
+                )
+                self.assertFalse((self.registrations / owner).exists())
 
     def test_plan_refuses_missing_registration_changed_sources_and_wrong_identity(self):
         target, environment, candidate = self.prepare_target("stargazer", "stargazer-sandbox")
@@ -1469,3 +1555,55 @@ esac
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("reserved kind name is already in use", result.stderr)
         self.assertFalse((self.registrations / ".plans").exists())
+
+    def test_plan_checks_exact_docker_names_and_cluster_labels(self):
+        target, environment, candidate = self.prepare_target("stargazer", "lab")
+        published = self.register("just", target, environment, candidate)
+        self.assertEqual(published.returncode, 0, published.stderr)
+        inventory = self.bin / "docker.containers"
+        inventory.write_text("lab-east-control-plane lab-east\nlab-east-worker lab-east\n")
+        for interface in ("just", "native"):
+            with self.subTest(
+                interface=interface, inventory="different cluster with a shared prefix"
+            ):
+                result = self.plan(interface, target, environment)
+                self.assertEqual(result.returncode, 0, result.stderr)
+        for interface, collision in (
+            ("just", "lab-control-plane"),
+            ("native", "lab-worker"),
+            ("just", "renamed-container lab"),
+            ("native", "renamed-container lab"),
+        ):
+            with self.subTest(interface=interface, collision=collision):
+                inventory.write_text(f"{collision}\n")
+                result = self.plan(interface, target, environment)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("reserved kind name is already in use", result.stderr)
+
+    def test_plan_uses_only_the_selected_local_provider_mirror(self):
+        self.config.write_text("provider_installation { direct {} }\n")
+        target, environment, candidate = self.prepare_target("stargazer", "stargazer-sandbox")
+        published = self.register("native", target, environment, candidate)
+        self.assertEqual(published.returncode, 0, published.stderr)
+        for interface in ("just", "native"):
+            with self.subTest(interface=interface):
+                result = self.plan(interface, target, environment)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                config = Path(result.stdout.strip()).parent / "opentofu.tfrc"
+                self.assertTrue(config.is_file(), "The plan must carry its own CLI configuration")
+                self.assertEqual(config.stat().st_mode & 0o777, 0o600)
+                self.assertEqual(
+                    json.loads(config.read_text()),
+                    {
+                        "provider_installation": [
+                            {
+                                "filesystem_mirror": [
+                                    {
+                                        "path": str(self.mirror),
+                                        "include": ["registry.terraform.io/elioseverojunior/kind"],
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                )

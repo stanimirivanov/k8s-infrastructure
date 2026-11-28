@@ -38,6 +38,11 @@ settings are the cluster name and whether the environment declares the target
 disposable. Use a lowercase cluster name of at most 49 characters, beginning
 with a letter and ending with a letter or digit.
 
+Both commands require a pin whose baseline root uses `main.tf` and the
+dependency lock. A pin with additional root OpenTofu or Terraform
+configuration, including overrides and automatically loaded variable files,
+requires a reviewed profile change.
+
 ## Reserve the target
 
 On the Operations host, use Bash, Git, Docker, jq, and GNU coreutils and flock.
@@ -81,12 +86,14 @@ Operations before proceeding.
 
 ## Save a plan for review
 
-Install the pinned OpenTofu and configure the existing checksummed provider
-filesystem mirror. Export `KIND_TOFU_CONFIG` as the canonical absolute path
-to the private mode-`0600` CLI configuration. Use a filesystem mirror for
-the pinned provider without a direct registry fallback. The target lock stays
-held while the procedure checks the registration, verifies the daemon and
-vacancy, stages the inputs, and saves the plan.
+Install the pinned OpenTofu and use the [qualified provider archive and
+filesystem mirror](kind-iac-rehearsal.md#setup). Export `KIND_PROVIDER_MIRROR`
+as the canonical absolute path to the mirror directory. Each attempt writes a
+private CLI configuration that installs only the locked kind provider from
+that mirror. The target lock stays held while the procedure checks the
+registration, verifies the daemon and vacancy, stages the inputs, and saves
+the plan. Vacancy covers the exact kind cluster label and the two baseline
+container names, `<cluster>-control-plane` and `<cluster>-worker`.
 
 ```bash
 just plan stargazer/sandbox "$ENVIRONMENT"
@@ -98,14 +105,22 @@ review record together. The reviewed inputs are saved alongside
 `registration.json` and `binding.json`. The latter binds both reviewed
 commits plus the declaration, pin and registration digests. The saved
 OpenTofu binary plan carries the SHA-256 of `binding.json`. In that directory,
-`sha256sum -c SHA256SUMS` verifies the exact `saved.tfplan` bytes. Preserve
-the directory in private Operations storage for review.
+`sha256sum -c SHA256SUMS` verifies the exact `saved.tfplan` bytes.
+
+Keep the attempt in private Operations storage while review or an approved
+apply needs it. After rejection, supersession, or completion of the approved
+operation, have Operations confirm that the plan is no longer needed, hold the
+registered target lock, and delete the exact `plan.*` attempt directory
+identified by `REVIEW.md`. Use the printed private diagnostics path for a
+failed attempt once diagnosis is complete. Retain only the required non-secret
+review or diagnostic evidence in Operations storage and keep plan contents out
+of Git and shared logs.
 
 ## Run with native commands
 
 Use the same prerequisites, candidate, and paths. Start a Bash shell and
 set its positional arguments for the chosen task. Set `PROVIDER_CHECKOUT`
-to the absolute path of the infrastructure checkout that contains the pinned
+to the absolute path of the infrastructure checkout root that contains the pinned
 provider commit.
 
 ```bash
@@ -153,7 +168,8 @@ subshell releases both types of lock when the task exits.
   git_at() {
     local checkout=$1
     shift
-    git --no-replace-objects --literal-pathspecs -C "$checkout" -c core.fsmonitor=false "$@"
+    timeout --kill-after=5s 30s git --no-replace-objects --literal-pathspecs \
+      -C "$checkout" -c core.fsmonitor=false "$@"
   }
   stage_blob() {
     local checkout=$1 revision=$2 path=$3 entry
@@ -175,8 +191,9 @@ subshell releases both types of lock when the task exits.
     printf '%s\n' "$revision"
   }
   record_paths() {
+    # OpenTofu's local backend strips one leading dot from the state filename.
     jq -er '[.state, .lock, .kubeconfig, (.state + ".backup"),
-      (.state | split("/") | .[-1] |= ("." + . + ".lock.info") | join("/"))]
+      (.state | split("/") | .[-1] |= ("." + ltrimstr(".") + ".lock.info") | join("/"))]
       | select(length == (unique | length)) | .[]' <<< "$1" ||
       refuse 'The state, lock, kubeconfig, and backend sidecar paths must be distinct.'
   }
@@ -228,6 +245,8 @@ subshell releases both types of lock when the task exits.
 
   [[ $# -ge 4 ]] || refuse 'Select register TARGET ENVIRONMENT CANDIDATE or plan TARGET ENVIRONMENT.'
   PROVIDER=$(realpath -e -- "$1")
+  [[ "$(git_at "$PROVIDER" rev-parse --show-toplevel)" == "$PROVIDER" ]] ||
+    refuse 'Select the provider checkout root.'
   OPERATION=$2
   TARGET=$3
   ENVIRONMENT=$(realpath -e -- "$4")
@@ -297,8 +316,17 @@ subshell releases both types of lock when the task exits.
   [[ "$(git_at "$PROVIDER" rev-parse --verify "$PROVIDER_REVISION^{commit}")" == "$PROVIDER_REVISION" ]] ||
     refuse 'The exact pinned provider commit is unavailable in this checkout.'
   MODULE=clusters/local-kind/kind-baseline
-  # Check both inputs before reserving an unusable profile or querying Docker.
-  for file in main.tf .terraform.lock.hcl; do
+  PROFILE_FILES=(main.tf .terraform.lock.hcl)
+  # Refuse pins whose deployed root would differ from the staged root.
+  git_at "$PROVIDER" ls-tree -z --name-only "$PROVIDER_REVISION:$MODULE" |
+    while IFS= read -r -d '' file; do
+      case "$file" in
+        main.tf) ;;
+        *.tf|*.tf.json|*.tofu|*.tofu.json|terraform.tfvars|terraform.tfvars.json|*.auto.tfvars|*.auto.tfvars.json)
+          refuse 'Unsupported configuration in the pinned baseline root. Review the profile before using this pin.' ;;
+      esac
+    done
+  for file in "${PROFILE_FILES[@]}"; do
     stage_blob "$PROVIDER" "$PROVIDER_REVISION" "$MODULE/$file" >/dev/null
   done
   [[ "$(clean_revision)" == "$ENV_REVISION" ]] || refuse 'The environment changed while staging its inputs.'
@@ -358,15 +386,14 @@ subshell releases both types of lock when the task exits.
     [[ "$path" == "$LOCK" || ( ! -e "$path" && ! -L "$path" ) ]] ||
       refuse 'A create plan requires vacant state, kubeconfig and backend sidecar paths.'
   done <<< "$paths"
-  for filter in "label=io.x-k8s.kind.cluster=$CLUSTER" "name=^/$CLUSTER-"; do
+  for filter in "label=io.x-k8s.kind.cluster=$CLUSTER" "name=^/$CLUSTER-(control-plane|worker)$"; do
     containers=$(timeout --kill-after=5s 15s docker --host "$DOCKER_HOST" ps -a \
       --filter "$filter" --format '{{.Names}}')
     [[ -z "$containers" ]] || refuse 'The reserved kind name is already in use.'
   done
-  TOFU_CONFIG=${KIND_TOFU_CONFIG:?Set KIND_TOFU_CONFIG to the private OpenTofu CLI configuration}
-  private_file "$TOFU_CONFIG"
-  [[ "$(realpath -e -- "$TOFU_CONFIG")" == "$TOFU_CONFIG" ]] || refuse 'Use the canonical OpenTofu CLI configuration path.'
-  outside_checkouts "$TOFU_CONFIG"
+  MIRROR=${KIND_PROVIDER_MIRROR:?Set KIND_PROVIDER_MIRROR to the qualified local provider mirror}
+  [[ -d "$MIRROR" && "$(realpath -e -- "$MIRROR")" == "$MIRROR" && "$MIRROR" != *[[:cntrl:]]* ]] ||
+    refuse 'Use a canonical directory path for the local provider mirror.'
 
   for directory in "$REGISTRY/.plans" "$REGISTRY/.plans/$OWNER" "$REGISTRY/.plans/$TARGET"; do
     mkdir -p -- "$directory"
@@ -374,7 +401,11 @@ subshell releases both types of lock when the task exits.
   done
   PLAN_DIR=$(mktemp -d "$REGISTRY/.plans/$TARGET/plan.XXXXXX")
   trap 'if (( $? != 0 )); then printf "Planning stopped. Private diagnostics are in %s\n" "$PLAN_DIR" >&2; fi' EXIT
-  for file in main.tf .terraform.lock.hcl; do
+  PROVIDER_ADDRESS=registry.terraform.io/elioseverojunior/kind
+  TOFU_CONFIG="$PLAN_DIR/opentofu.tfrc"
+  jq -n --arg mirror "$MIRROR" --arg provider "$PROVIDER_ADDRESS" \
+    '{provider_installation: [{filesystem_mirror: [{path: $mirror, include: [$provider]}]}]}' > "$TOFU_CONFIG"
+  for file in "${PROFILE_FILES[@]}"; do
     stage_blob "$PROVIDER" "$PROVIDER_REVISION" "$MODULE/$file" > "$PLAN_DIR/$file"
   done
   stage_blob "$ENVIRONMENT" "$ENV_REVISION" "$DECLARATION_PATH" > "$PLAN_DIR/declaration.json"
@@ -400,13 +431,13 @@ subshell releases both types of lock when the task exits.
       tofu -chdir="$PLAN_DIR" "$@"
   }
   PLAN="$PLAN_DIR/saved.tfplan"
-  run_tofu 120s init -no-color -input=false -lockfile=readonly -backend-config="path=$STATE" > "$PLAN_DIR/init.log" 2>&1
+  run_tofu 120s init -no-color -input=false -get=false -lockfile=readonly -backend-config="path=$STATE" > "$PLAN_DIR/init.log" 2>&1
   run_tofu 180s plan -no-color -input=false -refresh=false -lock-timeout=30s -out="$PLAN" > "$PLAN_DIR/plan.log" 2>&1
   run_tofu 60s show -json "$PLAN" 2>"$PLAN_DIR/show.log" |
-    jq -e --arg cluster "$CLUSTER" --arg binding "$BINDING_SHA256" '
+    jq -e --arg cluster "$CLUSTER" --arg binding "$BINDING_SHA256" --arg provider "$PROVIDER_ADDRESS" '
       .variables.cluster_name.value == $cluster and .variables.plan_binding_sha256.value == $binding
       and (.resource_changes | length == 1 and (.[0] |
-        .address == "kind_cluster.baseline" and .provider_name == "registry.terraform.io/elioseverojunior/kind"
+        .address == "kind_cluster.baseline" and .provider_name == $provider
         and .change.actions == ["create"] and .change.after.name == $cluster))
     ' >/dev/null || refuse 'OpenTofu did not save the expected bound baseline create plan.'
   run_tofu 60s show -no-color "$PLAN" > "$PLAN_DIR/plan.txt" 2>>"$PLAN_DIR/show.log"
@@ -425,9 +456,17 @@ subshell releases both types of lock when the task exits.
   before retrying. The lock files persist between operations.
 - For a dirty environment checkout or unavailable pin, restore the reviewed
   inputs, obtain the pinned commit locally, and retry with the same key.
+- If initialization fails, review the private `init.log` and verify the
+  OpenTofu version and checksummed provider archive in the selected mirror.
 - For a Docker ID mismatch, redirected path, existing state or occupied
   cluster name, have Operations verify the registration and the existing
   infrastructure before retrying.
+- If an interrupted planner leaves an empty state file or local backend lock
+  metadata, diagnose it under the registered target lock. Have Operations
+  verify that OpenTofu has exited, any state file is empty, and no apply ran
+  or cluster exists for the target. Retain private evidence and use an
+  explicitly approved Operations recovery to move only artifacts proven to
+  be abandoned before retrying.
 - A failed plan can leave private `init.log`, `plan.log`, and `show.log`
   under its attempt directory. A completed review has `REVIEW.md`,
   `plan.txt`, `saved.tfplan`, and `SHA256SUMS`. After correcting the
