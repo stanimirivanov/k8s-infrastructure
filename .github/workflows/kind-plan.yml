@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - .github/workflows/kind-plan.yml
+      - Makefile
       - clusters/local-kind/iac-pilot/**
       - docs/local-kind-opentofu.md
       - justfile
@@ -12,6 +13,7 @@ on:
     branches: [main]
     paths:
       - .github/workflows/kind-plan.yml
+      - Makefile
       - clusters/local-kind/iac-pilot/**
       - docs/local-kind-opentofu.md
       - justfile
@@ -45,4 +47,4 @@ jobs:
           "$tools/just" --version
           printf 'KIND_TEST_JUST=%s/just\n' "$tools" >> "$GITHUB_ENV"
       - name: Exercise both planning interfaces without cluster access
-        run: python3 -m unittest discover -s tests -p 'test_kind_just.py' -v
+        run: make kind-plan-check

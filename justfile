@@ -33,7 +33,10 @@ plan PROFILE INTENT:
     esac
 
     SOURCE_REVISION=$(git rev-parse --verify 'HEAD^{commit}')
-    CHECKOUT_STATUS=$(git status --porcelain=v1 --untracked-files=all --ignore-submodules=none)
+    INDEX_FLAGS=$(git ls-files -v | LC_ALL=C awk '/^[a-zS] / {print $1}')
+    [[ -z "$INDEX_FLAGS" ]] ||
+      refuse 'Use a clean, reviewed checkout without assume-unchanged or skip-worktree flags.'
+    CHECKOUT_STATUS=$(git --no-optional-locks status --porcelain=v1 --untracked-files=all --ignore-submodules=none)
     [[ -z "$CHECKOUT_STATUS" && "$(git rev-parse --verify 'HEAD^{commit}')" == "$SOURCE_REVISION" ]] ||
       refuse 'Plan from a clean, reviewed checkout at a stable HEAD.'
 
@@ -41,7 +44,8 @@ plan PROFILE INTENT:
     export DOCKER_HOST=unix:///var/run/docker.sock KIND_EXPERIMENTAL_PROVIDER=docker
     export TF_CLI_CONFIG_FILE="$STATE_DIR/opentofu.tfrc"
     unset DOCKER_CONTEXT TF_WORKSPACE TF_DATA_DIR TF_CLI_ARGS TF_CLI_ARGS_init \
-      TF_CLI_ARGS_state TF_CLI_ARGS_console TF_CLI_ARGS_plan TF_CLI_ARGS_show
+      TF_CLI_ARGS_state TF_CLI_ARGS_state_list TF_CLI_ARGS_console TF_CLI_ARGS_plan TF_CLI_ARGS_show \
+      TF_LOG TF_LOG_PATH TF_LOG_CORE TF_LOG_PROVIDER
     umask 077
 
     LOCK="$STATE_DIR/operation.lock"
@@ -108,12 +112,17 @@ plan PROFILE INTENT:
     rmdir -- "$PLAN_DIR/profiles/$PROFILE" "$PLAN_DIR/profiles"
     printf '%s\n' "$SOURCE_REVISION" > "$PLAN_DIR/source-revision.txt"
     export KUBECONFIG="$PLAN_DIR/provider.kubeconfig"
-    tofu -chdir="$PLAN_DIR" init -no-color -input=false -lockfile=readonly -backend-config="path=$STATE"
+    run_tofu() {
+      local deadline=$1
+      shift
+      timeout --verbose --kill-after=5s "$deadline" tofu -chdir="$PLAN_DIR" "$@"
+    }
+    run_tofu 120s init -no-color -input=false -lockfile=readonly -backend-config="path=$STATE"
 
     if [[ "$INTENT" == managed ]]; then
-      STATE_RESOURCES=$(tofu -chdir="$PLAN_DIR" state list)
+      STATE_RESOURCES=$(run_tofu 60s state list -state="$STATE")
       [[ "$STATE_RESOURCES" == kind_cluster.pilot ]] || refuse 'The registered state must contain only kind_cluster.pilot.'
-      NAME_MATCH=$(tofu -chdir="$PLAN_DIR" console -no-color -state="$STATE" \
+      NAME_MATCH=$(run_tofu 60s console -no-color -state="$STATE" \
         <<< "kind_cluster.pilot.name == var.cluster_name && var.cluster_name == \"$CLUSTER\"")
       [[ "$NAME_MATCH" == true ]] || refuse 'The state or staged cluster name differs from the registration.'
       kubectl --kubeconfig "$KCFG" --context "$CTX" --request-timeout=10s \
@@ -121,17 +130,17 @@ plan PROFILE INTENT:
         refuse 'The live kube-system UID could not be matched to the registration.'
     else
       if [[ -e "$STATE" ]]; then
-        STATE_RESOURCES=$(tofu -chdir="$PLAN_DIR" state list)
+        STATE_RESOURCES=$(run_tofu 60s state list -state="$STATE")
         [[ -z "$STATE_RESOURCES" ]] || refuse 'The selected state already contains resources.'
       fi
-      NAME_MATCH=$(tofu -chdir="$PLAN_DIR" console -no-color -state="$STATE" <<< "var.cluster_name == \"$CLUSTER\"")
+      NAME_MATCH=$(run_tofu 60s console -no-color -state="$STATE" <<< "var.cluster_name == \"$CLUSTER\"")
       [[ "$NAME_MATCH" == true ]] || refuse 'The staged cluster name differs from the registration.'
     fi
 
     PLAN="$PLAN_DIR/saved.tfplan"
-    tofu -chdir="$PLAN_DIR" plan -no-color -input=false -lock-timeout=30s -out="$PLAN" 2>&1 |
+    run_tofu 180s plan -no-color -input=false -lock-timeout=30s -out="$PLAN" 2>&1 |
       tee "$PLAN_DIR/plan.log"
-    tofu -chdir="$PLAN_DIR" show -no-color "$PLAN" > "$PLAN_DIR/plan.txt"
+    run_tofu 60s show -no-color "$PLAN" > "$PLAN_DIR/plan.txt"
     sha256sum -- "$PLAN" > "$PLAN_DIR/SHA256SUMS"
     read -r PLAN_SHA256 _ < "$PLAN_DIR/SHA256SUMS"
     cat "$PLAN_DIR/plan.txt" "$PLAN_DIR/SHA256SUMS"

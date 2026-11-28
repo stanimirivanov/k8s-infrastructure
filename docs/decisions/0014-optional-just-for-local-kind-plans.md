@@ -3,6 +3,7 @@
 - Status: Proposed
 - Date: 2026-11-28
 - Related work: Infrastructure #81 and #87
+- Supersedes in part: [ADR 0001's operator tooling for registered local kind planning](0001-repository-boundary-and-tooling.md)
 
 ## TL;DR
 
@@ -50,8 +51,8 @@ and a single Bash recipe with native positional arguments.
 ## Consequences and verification
 
 The task file and runbook must stay compatible as the procedure evolves.
-GitHub-hosted offline fixtures exercise both interfaces against dedicated
-scratch paths. The native hosted lifecycle rehearsal covers the kind
+The GitHub-hosted `make kind-plan-check` job exercises both interfaces against
+dedicated scratch paths. The native hosted lifecycle rehearsal covers the kind
 substrate. Operations holds the private plan and source revision for
 separate approval of the absolute path and SHA-256. This scope covers
 planning for the registered local targets. [Issue #87](https://github.com/stanimirivanov/k8s-infrastructure/issues/87).

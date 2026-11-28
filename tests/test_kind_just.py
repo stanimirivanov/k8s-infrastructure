@@ -37,6 +37,7 @@ esac
 
 TOFU = """#!/bin/bash
 set -eu
+[[ ! -v TF_LOG && ! -v TF_LOG_PATH && ! -v TF_LOG_CORE && ! -v TF_LOG_PROVIDER ]]
 plan_dir=${1#-chdir=}
 shift
 case "$1" in
@@ -44,7 +45,14 @@ case "$1" in
     [[ $* == *'-lockfile=readonly'* && $* == *"-backend-config=path=$FIXTURE_STATE/cluster.tfstate"* ]]
     [[ $TF_CLI_CONFIG_FILE == "$FIXTURE_STATE/opentofu.tfrc" ]]
     ;;
-  state) [[ $2 == list ]]; printf '%s\\n' "$FIXTURE_RESOURCES" ;;
+  state)
+    [[ $2 == list ]]
+    if [[ $# == 2 && ${TF_CLI_ARGS_state_list:-} == -state=* ]]; then
+      exit 0
+    fi
+    [[ $3 == "-state=$FIXTURE_STATE/cluster.tfstate" && ! -v TF_CLI_ARGS_state_list ]]
+    printf '%s\\n' "$FIXTURE_RESOURCES"
+    ;;
   console)
     read -r expression
     [[ "$expression" == *"var.cluster_name == \\"$FIXTURE_CLUSTER\\"" ]]
@@ -59,6 +67,12 @@ case "$1" in
       printf 'fixture plan failure\\n' >&2
       exit 1
     fi
+    if [[ $FIXTURE_PLAN_ERROR == timeout ]]; then
+      [[ -e $FIXTURE_TOFU_DEADLINES ]] || exit 99
+      printf 'fixture plan waiting\\n' >&2
+      trap '' TERM
+      exec sleep 10
+    fi
     ;;
   show)
     [[ $3 == "$plan_dir/saved.tfplan" ]]
@@ -66,6 +80,18 @@ case "$1" in
     ;;
   *) exit 99 ;;
 esac
+"""
+
+TIMEOUT = """#!/bin/bash
+set -eu
+if [[ $1 == --verbose && $2 == --kill-after=5s && $4 == tofu ]]; then
+  printf '%s %s\\n' "$3" "$6" >> "$FIXTURE_TOFU_DEADLINES"
+  if [[ $6 == plan && $FIXTURE_PLAN_ERROR == timeout ]]; then
+    shift 3
+    exec "$FIXTURE_REAL_TIMEOUT" --verbose --kill-after=0.2s 0.2s "$@"
+  fi
+fi
+exec "$FIXTURE_REAL_TIMEOUT" "$@"
 """
 
 KUBECTL = """#!/bin/bash
@@ -153,12 +179,21 @@ class KindJustTests(unittest.TestCase):
         self.state.mkdir(mode=0o700, parents=True)
         tools = self.home / ".local/state/perfeng/kind-74/bin"
         tools.mkdir(mode=0o700, parents=True)
-        for name, contents in [("docker", DOCKER), ("tofu", TOFU), ("kubectl", KUBECTL)]:
+        for name, contents in (
+            ("docker", DOCKER),
+            ("tofu", TOFU),
+            ("kubectl", KUBECTL),
+            ("timeout", TIMEOUT),
+        ):
             tool = tools / name
             tool.write_text(contents, encoding="utf-8")
             tool.chmod(0o700)
         (self.state / "opentofu.tfrc").touch(mode=0o600)
         self.plan_attempted = self.root / "plan-attempted"
+        self.tofu_deadlines = self.root / "tofu-deadlines"
+        real_timeout = shutil.which("timeout", path=os.defpath)
+        if real_timeout is None:
+            self.fail("timeout is required for the local kind planning fixtures")
         self.env.update(
             EXPECTED_DAEMON="fixture-daemon",
             FIXTURE_DAEMON="fixture-daemon",
@@ -173,6 +208,8 @@ class KindJustTests(unittest.TestCase):
             FIXTURE_LIVE_UID="fixture-uid",
             FIXTURE_PLAN_ATTEMPTED=str(self.plan_attempted),
             FIXTURE_PLAN_ERROR="no",
+            FIXTURE_TOFU_DEADLINES=str(self.tofu_deadlines),
+            FIXTURE_REAL_TIMEOUT=real_timeout,
         )
 
     def plan(self, interface: str, profile: str, intent: str):
@@ -193,23 +230,37 @@ class KindJustTests(unittest.TestCase):
             "target.auto.tfvars": MODULE / "profiles" / profile / "target.auto.tfvars",
             "retained_override.tf": MODULE / "profiles" / profile / "retained-lifecycle.tf",
         }
-        expected_inputs = {
-            name: (self.checkout / path).read_bytes() for name, path in inputs.items()
+        expected_blobs = {
+            name: self.git("rev-parse", f"{self.revision}:{path}") for name, path in inputs.items()
         }
-        # Keep the alternate working-tree bytes out of Git's clean-status view.
-        self.git("update-index", "--assume-unchanged", str(inputs["main.tf"]))
-        (self.checkout / inputs["main.tf"]).write_text("working-tree-only data\n", encoding="utf-8")
+        # Change only file metadata so a normal Git status would refresh the index.
+        runbook = self.checkout / RUNBOOK
+        metadata = runbook.stat()
+        os.utime(runbook, ns=(metadata.st_atime_ns, metadata.st_mtime_ns - 1_000_000_000))
+        self.assertEqual(self.git("--no-optional-locks", "status", "--porcelain"), "")
+        index_before = (self.checkout / ".git/index").read_bytes()
+        self.env.update(
+            TF_LOG="TRACE",
+            TF_LOG_PATH=str(self.root / "outside-plan.log"),
+            TF_LOG_CORE="TRACE",
+            TF_LOG_PROVIDER="TRACE",
+        )
 
         for interface in ("just", "native"):
             with self.subTest(interface=interface):
                 result = self.plan(interface, profile, "create")
                 self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual((self.checkout / ".git/index").read_bytes(), index_before)
                 reviews = set((self.state / "plans").glob("plan.*/REVIEW.md"))
                 self.assertEqual(len(reviews), 1)
                 review = reviews.pop()
                 directory = review.parent
                 self.assertEqual(
-                    {name: (directory / name).read_bytes() for name in inputs}, expected_inputs
+                    {
+                        name: self.git("hash-object", "--no-filters", str(directory / name))
+                        for name in inputs
+                    },
+                    expected_blobs,
                 )
                 self.assertEqual(
                     (directory / "source-revision.txt").read_text().strip(), self.revision
@@ -223,11 +274,14 @@ class KindJustTests(unittest.TestCase):
                     self.assertIn(field, evidence)
                 self.assertEqual(directory.stat().st_mode & 0o777, 0o700)
                 self.assertEqual(saved.stat().st_mode & 0o777, 0o600)
-                lock = self.command(
-                    "flock", "-n", str(self.state / "operation.lock"), "true", cwd=self.checkout
-                )
-                self.assertEqual(lock.returncode, 0, lock.stderr)
+                self.assert_lock_released()
                 shutil.rmtree(directory)
+
+    def assert_lock_released(self):
+        lock = self.command(
+            "flock", "-n", str(self.state / "operation.lock"), "true", cwd=self.checkout
+        )
+        self.assertEqual(lock.returncode, 0, lock.stderr)
 
     def assert_refused(self, interface: str, intent: str, message: str):
         result = self.plan(interface, "pilot-74", intent)
@@ -284,6 +338,37 @@ class KindJustTests(unittest.TestCase):
                 )
         self.assertFalse(list(redirected.iterdir()))
 
+    def test_refuses_git_flags_that_hide_planning_files(self):
+        self.prepare_checkout("pilot-74")
+        for flag, path in (
+            ("assume-unchanged", MODULE / "main.tf"),
+            ("skip-worktree", Path("justfile")),
+        ):
+            with self.subTest(flag=flag):
+                file = self.checkout / path
+                reviewed = file.read_bytes()
+                self.git("update-index", f"--{flag}", str(path))
+                file.write_bytes(reviewed + b"\n# Unreviewed local change\n")
+                self.assertEqual(self.git("--no-optional-locks", "status", "--porcelain"), "")
+                for interface in ("just", "native"):
+                    with self.subTest(interface=interface):
+                        self.assert_refused(interface, "create", flag)
+                file.write_bytes(reviewed)
+                self.git("update-index", f"--no-{flag}", str(path))
+
+    def test_create_checks_occupied_state_despite_ambient_state_list_arguments(self):
+        self.prepare_checkout("pilot-74")
+        (self.state / "cluster.tfstate").touch(mode=0o600)
+        alternate_state = self.root / "vacant.tfstate"
+        alternate_state.touch(mode=0o600)
+        self.env.update(
+            FIXTURE_RESOURCES="kind_cluster.pilot",
+            TF_CLI_ARGS_state_list=f"-state={alternate_state}",
+        )
+        for interface in ("just", "native"):
+            with self.subTest(interface=interface):
+                self.assert_refused(interface, "create", "state already contains resources")
+
     def test_managed_requires_matching_registration_state_and_live_uid(self):
         self.prepare_checkout("pilot-74")
         for interface in ("just", "native"):
@@ -321,8 +406,13 @@ class KindJustTests(unittest.TestCase):
 
         for interface in ("just", "native"):
             with self.subTest(interface=interface):
+                self.tofu_deadlines.unlink(missing_ok=True)
                 result = self.plan(interface, "pilot-74", "managed")
                 self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(
+                    self.tofu_deadlines.read_text().splitlines(),
+                    ["120s init", "60s state", "60s console", "180s plan", "60s show"],
+                )
         self.assertEqual(len(list((self.state / "plans").glob("plan.*/REVIEW.md"))), 2)
 
     def test_failed_plan_keeps_diagnostics_without_successful_review(self):
@@ -332,8 +422,27 @@ class KindJustTests(unittest.TestCase):
             with self.subTest(interface=interface):
                 result = self.plan(interface, "pilot-74", "create")
                 self.assertNotEqual(result.returncode, 0)
+                self.assert_lock_released()
         self.assertTrue(self.plan_attempted.exists())
         plans = self.state / "plans"
         self.assertFalse(list(plans.glob("plan.*/REVIEW.md")))
         logs = sorted(plans.glob("plan.*/plan.log"))
         self.assertEqual([log.read_text() for log in logs], ["fixture plan failure\n"] * 2)
+
+    def test_timed_out_plan_keeps_diagnostics_and_releases_the_lock(self):
+        self.prepare_checkout("pilot-74")
+        self.env["FIXTURE_PLAN_ERROR"] = "timeout"
+        for interface in ("just", "native"):
+            with self.subTest(interface=interface):
+                result = self.plan(interface, "pilot-74", "create")
+                self.assertIn(result.returncode, (124, 137), result.stderr)
+                self.assert_lock_released()
+        plans = self.state / "plans"
+        self.assertFalse(list(plans.glob("plan.*/REVIEW.md")))
+        self.assertFalse(list(plans.glob("plan.*/SHA256SUMS")))
+        logs = sorted(plans.glob("plan.*/plan.log"))
+        self.assertEqual(len(logs), 2)
+        for log in logs:
+            evidence = log.read_text()
+            self.assertIn("fixture plan waiting", evidence)
+            self.assertIn("sending signal KILL", evidence)

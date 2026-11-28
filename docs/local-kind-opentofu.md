@@ -53,7 +53,7 @@ export PATH="$HOME/.local/state/perfeng/kind-74/bin:$PATH"
 export DOCKER_HOST=unix:///var/run/docker.sock KIND_EXPERIMENTAL_PROVIDER=docker
 export TF_CLI_CONFIG_FILE="$STATE_DIR/opentofu.tfrc"
 unset DOCKER_CONTEXT TF_WORKSPACE TF_DATA_DIR TF_CLI_ARGS TF_CLI_ARGS_init \
-  TF_CLI_ARGS_state TF_CLI_ARGS_console TF_CLI_ARGS_plan TF_CLI_ARGS_show \
+  TF_CLI_ARGS_state TF_CLI_ARGS_state_list TF_CLI_ARGS_console TF_CLI_ARGS_plan TF_CLI_ARGS_show \
   TF_CLI_ARGS_apply KUBECTL_EXTERNAL_DIFF
 umask 077
 if [[ -d "$STATE_DIR" && "$(realpath -e -- "$STATE_DIR")" == "$STATE_DIR" && ! -L "$STATE_DIR/operation.lock" ]]; then
@@ -110,6 +110,13 @@ selected tracked inputs from the clean, reviewed Git `HEAD`, and saves the
 result in a new private `plans/plan.*` directory. It releases the lock on
 exit so the plan can be reviewed separately from apply.
 
+Use a checkout without Git `assume-unchanged` or `skip-worktree` flags,
+which can hide local changes. Both paths require GNU `timeout`. The OpenTofu
+deadlines are 120 seconds for initialization, 180 seconds for planning, and
+60 seconds each for state listing, console checks, and rendering the plan.
+A process still running five seconds after its deadline is killed. The plan
+can wait up to 30 seconds for the OpenTofu state lock.
+
 ### Plan with just
 
 After the [one-time installation](#install-just-on-linux-amd64), run `just`
@@ -158,7 +165,10 @@ Operations. Run the whole block.
   esac
 
   SOURCE_REVISION=$(git rev-parse --verify 'HEAD^{commit}')
-  CHECKOUT_STATUS=$(git status --porcelain=v1 --untracked-files=all --ignore-submodules=none)
+  INDEX_FLAGS=$(git ls-files -v | LC_ALL=C awk '/^[a-zS] / {print $1}')
+  [[ -z "$INDEX_FLAGS" ]] ||
+    refuse 'Use a clean, reviewed checkout without assume-unchanged or skip-worktree flags.'
+  CHECKOUT_STATUS=$(git --no-optional-locks status --porcelain=v1 --untracked-files=all --ignore-submodules=none)
   [[ -z "$CHECKOUT_STATUS" && "$(git rev-parse --verify 'HEAD^{commit}')" == "$SOURCE_REVISION" ]] ||
     refuse 'Plan from a clean, reviewed checkout at a stable HEAD.'
 
@@ -166,7 +176,8 @@ Operations. Run the whole block.
   export DOCKER_HOST=unix:///var/run/docker.sock KIND_EXPERIMENTAL_PROVIDER=docker
   export TF_CLI_CONFIG_FILE="$STATE_DIR/opentofu.tfrc"
   unset DOCKER_CONTEXT TF_WORKSPACE TF_DATA_DIR TF_CLI_ARGS TF_CLI_ARGS_init \
-    TF_CLI_ARGS_state TF_CLI_ARGS_console TF_CLI_ARGS_plan TF_CLI_ARGS_show
+    TF_CLI_ARGS_state TF_CLI_ARGS_state_list TF_CLI_ARGS_console TF_CLI_ARGS_plan TF_CLI_ARGS_show \
+    TF_LOG TF_LOG_PATH TF_LOG_CORE TF_LOG_PROVIDER
   umask 077
 
   LOCK="$STATE_DIR/operation.lock"
@@ -233,12 +244,17 @@ Operations. Run the whole block.
   rmdir -- "$PLAN_DIR/profiles/$PROFILE" "$PLAN_DIR/profiles"
   printf '%s\n' "$SOURCE_REVISION" > "$PLAN_DIR/source-revision.txt"
   export KUBECONFIG="$PLAN_DIR/provider.kubeconfig"
-  tofu -chdir="$PLAN_DIR" init -no-color -input=false -lockfile=readonly -backend-config="path=$STATE"
+  run_tofu() {
+    local deadline=$1
+    shift
+    timeout --verbose --kill-after=5s "$deadline" tofu -chdir="$PLAN_DIR" "$@"
+  }
+  run_tofu 120s init -no-color -input=false -lockfile=readonly -backend-config="path=$STATE"
 
   if [[ "$INTENT" == managed ]]; then
-    STATE_RESOURCES=$(tofu -chdir="$PLAN_DIR" state list)
+    STATE_RESOURCES=$(run_tofu 60s state list -state="$STATE")
     [[ "$STATE_RESOURCES" == kind_cluster.pilot ]] || refuse 'The registered state must contain only kind_cluster.pilot.'
-    NAME_MATCH=$(tofu -chdir="$PLAN_DIR" console -no-color -state="$STATE" \
+    NAME_MATCH=$(run_tofu 60s console -no-color -state="$STATE" \
       <<< "kind_cluster.pilot.name == var.cluster_name && var.cluster_name == \"$CLUSTER\"")
     [[ "$NAME_MATCH" == true ]] || refuse 'The state or staged cluster name differs from the registration.'
     kubectl --kubeconfig "$KCFG" --context "$CTX" --request-timeout=10s \
@@ -246,17 +262,17 @@ Operations. Run the whole block.
       refuse 'The live kube-system UID could not be matched to the registration.'
   else
     if [[ -e "$STATE" ]]; then
-      STATE_RESOURCES=$(tofu -chdir="$PLAN_DIR" state list)
+      STATE_RESOURCES=$(run_tofu 60s state list -state="$STATE")
       [[ -z "$STATE_RESOURCES" ]] || refuse 'The selected state already contains resources.'
     fi
-    NAME_MATCH=$(tofu -chdir="$PLAN_DIR" console -no-color -state="$STATE" <<< "var.cluster_name == \"$CLUSTER\"")
+    NAME_MATCH=$(run_tofu 60s console -no-color -state="$STATE" <<< "var.cluster_name == \"$CLUSTER\"")
     [[ "$NAME_MATCH" == true ]] || refuse 'The staged cluster name differs from the registration.'
   fi
 
   PLAN="$PLAN_DIR/saved.tfplan"
-  tofu -chdir="$PLAN_DIR" plan -no-color -input=false -lock-timeout=30s -out="$PLAN" 2>&1 |
+  run_tofu 180s plan -no-color -input=false -lock-timeout=30s -out="$PLAN" 2>&1 |
     tee "$PLAN_DIR/plan.log"
-  tofu -chdir="$PLAN_DIR" show -no-color "$PLAN" > "$PLAN_DIR/plan.txt"
+  run_tofu 60s show -no-color "$PLAN" > "$PLAN_DIR/plan.txt"
   sha256sum -- "$PLAN" > "$PLAN_DIR/SHA256SUMS"
   read -r PLAN_SHA256 _ < "$PLAN_DIR/SHA256SUMS"
   cat "$PLAN_DIR/plan.txt" "$PLAN_DIR/SHA256SUMS"
@@ -272,8 +288,8 @@ Keep the staged root module, selected profile, provider lock and saved plan
 fixed between review and apply. The plan directory contains the source
 revision, readable `plan.txt`, checksum file `SHA256SUMS`, and `REVIEW.md`
 with the profile, intent, revision, absolute saved-plan path and digest.
-A failed plan leaves `plan.log` for diagnosis. Use a new plan directory
-when the review record is missing.
+A failed or timed-out `plan` command leaves `plan.log` for diagnosis. Use
+a new plan directory when the review record is missing.
 
 Review the whole plan. An unchanged managed target reports zero changes.
 For a fresh pilot, check each item:
@@ -391,7 +407,7 @@ paths must be vacant. Existing resources or registration files need
   test -z "$CLUSTER_LABELS$CLUSTER_NAMES" ||
     { printf '%s\n' 'The selected kind name is already in use.' >&2; exit 1; }
   if [[ -e "$STATE_DIR/cluster.tfstate" ]]; then
-    STATE_RESOURCES=$(tofu -chdir="$PLAN_DIR" state list)
+    STATE_RESOURCES=$(tofu -chdir="$PLAN_DIR" state list -state="$STATE_DIR/cluster.tfstate")
     test -z "$STATE_RESOURCES" ||
       { printf '%s\n' 'The selected state already contains resources.' >&2; exit 1; }
   fi
@@ -406,7 +422,7 @@ kind_cluster.pilot` for inspection.
 
 ~~~sh
 {
-  STATE_RESOURCES=$(tofu -chdir="$PLAN_DIR" state list)
+  STATE_RESOURCES=$(tofu -chdir="$PLAN_DIR" state list -state="$STATE_DIR/cluster.tfstate")
   test "$STATE_RESOURCES" = kind_cluster.pilot
   STATE_NAME_MATCH=$(tofu -chdir="$PLAN_DIR" console -no-color -state="$STATE_DIR/cluster.tfstate" \
     <<< "kind_cluster.pilot.name == var.cluster_name && var.cluster_name == \"$CLUSTER\"")
