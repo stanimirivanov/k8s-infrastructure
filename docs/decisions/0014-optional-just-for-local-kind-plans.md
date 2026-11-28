@@ -2,13 +2,13 @@
 
 - Status: Proposed
 - Date: 2026-11-28
-- Related work: Infrastructure #81 and #87
+- Related work: Infrastructure #81, #87 and #88
 - Supersedes in part: [ADR 0001's operator tooling for registered local kind planning](0001-repository-boundary-and-tooling.md)
 
 ## TL;DR
 
-- Offer `just plan` to operators of the registered local OpenTofu kind profiles
-  on Linux AMD64. Keep the native runbook as a supported planning interface.
+- Offer `just plan`, `just apply` and `just verify` for the registered local
+  OpenTofu kind profiles on Linux AMD64. Keep the native runbook supported.
 - Stage the selected tracked inputs from reviewed Git `HEAD` and save the same
   private evidence for either interface.
 - Use the pinned upstream release and run both interfaces in offline fixtures.
@@ -28,8 +28,9 @@ Use an optional `justfile` for these registered kind profiles. Bare `just`
 lists the available recipes. `just plan` takes the profile and intent as
 positional arguments. The recipe contains the Bash orchestration for the
 existing native tools. The Markdown procedure uses the same target lock,
-backend, archive inputs and review evidence so that either plan can enter
-the native approved-apply procedure.
+backend, archive inputs and review evidence. An operator can apply a plan
+from either planning interface. Either verification interface can use the
+shared apply receipt and the original staged inputs after registration.
 
 Pin the maintained `casey/just` 1.59.0 Linux AMD64 musl archive to the
 repository's SHA-256. It is distributed under CC0-1.0. The installation
@@ -54,5 +55,5 @@ The task file and runbook must stay compatible as the procedure evolves.
 The GitHub-hosted `make kind-plan-check` job exercises both interfaces against
 dedicated scratch paths. The native hosted lifecycle rehearsal covers the kind
 substrate. Operations holds the private plan and source revision for
-separate approval of the absolute path and SHA-256. This scope covers
-planning for the registered local targets. [Issue #87](https://github.com/stanimirivanov/k8s-infrastructure/issues/87).
+separate approval of the absolute path and SHA-256. [Issue #87](https://github.com/stanimirivanov/k8s-infrastructure/issues/87) ·
+[Issue #88](https://github.com/stanimirivanov/k8s-infrastructure/issues/88).

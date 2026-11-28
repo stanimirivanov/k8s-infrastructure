@@ -1,4 +1,4 @@
-"""Exercise the optional kind planning interface with disposable fixtures."""
+"""Exercise the optional local kind recipes with disposable fixtures."""
 
 import hashlib
 import os
@@ -51,16 +51,39 @@ case "$1" in
       exit 0
     fi
     [[ $3 == "-state=$FIXTURE_STATE/cluster.tfstate" && ! -v TF_CLI_ARGS_state_list ]]
-    printf '%s\\n' "$FIXTURE_RESOURCES"
+    if [[ -s "$FIXTURE_STATE/cluster.tfstate" ]]; then
+      printf 'kind_cluster.pilot\\n'
+    else
+      printf '%s\\n' "$FIXTURE_RESOURCES"
+    fi
     ;;
   console)
     read -r expression
     [[ "$expression" == *"var.cluster_name == \\"$FIXTURE_CLUSTER\\"" ]]
     printf '%s\\n' "$FIXTURE_NAME_MATCH"
     ;;
+  apply)
+    [[ ! -v TF_CLI_ARGS_apply && $KUBECONFIG == "$plan_dir/provider.kubeconfig" ]]
+    [[ $2 == -no-color && $3 == -input=false && $4 == -lock-timeout=30s ]]
+    [[ $5 == "-state=$FIXTURE_STATE/cluster.tfstate" && $6 == "-state-out=$FIXTURE_STATE/cluster.tfstate" ]]
+    [[ $7 == "-backup=$FIXTURE_STATE/cluster.tfstate.backup" && $8 == "$plan_dir/saved.tfplan" && $# == 8 ]]
+    if flock -n "$FIXTURE_STATE/operation.lock" true; then exit 99; fi
+    printf 'apply\\n' >> "$FIXTURE_APPLY_ATTEMPTS"
+    if [[ $FIXTURE_APPLY_ERROR == stale ]]; then
+      printf 'Error: Saved plan is stale\\n' >&2
+      exit 1
+    fi
+    printf 'fixture applied state\\n' > "$FIXTURE_STATE/cluster.tfstate"
+    printf 'fixture apply complete\\n'
+    ;;
   plan)
     [[ $KUBECONFIG == "$plan_dir/provider.kubeconfig" && $* == *'-lock-timeout=30s'* ]]
     if flock -n "$FIXTURE_STATE/operation.lock" true; then exit 99; fi
+    if [[ $* == *'-detailed-exitcode'* ]]; then
+      [[ $* == *"-state=$FIXTURE_STATE/cluster.tfstate"* ]]
+      printf 'fixture repeat plan\\n'
+      exit "$FIXTURE_REPEAT_EXIT"
+    fi
     touch "$FIXTURE_PLAN_ATTEMPTED"
     printf 'fixture saved plan\\n' > "$plan_dir/saved.tfplan"
     if [[ $FIXTURE_PLAN_ERROR == yes ]]; then
@@ -76,7 +99,11 @@ case "$1" in
     ;;
   show)
     [[ $3 == "$plan_dir/saved.tfplan" ]]
-    printf 'fixture readable plan\\n'
+    if [[ $2 == -json ]]; then
+      printf '{"variables":{"cluster_name":{"value":"%s"}}}\\n' "$FIXTURE_PLAN_CLUSTER"
+    else
+      printf 'fixture readable plan\\n'
+    fi
     ;;
   *) exit 99 ;;
 esac
@@ -96,10 +123,65 @@ exec "$FIXTURE_REAL_TIMEOUT" "$@"
 
 KUBECTL = """#!/bin/bash
 set -eu
-[[ $1 == --kubeconfig && $2 == "$FIXTURE_STATE/kubeconfig" ]]
+[[ $1 == --kubeconfig ]]
+case "$2" in
+  "$FIXTURE_STATE/kubeconfig"|"$FIXTURE_STATE/plans/"*/kubeconfig) ;;
+  *) exit 99 ;;
+esac
 [[ $3 == --context && $4 == "kind-$FIXTURE_CLUSTER" ]]
-[[ $5 == --request-timeout=* && $6 == wait && $9 == namespace/kube-system ]]
-[[ $7 == "--for=jsonpath={.metadata.uid}=$FIXTURE_LIVE_UID" ]]
+if flock -n "$FIXTURE_STATE/operation.lock" true; then exit 99; fi
+shift 4
+if [[ $1 == --request-timeout=* ]]; then shift; fi
+case "$1 $2" in
+  'config view')
+    printf 'https://127.0.0.1:12345'
+    ;;
+  'get namespace')
+    [[ $3 == kube-system ]]
+    printf '%s' "$FIXTURE_LIVE_UID"
+    ;;
+  'wait --for=condition=Ready')
+    [[ $3 == --timeout=90s && $# == 6 ]]
+    [[ $4 == "node/$FIXTURE_CLUSTER-control-plane" &&
+       $5 == "node/$FIXTURE_CLUSTER-worker" && $6 == "node/$FIXTURE_CLUSTER-worker2" ]]
+    if [[ $FIXTURE_READINESS != ready ]]; then
+      printf '%s\\n' "$FIXTURE_READINESS" >&2
+      exit 124
+    fi
+    ;;
+  'get nodes')
+    case "$3" in
+      -o)
+        printf 'node/%s\\n' "$FIXTURE_CLUSTER-worker" "$FIXTURE_CLUSTER-control-plane"
+        if [[ $FIXTURE_INVENTORY != missing ]]; then printf 'node/%s\\n' "$FIXTURE_CLUSTER-worker2"; fi
+        if [[ $FIXTURE_INVENTORY == extra ]]; then printf 'node/%s\\n' "$FIXTURE_CLUSTER-extra"; fi
+        ;;
+      -L) printf 'fixture node inventory\\n' ;;
+      -l)
+        case "$4" in
+          'workload=control-plane,node-role.kubernetes.io/control-plane') node=control-plane ;;
+          'workload=performance-generator,perfeng.io/node-type=generator') node=worker ;;
+          'workload=sut,perfeng.io/node-type=sut') node=worker2 ;;
+          *) exit 99 ;;
+        esac
+        if [[ $FIXTURE_INVENTORY == placement && $node == worker2 ]]; then node=worker; fi
+        printf 'node/%s\\n' "$FIXTURE_CLUSTER-$node"
+        ;;
+      *) exit 99 ;;
+    esac
+    ;;
+  "wait "--for=jsonpath*)
+    [[ $4 == namespace/kube-system && $2 == "--for=jsonpath={.metadata.uid}=$FIXTURE_LIVE_UID" ]]
+    ;;
+  *) exit 99 ;;
+esac
+"""
+
+KIND = """#!/bin/bash
+set -eu
+[[ $1 == get && $2 == kubeconfig && $3 == --name && $4 == "$FIXTURE_CLUSTER" ]]
+if flock -n "$FIXTURE_STATE/operation.lock" true; then exit 99; fi
+printf 'fixture dedicated kubeconfig\\n'
 """
 
 
@@ -116,7 +198,13 @@ class KindJustTests(unittest.TestCase):
     def test_bare_just_lists_supported_tasks(self):
         result = self.command(JUST or "just", cwd=REPO)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertRegex(result.stdout, r"(?m)^\s+plan PROFILE INTENT\b")
+        for signature in (
+            "plan PROFILE INTENT",
+            "apply PROFILE INTENT ABSOLUTE_PLAN_PATH SHA256 APPROVER APPROVAL_UTC",
+            "verify PROFILE ABSOLUTE_PLAN_PATH",
+        ):
+            with self.subTest(recipe=signature):
+                self.assertRegex(result.stdout, rf"(?m)^\s+{signature}\b")
 
     def test_plan_refuses_unregistered_profile_and_intent(self):
         result = self.command(JUST or "just", "plan", "pilot-74", cwd=REPO)
@@ -183,6 +271,7 @@ class KindJustTests(unittest.TestCase):
             ("docker", DOCKER),
             ("tofu", TOFU),
             ("kubectl", KUBECTL),
+            ("kind", KIND),
             ("timeout", TIMEOUT),
         ):
             tool = tools / name
@@ -191,6 +280,7 @@ class KindJustTests(unittest.TestCase):
         (self.state / "opentofu.tfrc").touch(mode=0o600)
         self.plan_attempted = self.root / "plan-attempted"
         self.tofu_deadlines = self.root / "tofu-deadlines"
+        self.apply_attempts = self.root / "apply-attempts"
         real_timeout = shutil.which("timeout", path=os.defpath)
         if real_timeout is None:
             self.fail("timeout is required for the local kind planning fixtures")
@@ -200,6 +290,14 @@ class KindJustTests(unittest.TestCase):
             FIXTURE_CLUSTER="perfeng-iac-pilot-74"
             if profile == "pilot-74"
             else "perfeng-retained-434",
+            FIXTURE_PLAN_CLUSTER="perfeng-iac-pilot-74"
+            if profile == "pilot-74"
+            else "perfeng-retained-434",
+            FIXTURE_APPLY_ATTEMPTS=str(self.apply_attempts),
+            FIXTURE_APPLY_ERROR="none",
+            FIXTURE_INVENTORY="correct",
+            FIXTURE_READINESS="ready",
+            FIXTURE_REPEAT_EXIT="0",
             FIXTURE_LABEL="",
             FIXTURE_NAME="",
             FIXTURE_STATE=str(self.state),
@@ -220,6 +318,276 @@ class KindJustTests(unittest.TestCase):
         native_section = runbook.split("### Plan with native commands\n", 1)[1]
         source = native_section.split("~~~bash\n", 1)[1].split("~~~", 1)[0]
         return self.command("bash", "--noprofile", "--norc", cwd=self.checkout, input_text=source)
+
+    def saved_plan(self, interface: str, profile: str, intent: str):
+        result = self.plan(interface, profile, intent)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return next((self.state / "plans").glob("plan.*/saved.tfplan"))
+
+    def apply(self, profile: str, intent: str, saved: Path | str, digest: str):
+        return self.command(
+            JUST or "just",
+            "apply",
+            profile,
+            intent,
+            str(saved),
+            digest,
+            "Fixture Approver",
+            "2026-11-28T01:02:03Z",
+            cwd=self.checkout,
+        )
+
+    def register_existing_cluster(self):
+        (self.state / "identity.json").write_text(
+            '{"daemon":"fixture-daemon","uid":"fixture-uid"}\n', encoding="utf-8"
+        )
+        (self.state / "kubeconfig").touch(mode=0o600)
+        (self.state / "cluster.tfstate").touch(mode=0o600)
+        self.env.update(FIXTURE_RESOURCES="kind_cluster.pilot")
+
+    def test_applies_a_native_managed_plan_and_verifies_with_staged_inputs(self):
+        profile = "pilot-74"
+        self.prepare_checkout(profile)
+        self.register_existing_cluster()
+        saved = self.saved_plan("native", profile, "managed")
+        digest = hashlib.sha256(saved.read_bytes()).hexdigest()
+        (self.checkout / MODULE / "main.tf").unlink()
+        self.env["TF_CLI_ARGS_apply"] = "-lock=false"
+        result = self.apply(profile, "managed", saved, digest)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("zero changes", result.stdout)
+        self.assertEqual((saved.parent / "apply.log").read_text(), "fixture apply complete\n")
+        self.assertEqual((saved.parent / "nodes.txt").read_text(), "fixture node inventory\n")
+        self.assertEqual((saved.parent / "repeat.log").read_text(), "fixture repeat plan\n")
+        self.assertEqual(self.apply_attempts.read_text(), "apply\n")
+        retried = self.apply(profile, "managed", saved, digest)
+        self.assertNotEqual(retried.returncode, 0)
+        self.assertIn("already attempted", retried.stderr)
+        self.assertEqual(self.apply_attempts.read_text(), "apply\n")
+        self.assert_lock_released()
+
+    def native_block(self, heading: str):
+        runbook = (self.checkout / RUNBOOK).read_text(encoding="utf-8")
+        section = runbook.split(f"{heading}\n", 1)[1]
+        return section.split("~~~sh\n", 1)[1].split("~~~", 1)[0]
+
+    def native_operation(self, *headings: str):
+        session = self.native_block("## Open a locked session").split('if [[ -d "$STATE_DIR"', 1)[0]
+        source = "\n".join(
+            (
+                session,
+                'exec 9>>"$STATE_DIR/operation.lock"',
+                "flock -w 15 9",
+                'KCFG="$STATE_DIR/kubeconfig"',
+                'CTX="kind-$CLUSTER"',
+                'EXPECTED_DAEMON=$(jq -er ".daemon" "$STATE_DIR/identity.json")',
+                'EXPECTED_UID=$(jq -er ".uid" "$STATE_DIR/identity.json")',
+                *(self.native_block(heading) for heading in headings),
+            )
+        )
+        return self.command(
+            "bash",
+            "--noprofile",
+            "--norc",
+            "-e",
+            "-o",
+            "pipefail",
+            cwd=self.checkout,
+            input_text=source,
+        )
+
+    def verify(self, profile: str, saved: Path):
+        return self.command(JUST or "just", "verify", profile, str(saved), cwd=self.checkout)
+
+    def test_native_apply_of_a_recipe_plan_can_resume_with_the_recipe(self):
+        profile = "pilot-74"
+        self.prepare_checkout(profile)
+        self.register_existing_cluster()
+        saved = self.saved_plan("just", profile, "managed")
+        digest = hashlib.sha256(saved.read_bytes()).hexdigest()
+        self.env.update(
+            INTENT="managed",
+            APPROVED_PLAN=str(saved),
+            APPROVED_SHA256=digest,
+            APPROVED_BY="Fixture Approver",
+            APPROVED_AT="2026-11-28T01:02:03Z",
+        )
+        result = self.native_operation(
+            "### Locate the approved plan",
+            "## Check the plan target",
+            "### Managed target",
+            "### Run the saved apply",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.verify(profile, saved)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("zero changes", result.stdout)
+        self.assertEqual(self.apply_attempts.read_text(), "apply\n")
+        self.assert_lock_released()
+
+    def test_native_verification_resumes_an_interrupted_recipe_apply(self):
+        profile = "pilot-74"
+        self.prepare_checkout(profile)
+        self.register_existing_cluster()
+        saved = self.saved_plan("native", profile, "managed")
+        digest = hashlib.sha256(saved.read_bytes()).hexdigest()
+        self.env["FIXTURE_READINESS"] = "fixture wait interrupted"
+        result = self.apply(profile, "managed", saved, digest)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("verification phase", result.stderr)
+        log = saved.parent / "verify.log"
+        self.assertIn("fixture wait interrupted", log.read_text())
+        self.assertEqual(log.stat().st_mode & 0o777, 0o600)
+        self.assert_lock_released()
+
+        self.env.update(FIXTURE_READINESS="ready", APPROVED_PLAN=str(saved))
+        result = self.native_operation(
+            "### Locate the approved plan",
+            "### Resume verification",
+            "## Check the plan target",
+            "### Managed target",
+            "## Verify the apply",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("zero changes", result.stdout)
+        self.assertEqual(self.apply_attempts.read_text(), "apply\n")
+        self.assert_lock_released()
+
+    def test_create_records_the_uid_from_the_dedicated_kubeconfig(self):
+        profile = "pilot-74"
+        self.prepare_checkout(profile)
+        saved = self.saved_plan("native", profile, "create")
+        digest = hashlib.sha256(saved.read_bytes()).hexdigest()
+        result = self.apply(profile, "create", saved, digest)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("zero changes", result.stdout)
+        for filename, expected in (
+            ("kubeconfig", "fixture dedicated kubeconfig"),
+            ("identity.json", "fixture-uid"),
+        ):
+            registered = self.state / filename
+            self.assertEqual(registered.read_bytes(), (saved.parent / filename).read_bytes())
+            self.assertIn(expected, registered.read_text())
+            self.assertEqual(registered.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.apply_attempts.read_text(), "apply\n")
+        self.assert_lock_released()
+
+    def test_incomplete_create_registration_preserves_evidence_for_recovery(self):
+        profile = "pilot-74"
+        self.prepare_checkout(profile)
+        saved = self.saved_plan("just", profile, "create")
+        digest = hashlib.sha256(saved.read_bytes()).hexdigest()
+        self.env["FIXTURE_LIVE_UID"] = ""
+        result = self.apply(profile, "create", saved, digest)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("registration phase", result.stderr)
+        self.assertIn("has no UID", result.stderr)
+        self.assertTrue((saved.parent / "kubeconfig").exists())
+        self.assertFalse((self.state / "identity.json").exists())
+        self.assertFalse((saved.parent / "repeat.log").exists())
+        result = self.verify(profile, saved)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("kubeconfig or identity record is missing", result.stderr)
+        self.assertEqual(self.apply_attempts.read_text(), "apply\n")
+        self.assert_lock_released()
+
+    def test_apply_refuses_a_wrong_daemon_uid_or_saved_plan_cluster(self):
+        profile = "retained-434"
+        self.prepare_checkout(profile)
+        self.register_existing_cluster()
+        saved = self.saved_plan("just", profile, "managed")
+        digest = hashlib.sha256(saved.read_bytes()).hexdigest()
+        for variable, wrong, message in (
+            ("FIXTURE_DAEMON", "other-daemon", "Docker daemon ID differs"),
+            ("FIXTURE_LIVE_UID", "other-uid", "live kube-system UID"),
+            (
+                "FIXTURE_PLAN_CLUSTER",
+                "perfeng-iac-pilot-74",
+                "saved plan names a different cluster",
+            ),
+        ):
+            with self.subTest(variable=variable):
+                previous = self.env[variable]
+                self.env[variable] = wrong
+                result = self.apply(profile, "managed", saved, digest)
+                self.env[variable] = previous
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr)
+                self.assertFalse(self.apply_attempts.exists())
+                self.assertFalse((saved.parent / "apply.status").exists())
+                self.assert_lock_released()
+
+    def test_stale_apply_keeps_backend_refusal_and_never_plans_or_verifies(self):
+        profile = "pilot-74"
+        self.prepare_checkout(profile)
+        saved = self.saved_plan("native", profile, "create")
+        digest = hashlib.sha256(saved.read_bytes()).hexdigest()
+        self.env["FIXTURE_APPLY_ERROR"] = "stale"
+        self.plan_attempted.unlink()
+        result = self.apply(profile, "create", saved, digest)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("apply phase", result.stderr)
+        self.assertIn("Saved plan is stale", (saved.parent / "apply.log").read_text())
+        self.assertFalse(self.plan_attempted.exists())
+        self.assertFalse((self.state / "identity.json").exists())
+        result = self.verify(profile, saved)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no completed apply receipt", result.stderr)
+        self.assertEqual(self.apply_attempts.read_text(), "apply\n")
+        self.assert_lock_released()
+
+    def test_verify_requires_ready_nodes_exact_inventory_placement_and_zero_changes(self):
+        profile = "pilot-74"
+        self.prepare_checkout(profile)
+        self.register_existing_cluster()
+        saved = self.saved_plan("just", profile, "managed")
+        digest = hashlib.sha256(saved.read_bytes()).hexdigest()
+        result = self.apply(profile, "managed", saved, digest)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for variable, wrong, message in (
+            ("FIXTURE_READINESS", "one node unready", "did not all become Ready"),
+            ("FIXTURE_INVENTORY", "missing", "Unexpected node inventory"),
+            ("FIXTURE_INVENTORY", "extra", "Unexpected node inventory"),
+            ("FIXTURE_INVENTORY", "placement", "Unexpected placement"),
+            ("FIXTURE_REPEAT_EXIT", "2", "Repeat plan exited 2"),
+        ):
+            with self.subTest(variable=variable, wrong=wrong):
+                previous = self.env[variable]
+                self.env[variable] = wrong
+                result = self.verify(profile, saved)
+                self.env[variable] = previous
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr)
+                self.assertIn("verification phase", result.stderr)
+                self.assert_lock_released()
+        result = self.verify(profile, saved)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("zero changes", result.stdout)
+        self.assertEqual(self.apply_attempts.read_text(), "apply\n")
+
+    def test_apply_refuses_an_unapproved_digest_and_noncanonical_plan(self):
+        profile = "pilot-74"
+        self.prepare_checkout(profile)
+        saved = self.saved_plan("native", profile, "create")
+        digest = hashlib.sha256(saved.read_bytes()).hexdigest()
+        alias = saved.with_name("link.tfplan")
+        alias.symlink_to(saved)
+        outside = self.root / "saved.tfplan"
+        shutil.copy2(saved, outside)
+        for path, sha, message in (
+            (saved, "0" * 64, "approved SHA-256"),
+            (saved.relative_to(self.root), digest, "canonical saved plan"),
+            (f"{saved.parent}/../{saved.parent.name}/saved.tfplan", digest, "canonical saved plan"),
+            (outside, digest, "canonical saved plan"),
+            (alias, digest, "canonical saved plan"),
+        ):
+            with self.subTest(path=path, digest=sha):
+                result = self.apply(profile, "create", path, sha)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr)
+                self.assertFalse((saved.parent / "apply.log").exists())
+                self.assertFalse((saved.parent / "apply.status").exists())
+                self.assert_lock_released()
 
     def test_directs_each_interface_to_reviewed_inputs_and_compatible_artifacts(self):
         profile = "retained-434"
