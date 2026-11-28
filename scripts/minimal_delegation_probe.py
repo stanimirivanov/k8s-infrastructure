@@ -582,10 +582,14 @@ def require_forbidden_job_read(
     try:
         get_jobs_raw(target, actor, namespace, name=name, selector=selector, watch=watch)
     except CommandFailure as error:
-        if error.denial == ("authorization", "forbidden"):
-            return
-        raise
-    raise ValueError("Native Job request escaped the observer's reviewed authorization")
+        if error.timed_out or error.denial != ("authorization", "forbidden"):
+            raise
+        verb = "watch" if watch else "get" if name is not None else "list"
+        # Kubernetes assigns the exact metadata.name selector to the
+        # authorization name on collection list and watch requests.
+        decision(target, actor, verb, "jobs.batch", namespace, name=name or selector, yes=False)
+    else:
+        raise ValueError("Native Job request escaped the observer's reviewed authorization")
 
 
 def prove_observer_scope(target: Target, operation: Operation, foreign: str) -> None:

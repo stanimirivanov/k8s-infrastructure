@@ -350,6 +350,13 @@ def configure(
         if json.loads(raw)["metadata"].get("deletionTimestamp"):
             raise ValueError("Reviewed deployment observer ServiceAccount is terminating")
     preflight = database_runtime.inventory(target, objects)
+    if (
+        existing_job
+        and operation
+        and operation.observer
+        and ("RoleBinding", operation.observer_binding, operation.namespace) not in preflight
+    ):
+        raise ValueError("Used attempt is missing its reviewed observer binding")
     base = render(target) if operation else objects
     bindings = [item for item in objects if item["kind"] == "RoleBinding"]
     attempt_grants = [
@@ -470,11 +477,12 @@ def withdrawal_path(target: Target, operation: Operation) -> Path:
     return target.directory / f"{target.name}.delegation-withdraw-{operation.launcher}.json"
 
 
-def attempt_resources(target: Target, operation: Operation) -> list[dict]:
+def attempt_bindings(target: Target, operation: Operation) -> list[dict]:
     return [
         item
         for item in render(target, operation)
-        if item["metadata"]["labels"][OWNER_LABEL] == operation.launcher
+        if item["kind"] == "RoleBinding"
+        and item["metadata"]["labels"][OWNER_LABEL] == operation.launcher
     ]
 
 
@@ -516,20 +524,9 @@ def withdrawal_job(target: Target, operation: Operation) -> dict:
     return {"jobUID": uid, "podUIDs": sorted(pod_uids)}
 
 
-def delete_attempt_resource(target: Target, item: dict) -> None:
-    plurals = {
-        "RoleBinding": "rolebindings",
-        "ValidatingAdmissionPolicyBinding": "validatingadmissionpolicybindings",
-        "ValidatingAdmissionPolicy": "validatingadmissionpolicies",
-        "PodTemplate": "podtemplates",
-        "Role": "roles",
-        "ServiceAccount": "serviceaccounts",
-    }
-    kind, name, ns = reference(item)
-    path = "/api/v1" if item["apiVersion"] == "v1" else f"/apis/{item['apiVersion']}"
-    if ns:
-        path += f"/namespaces/{ns}"
-    path += f"/{plurals[kind]}/{name}"
+def delete_attempt_binding(target: Target, item: dict) -> None:
+    _, name, ns = reference(item)
+    path = f"/apis/{item['apiVersion']}/namespaces/{ns}/rolebindings/{name}"
     runtime.command(
         target,
         [
@@ -555,8 +552,47 @@ def delete_attempt_resource(target: Target, item: dict) -> None:
     )
 
 
+WITHDRAWAL_PHASES = (
+    "attempt-verified",
+    "launcher-revoked",
+    "execution-rechecked",
+    "bindings-removed",
+    "completion",
+)
+
+
+def read_withdrawal(path: Path, own: dict, binding_names: set[str]) -> dict | None:
+    try:
+        receipt = json.loads(read_bounded(path))
+    except FileNotFoundError:
+        return None
+    if not isinstance(receipt, dict):
+        raise ValueError("Invalid withdrawal receipt")
+    phase = receipt.get("lastCompletedPhase")
+    uids = receipt.get("resourceUIDs")
+    job_uid = receipt.get("jobUID")
+    pod_uids = receipt.get("podUIDs")
+    if (
+        receipt.keys()
+        != own.keys() | {"lastCompletedPhase", "outcome", "resourceUIDs", "jobUID", "podUIDs"}
+        or any(receipt.get(key) != value for key, value in own.items())
+        or phase not in WITHDRAWAL_PHASES
+        or receipt.get("outcome") != ("withdrawn" if phase == "completion" else "withdrawing")
+        or not isinstance(uids, dict)
+        or not uids
+        or not uids.keys() <= binding_names
+        or any(not isinstance(uid, str) or not uid for uid in uids.values())
+        or (job_uid is not None and (not isinstance(job_uid, str) or not job_uid))
+        or not isinstance(pod_uids, list)
+        or any(not isinstance(uid, str) or not uid for uid in pod_uids)
+        or (job_uid is None and pod_uids)
+    ):
+        raise ValueError("Withdrawal receipt does not match the reviewed attempt and target")
+    return receipt
+
+
 def withdraw(target: Target, operation: Operation, incarnation: str) -> dict:
-    """Retire one reviewed attempt under the caller's existing provider lock."""
+    """Revoke the reviewed attempt bindings under the caller's provider lock."""
     path = withdrawal_path(target, operation)
     own = {
         **identity(target),
@@ -564,69 +600,69 @@ def withdraw(target: Target, operation: Operation, incarnation: str) -> dict:
         "operationDigest": operation.digest,
         **observer_handoff(operation),
     }
-    try:
-        receipt = json.loads(read_bounded(path))
-    except FileNotFoundError:
-        receipt = None
-    if receipt is not None and (
-        any(receipt.get(key) != value for key, value in own.items())
-        or receipt.get("outcome") not in {"withdrawing", "withdrawn"}
-    ):
-        raise ValueError("Withdrawal receipt does not match the reviewed attempt and target")
-    desired = attempt_resources(target, operation)
+    desired = attempt_bindings(target, operation)
+    binding_names = {
+        reference(item): "/".join(part for part in reference(item) if part) for item in desired
+    }
+    receipt = read_withdrawal(path, own, set(binding_names.values()))
     present = database_runtime.inventory(target, desired)
     for item in desired:
         actual = present.get(reference(item))
         if actual is not None:
             check_document(item, actual, type_checked=False)
-    uids = {
-        "/".join(part for part in key if part): item["metadata"]["uid"]
-        for key, item in present.items()
-    }
+    uids = {binding_names[key]: item["metadata"]["uid"] for key, item in present.items()}
     if receipt is not None and any(
         receipt["resourceUIDs"].get(key) != uid for key, uid in uids.items()
     ):
-        raise ValueError("Attempt resource was replaced after withdrawal began")
+        raise ValueError("Attempt RoleBinding was replaced after withdrawal began")
     if receipt is not None and receipt["outcome"] == "withdrawn":
         if present:
-            raise ValueError("Withdrawn attempt resources reappeared")
+            raise ValueError("Withdrawn attempt bindings reappeared")
         return receipt
-    observed = withdrawal_job(target, operation)
     if receipt is None:
         if not present:
-            raise ValueError("No reviewed attempt resources exist to withdraw")
-        receipt = {**own, **observed, "resourceUIDs": uids, "outcome": "withdrawing"}
+            raise ValueError("No reviewed attempt bindings exist to withdraw")
+        receipt = {
+            **own,
+            **withdrawal_job(target, operation),
+            "resourceUIDs": uids,
+            "lastCompletedPhase": "attempt-verified",
+            "outcome": "withdrawing",
+        }
         minimal_network.save_receipt(path, receipt)
-    elif receipt["jobUID"] is not None and receipt["jobUID"] != observed["jobUID"]:
-        raise ValueError("Reviewed Job identity changed after withdrawal began")
+
+    def checkpoint(phase: str) -> None:
+        if WITHDRAWAL_PHASES.index(phase) >= WITHDRAWAL_PHASES.index(receipt["lastCompletedPhase"]):
+            receipt["lastCompletedPhase"] = phase
+            minimal_network.save_receipt(path, receipt)
+
     launcher_key = "RoleBinding", operation.launcher, operation.namespace
     if launcher_key in present:
-        delete_attempt_resource(target, present.pop(launcher_key))
+        delete_attempt_binding(target, present[launcher_key])
+        launcher_binding = next(item for item in desired if reference(item) == launcher_key)
+        if database_runtime.inventory(target, [launcher_binding]):
+            raise ValueError("Launcher binding withdrawal is incomplete; inspect and retry")
     launcher = probe.as_account(operations_namespace(target), operation.launcher)
     with runtime.deadline(20):
         while probe.allowed(target, launcher, "create", "jobs.batch", operation.namespace):
             time.sleep(1)
+    checkpoint("launcher-revoked")
+    observed = withdrawal_job(target, operation)
+    if any(receipt[key] != value for key, value in observed.items()):
+        raise ValueError("Reviewed Job or Pod identity changed after withdrawal began")
+    checkpoint("execution-rechecked")
+    observer_key = "RoleBinding", operation.observer_binding, operation.namespace
+    if observer_key in present:
+        delete_attempt_binding(target, present[observer_key])
+    if database_runtime.inventory(target, desired):
+        raise ValueError("Attempt binding withdrawal is incomplete; inspect and retry")
+    checkpoint("bindings-removed")
+    # Requests authorized before revocation can still complete. Retain the
+    # reviewed admission and runtime controls for the provider's retirement.
     if withdrawal_job(target, operation) != observed:
         raise ValueError("Attempt changed during withdrawal; inspect its outcome before retrying")
-    receipt.update(observed)
-    minimal_network.save_receipt(path, receipt)
-    # Removing the admission bindings before their parameter keeps other
-    # flows free of missing-parameter errors.
-    for kind in (
-        "RoleBinding",
-        "ValidatingAdmissionPolicyBinding",
-        "ValidatingAdmissionPolicy",
-        "PodTemplate",
-        "Role",
-        "ServiceAccount",
-    ):
-        for key, item in present.items():
-            if key[0] == kind:
-                delete_attempt_resource(target, item)
-    if database_runtime.inventory(target, desired):
-        raise ValueError("Attempt withdrawal is incomplete; inspect and retry")
     receipt["outcome"] = "withdrawn"
-    minimal_network.save_receipt(path, receipt)
+    checkpoint("completion")
     return receipt
 
 
@@ -853,6 +889,7 @@ def qualify(target: Target, request: dict, host_id: str) -> dict:
                 probe.prove_observer_revoked(target, operation)
                 receipt["nativeControls"]["attemptWithdrawal"] = {
                     "jobUID": withdrawal["jobUID"],
+                    "launcherCreateRevoked": True,
                     "observerAccessRevoked": True,
                 }
                 if withdrawal["jobUID"] != receipt["nativeControls"]["neutralJob"]["jobUID"]:
@@ -895,7 +932,7 @@ def qualify(target: Target, request: dict, host_id: str) -> dict:
 
 def preview(target: Target, action: str, operation: Operation | None) -> dict:
     objects = (
-        attempt_resources(target, operation)
+        attempt_bindings(target, operation)
         if action == "withdraw" and operation
         else render(target, operation)
     )

@@ -131,14 +131,17 @@ before approval. Stage immutable operator-owned inputs for attempts that
 consume credentials or execute commands from configuration.
 
 The observer grant provides Batch Job `get`, `list` and `watch` for the
-reviewed Job name in its workload namespace. Both list and watch require
-`fieldSelector=metadata.name=<reviewed-job-name>`. Before the initial POST,
-list that name as the observer, verify `items` is empty and retain the list's
-`metadata.resourceVersion`. Start a namespaced Job watch with the same
-selector and that resource version. Use the first `ADDED` event to obtain the
+reviewed Job name in its workload namespace. Collection list and watch
+require `fieldSelector=metadata.name=<reviewed-job-name>`. Kubernetes also
+serves a deprecated watch route scoped by the Job name in its path. Use the
+collection route with the exact selector for this workflow. Before the initial
+POST, list that name as the observer, verify `items` is empty and retain the
+list's `metadata.resourceVersion`. Start a namespaced Job watch with the
+same selector and that resource version. Use the first `ADDED` event to obtain the
 server-assigned UID and compare the named GET with it. Treat an expired watch
 version, a missing creation event, or different Job identity as incomplete
-observation. The [Kubernetes RBAC resource-name rules](https://kubernetes.io/docs/reference/access-authn-authz/rbac/#referring-to-resources)
+observation. The [Kubernetes RBAC resource-name rules](https://kubernetes.io/docs/reference/access-authn-authz/rbac/#referring-to-resources),
+the [Batch Job API](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.35/#job-v1-batch)
 and [watch version semantics](https://kubernetes.io/docs/reference/using-api/api-concepts/#semantics-for-watch)
 define this behavior.
 
@@ -161,9 +164,10 @@ base namespace delegation. The provider installs quota and admission controls
 and exercises their admission behavior before enabling the corresponding
 RoleBindings. The named provider lock serializes configure calls. Configure
 checks all three workload namespaces for another attempt grant or an active
-or incomplete owned Job. Repeating an attempt with an existing Job checks the
-bound Job and leaves its grant withdrawn if already withdrawn. An exact
-same-name lookalike is refused if the identity or reviewed envelope differs.
+or incomplete owned Job. Repeating an attempt with an existing Job checks
+its identity and reviewed envelope. For a watched attempt, configure
+requires the existing observer binding before publishing the handoff. A
+recorded withdrawal blocks further configure calls for that same attempt.
 The provider records completed phases and the last observed grant in a
 private `<target>.delegation-configure-*.json` receipt. If configure is interrupted,
 inspect the exact grants and the receipt before retrying. Run `health` with
@@ -201,10 +205,11 @@ Its neutral observer lists the unused name, watches from the pre-submit
 resource version and reads the first server-assigned UID. The launcher
 submits one neutral Job. The gate checks terminal success and the exact Pod
 owner, verifies that unfiltered, wrong-name and wrong-namespace reads and
-Job mutations are denied, and confirms that the exact observer reads are
-revoked after withdrawal. Each workload namespace opts into `local-retained`
-Filesystem RWO claims of whole 1–4Gi, with at most four and 8Gi requested per
-namespace. The quotas measure requested storage. The installed filesystem
+Job mutations are denied, and checks that fresh launcher CREATE and exact
+observer reads are denied after withdrawal. Negative observer reads pair the
+raw requests with matching SubjectAccessReview decisions. Each workload
+namespace opts into `local-retained` Filesystem RWO claims of whole 1–4Gi,
+with at most four and 8Gi requested per namespace. The quotas measure requested storage. The installed filesystem
 probe binds one neutral 1Gi application claim, verifies its Retain PV identity
 and worker affinity, and checks a local ext4 mount. Two bounded Pods exercise
 SQLite and POSIX lock exclusion with UID/GID 65532 and private 0700 directories
@@ -232,10 +237,16 @@ application results in its private receipt. Give downstream consumers the
 sanitized receipt. The launcher has named Job and PodTemplate reads and does
 not have Pod logs, exec or cleanup access.
 
-Stop launcher submissions and close any observer watch connections. Verify
+Stop launcher submissions and close any observer watch connections. An
+already-open server watch can continue after RoleBinding revocation. Verify
 the exact attempt is unused or wait for its Job to reach a terminal condition
-with all Pods accounted for and its receipt collected. Preview withdrawal
-with the same reviewed operation, then execute it on the same exact target.
+with all Pods accounted for and its receipt collected. If a launch was
+interrupted or its CREATE result is ambiguous, inspect the exact attempt
+under provider authority and resolve the original submission before declaring
+the name unused, retiring controls or approving another attempt. An absent
+Job at one instant or a client timeout leaves the submission unresolved.
+Preview withdrawal with the same reviewed operation, then execute it on the
+same exact target.
 
 ```sh
 uv run --locked --offline python -m scripts.minimal_delegation withdraw \
@@ -244,14 +255,26 @@ uv run --locked --offline python -m scripts.minimal_delegation withdraw \
   --confirm-target example-local --execute
 ```
 
-Withdrawal verifies the target, matching subject, rules and ownership labels.
-It revokes the launcher binding and rechecks outstanding execution before
-removing the observer binding and attempt controls. The provider deletes the
-parameterized admission binding before its PodTemplate. The Job, Pods,
-existing observer identity, shared admission and namespace state are retained.
-The private `<target>.delegation-withdraw-*.json` receipt records the exact
-resource UIDs so a retry can refuse replacement objects. If interrupted,
-inspect the Job and receipt and repeat withdrawal with the same operation.
+Withdrawal verifies the target and the RoleBindings' subjects, role
+references and ownership labels. It withdraws the launcher binding, confirms
+denial of fresh CREATE requests, rechecks Job and Pod status, and withdraws
+the observer binding when present. The private
+`<target>.delegation-withdraw-*.json` receipt records the exact binding UIDs,
+the last completed phase and the observed Job and Pod identities. If
+interrupted, inspect the Job and receipt and repeat withdrawal with the same
+operation. A retry refuses replacement bindings. If a Job appears after an
+unused snapshot, withdrawal stops and preserves the observer binding if it
+is still present. The provider and deployment operator must reconcile the
+late Job, collect its terminal evidence and complete UID-scoped cleanup
+before retrying the original withdrawal. Keep the original receipt.
+
+An already-authorized CREATE can still complete after the launcher binding
+is withdrawn. The attempt admission policies, PodTemplate and tokenless
+runtime stay in place. Under the separate provider retirement procedure,
+remove the named parameterized ValidatingAdmissionPolicyBinding before
+deleting its PodTemplate. Remove the remaining attempt controls only once
+all outstanding execution is accounted for. Keep shared admission, namespace
+state and the existing observer identity.
 
 The deployment operator can then delete the exact owned Job and its Pods with
 UID-scoped cleanup. Retain historical receipts and use a fresh reviewed Job
