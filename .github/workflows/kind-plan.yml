@@ -6,7 +6,9 @@ on:
       - .github/workflows/kind-plan.yml
       - Makefile
       - clusters/local-kind/iac-pilot/**
+      - clusters/local-kind/kind-baseline/**
       - docs/local-kind-opentofu.md
+      - docs/registered-kind-targets.md
       - justfile
       - tests/test_kind_just.py
   push:
@@ -15,7 +17,9 @@ on:
       - .github/workflows/kind-plan.yml
       - Makefile
       - clusters/local-kind/iac-pilot/**
+      - clusters/local-kind/kind-baseline/**
       - docs/local-kind-opentofu.md
+      - docs/registered-kind-targets.md
       - justfile
       - tests/test_kind_just.py
   workflow_dispatch:
@@ -30,6 +34,12 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          persist-credentials: false
+      - name: Check out reviewed legacy fixture
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: 86ddee734de4903136459f7c6369d3610c1f7242
+          path: .local/kind-plan-legacy
           persist-credentials: false
       - name: Install pinned just
         shell: bash
@@ -46,5 +56,7 @@ jobs:
           tar -xzf "$archive" just
           "$tools/just" --version
           printf 'KIND_TEST_JUST=%s/just\n' "$tools" >> "$GITHUB_ENV"
-      - name: Exercise local kind plan, apply and verify without cluster access
+      - name: Exercise registered planning and reviewed legacy fixtures without cluster access
+        env:
+          KIND_TEST_LEGACY_JUSTFILE: ${{ github.workspace }}/.local/kind-plan-legacy/justfile
         run: make kind-plan-check

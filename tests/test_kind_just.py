@@ -8,12 +8,16 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 JUST = os.environ.get("KIND_TEST_JUST")
 MODULE = Path("clusters/local-kind/iac-pilot")
 RUNBOOK = Path("docs/local-kind-opentofu.md")
+LEGACY_REVISION = "86ddee734de4903136459f7c6369d3610c1f7242"
+BASELINE = Path("clusters/local-kind/kind-baseline")
+REGISTERED_RUNBOOK = Path("docs/registered-kind-targets.md")
 PROFILE_FILES = (
     "main.tf",
     ".terraform.lock.hcl",
@@ -205,9 +209,52 @@ jq -cn --arg server "$FIXTURE_DEDICATED_SERVER" --arg ca "$FIXTURE_DEDICATED_CA"
   '{fixture: "fixture dedicated kubeconfig", clusters: [{cluster: {server: $server, "certificate-authority-data": $ca}}]}'
 """
 
+REGISTERED_TOFU = """#!/bin/bash
+set -eu
+[[ ! -v TF_LOG && ! -v TF_CLI_ARGS && ! -v TF_VAR_cluster_name ]]
+plan_dir=${1#-chdir=}
+shift
+[[ $KUBECONFIG == "$plan_dir/provider.kubeconfig" && $TF_WORKSPACE == default ]]
+[[ ${TF_CLI_CONFIG_FILE##*/} == opentofu.tfrc ]]
+lock=$(jq -er .lock "$plan_dir/registration.json")
+if flock -n "$lock" true; then exit 99; fi
+case "$1" in
+  init)
+    state=$(jq -er .state "$plan_dir/registration.json")
+    [[ $# == 5 && $* == *-lockfile=readonly* && $5 == "-backend-config=path=$state" ]]
+    ;;
+  plan)
+    [[ $# == 6 && $* == *-refresh=false* && $* == *-lock-timeout=30s* && $6 == "-out=$plan_dir/saved.tfplan" ]]
+    cp -- "$plan_dir/target.auto.tfvars.json" "$plan_dir/saved.tfplan"
+    ;;
+  show)
+    [[ $# == 3 && $3 == "$plan_dir/saved.tfplan" ]]
+    if [[ $2 == -json ]]; then
+      jq '{variables: (with_entries(.value |= {value: .})), resource_changes: [{
+        address: "kind_cluster.baseline", provider_name: "registry.terraform.io/elioseverojunior/kind",
+        change: {actions: ["create"], after: {name: .cluster_name}}
+      }]}' "$3"
+    else
+      printf 'fixture readable baseline plan\\n'
+    fi
+    ;;
+  *) exit 99 ;;
+esac
+"""
+
 
 @unittest.skipUnless(JUST, "set KIND_TEST_JUST to the pinned Linux AMD64 just binary")
 class KindJustTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        legacy_fixture = os.environ.get("KIND_TEST_LEGACY_JUSTFILE")
+        if legacy_fixture:
+            cls.legacy_justfile = Path(legacy_fixture).read_bytes()
+        else:
+            cls.legacy_justfile = subprocess.check_output(
+                ["git", "show", f"{LEGACY_REVISION}:justfile"], cwd=REPO, timeout=20
+            )
+
     def setUp(self):
         scratch = tempfile.TemporaryDirectory(prefix="kind-just-fixture-")
         self.addCleanup(scratch.cleanup)
@@ -215,9 +262,10 @@ class KindJustTests(unittest.TestCase):
         self.home = self.root / "operator home"
         self.home.mkdir(mode=0o700)
         self.env = {"HOME": str(self.home), "PATH": os.defpath, "GIT_CONFIG_NOSYSTEM": "1"}
+        (self.root / "justfile").write_bytes(self.legacy_justfile)
 
     def test_bare_just_lists_supported_tasks(self):
-        result = self.command(JUST or "just", cwd=REPO)
+        result = self.command(JUST or "just", cwd=self.root)
         self.assertEqual(result.returncode, 0, result.stderr)
         for signature in (
             "plan PROFILE INTENT",
@@ -228,7 +276,7 @@ class KindJustTests(unittest.TestCase):
                 self.assertRegex(result.stdout, rf"(?m)^\s+{signature}\b")
 
     def test_plan_refuses_unregistered_profile_and_intent(self):
-        result = self.command(JUST or "just", "plan", "pilot-74", cwd=REPO)
+        result = self.command(JUST or "just", "plan", "pilot-74", cwd=self.root)
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse((self.home / ".local").exists())
         marker = self.root / "substitution-ran"
@@ -237,7 +285,7 @@ class KindJustTests(unittest.TestCase):
             ("pilot-74", "apply", "Plan intent must be create or managed"),
         ):
             with self.subTest(profile=profile, intent=intent):
-                result = self.command(JUST or "just", "plan", profile, intent, cwd=REPO)
+                result = self.command(JUST or "just", "plan", profile, intent, cwd=self.root)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(message, result.stderr)
                 self.assertFalse(marker.exists())
@@ -263,7 +311,8 @@ class KindJustTests(unittest.TestCase):
     def prepare_checkout(self, profile: str):
         self.checkout = self.root / "checkout"
         self.checkout.mkdir()
-        for path in (Path("justfile"), RUNBOOK, *(MODULE / name for name in PROFILE_FILES)):
+        (self.checkout / "justfile").write_bytes(self.legacy_justfile)
+        for path in (RUNBOOK, *(MODULE / name for name in PROFILE_FILES)):
             destination = self.checkout / path
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(REPO / path, destination)
@@ -1055,3 +1104,368 @@ class KindJustTests(unittest.TestCase):
             evidence = log.read_text()
             self.assertIn("fixture plan waiting", evidence)
             self.assertIn("sending signal KILL", evidence)
+
+
+@unittest.skipUnless(JUST, "set KIND_TEST_JUST to the pinned Linux AMD64 just binary")
+class RegisteredKindTests(unittest.TestCase):
+    def setUp(self):
+        scratch = tempfile.TemporaryDirectory(prefix="kind-registration-fixture-")
+        self.addCleanup(scratch.cleanup)
+        self.root = Path(scratch.name).resolve()
+        self.registrations = self.root / "registrations"
+        self.registrations.mkdir(mode=0o700)
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        self.home = self.root / "home"
+        self.home.mkdir(mode=0o700)
+        self.config = self.root / "opentofu.tfrc"
+        self.config.touch(mode=0o600)
+        self.env = {
+            "HOME": str(self.home),
+            "PATH": f"{self.bin}:{os.defpath}",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "KIND_REGISTRATIONS": str(self.registrations),
+            "KIND_TOFU_CONFIG": str(self.config),
+            "TF_CLI_ARGS": "would redirect tofu",
+            "TF_LOG": "TRACE",
+            "TF_VAR_cluster_name": "unexpected-cluster",
+        }
+        self.write_tool(
+            "docker",
+            """#!/bin/bash
+set -eu
+[[ $1 == --host && $2 == unix:///fixture/* ]]
+case "$3 $4" in
+  'info --format')
+    [[ $5 == '{{.ID}}' ]]
+    if [[ -f "$0.id" ]]; then cat "$0.id"; else printf '%s\\n' fixture-daemon; fi ;;
+  'ps -a')
+    [[ $5 == --filter && $7 == --format && $8 == '{{.Names}}' ]]
+    if [[ -f "$0.containers" ]]; then cat "$0.containers"; fi ;;
+  *) exit 99 ;;
+esac
+""",
+        )
+        self.write_tool("tofu", REGISTERED_TOFU)
+        self.provider = self.root / "provider checkout"
+        self.provider.mkdir()
+        self.git(self.provider, "init", "-q")
+        for path in (
+            Path("justfile"),
+            *(BASELINE / name for name in ("main.tf", ".terraform.lock.hcl")),
+        ):
+            destination = self.provider / path
+            destination.parent.mkdir(exist_ok=True, parents=True)
+            shutil.copy2(REPO / path, destination)
+        self.provider_revision = self.commit(self.provider)
+
+    def write_tool(self, name: str, body: str):
+        executable = self.bin / name
+        executable.write_text(body, encoding="utf-8")
+        executable.chmod(0o700)
+
+    def command(self, *args: str, cwd: Path = REPO, input_text: str | None = None):
+        return subprocess.run(
+            args,
+            cwd=cwd,
+            env=self.env,
+            input=input_text,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+
+    def git(self, directory: Path, *args: str):
+        result = self.command("git", "-C", str(directory), *args)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip()
+
+    def write_json(self, path: Path, value: dict):
+        path.write_text(json.dumps(value), encoding="utf-8")
+        path.chmod(0o600)
+
+    def commit(self, directory: Path):
+        self.git(directory, "add", ".")
+        self.git(
+            directory,
+            "-c",
+            "user.email=fixture@example.invalid",
+            "-c",
+            "user.name=Fixture",
+            "commit",
+            "-m",
+            "Review fixture",
+        )
+        return self.git(directory, "rev-parse", "HEAD")
+
+    def prepare_target(self, owner: str, cluster: str):
+        directory = self.root / f"{owner} environment"
+        directory.mkdir()
+        self.git(directory, "init", "-q")
+        declaration = directory / "targets" / "sandbox.json"
+        pin = directory / "deployments" / "infrastructure.json"
+        for path in (declaration, pin):
+            path.parent.mkdir()
+        self.write_json(
+            declaration,
+            {
+                "profile": "kind-baseline",
+                "clusterName": cluster,
+                "disposable": True,
+                "providerPin": "deployments/infrastructure.json",
+            },
+        )
+        self.write_json(
+            pin,
+            {
+                "schemaVersion": 1,
+                "source": {
+                    "repository": "https://github.com/stanimirivanov/k8s-infrastructure.git",
+                    "revision": self.provider_revision,
+                },
+                "compatibility": {"retainedProfile": "fixture-only"},
+            },
+        )
+        self.commit(directory)
+
+        target = f"{owner}/sandbox"
+        private = self.root / f"{owner} private"
+        private.mkdir(mode=0o700)
+        candidate = private / "candidate.json"
+        self.write_json(
+            candidate,
+            {
+                "target": target,
+                "declaration": "targets/sandbox.json",
+                "dockerHost": "unix:///fixture/docker.sock",
+                "state": str(private / "cluster.tfstate"),
+                "lock": str(private / "operation.lock"),
+                "kubeconfig": str(private / "kubeconfig"),
+            },
+        )
+        return target, directory, candidate
+
+    def register(self, interface: str, target: str, directory: Path, candidate: Path):
+        return self.operation(interface, "register", target, str(directory), str(candidate))
+
+    def plan(self, interface: str, target: str, directory: Path):
+        return self.operation(interface, "plan", target, str(directory))
+
+    def operation(self, interface: str, *args: str):
+        if interface == "just":
+            return self.command(JUST or "just", *args, cwd=self.provider)
+        runbook = (REPO / REGISTERED_RUNBOOK).read_text(encoding="utf-8")
+        native = runbook.split("<!-- registered-kind-commands -->")[1].split("```bash\n")[1]
+        native = native.split("\n```")[0]
+        return self.command(
+            "bash",
+            "--noprofile",
+            "--norc",
+            "-s",
+            "--",
+            str(self.provider),
+            *args,
+            input_text=native,
+        )
+
+    def test_registers_the_observed_docker_identity_and_retries_idempotently(self):
+        target, environment, candidate = self.prepare_target("stargazer", "stargazer-sandbox")
+        registration = self.registrations / "stargazer" / "sandbox.json"
+        result = self.register("just", target, environment, candidate)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        observed = json.loads(registration.read_text(encoding="utf-8"))
+        self.assertEqual(observed["target"], "stargazer/sandbox")
+        self.assertEqual(observed["clusterName"], "stargazer-sandbox")
+        self.assertEqual(observed["daemonId"], "fixture-daemon")
+        self.assertEqual(registration.stat().st_mode & 0o777, 0o600)
+        timestamp = registration.stat().st_mtime_ns
+        result = self.register("native", target, environment, candidate)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(registration.stat().st_mtime_ns, timestamp)
+
+    def test_both_entry_points_save_independently_bound_plans_from_two_owners(self):
+        module = self.provider / BASELINE / "main.tf"
+        reviewed_module = module.read_bytes()
+        module.write_bytes(reviewed_module + b"\n# A later provider revision\n")
+        self.commit(self.provider)
+        digests = set()
+        for index, (owner, cluster) in enumerate(
+            (("stargazer", "stargazer-sandbox"), ("observatory", "observatory-sandbox"))
+        ):
+            target, environment, candidate = self.prepare_target(owner, cluster)
+            interfaces = ("just", "native") if index == 0 else ("native", "just")
+            result = self.register(interfaces[0], target, environment, candidate)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            registration = Path(result.stdout.strip())
+            result = self.plan(interfaces[1], target, environment)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            review = Path(result.stdout.strip())
+            plan_dir = review.parent
+            self.assertEqual(plan_dir.parent, self.registrations / ".plans" / target)
+            self.assertEqual(plan_dir.stat().st_mode & 0o777, 0o700)
+            expected = json.loads(candidate.read_text(encoding="utf-8"))
+            self.assertFalse(Path(expected["state"]).exists())
+            self.assertFalse(Path(expected["kubeconfig"]).exists())
+            self.assertEqual((plan_dir / "main.tf").read_bytes(), reviewed_module)
+            self.assertEqual(
+                (plan_dir / "plan.txt").read_text(), "fixture readable baseline plan\n"
+            )
+
+            binding = plan_dir / "binding.json"
+            binding_digest = hashlib.sha256(binding.read_bytes()).hexdigest()
+            self.assertEqual(
+                json.loads(binding.read_text(encoding="utf-8")),
+                {
+                    "schemaVersion": 1,
+                    "target": target,
+                    "profile": "kind-baseline",
+                    "intent": "create",
+                    "environmentRevision": self.git(environment, "rev-parse", "HEAD"),
+                    "providerRevision": self.provider_revision,
+                    "registrationSha256": hashlib.sha256(registration.read_bytes()).hexdigest(),
+                    "declarationSha256": hashlib.sha256(
+                        (environment / expected["declaration"]).read_bytes()
+                    ).hexdigest(),
+                    "providerPinSha256": hashlib.sha256(
+                        (environment / "deployments/infrastructure.json").read_bytes()
+                    ).hexdigest(),
+                },
+            )
+            saved = plan_dir / "saved.tfplan"
+            self.assertEqual(saved.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(
+                json.loads(saved.read_text()),
+                {"cluster_name": cluster, "plan_binding_sha256": binding_digest},
+            )
+            plan_digest = hashlib.sha256(saved.read_bytes()).hexdigest()
+            self.assertEqual(
+                (plan_dir / "SHA256SUMS").read_text(), f"{plan_digest}  saved.tfplan\n"
+            )
+            self.assertIn(f"- SHA-256 {plan_digest}", review.read_text())
+            digests.add(plan_digest)
+        self.assertEqual(len(digests), 2)
+
+    def test_refuses_to_publish_private_reservations_inside_a_checkout(self):
+        target, environment, candidate = self.prepare_target("stargazer", "stargazer-sandbox")
+        registry = self.provider / ".local/registrations"
+        registry.mkdir(mode=0o700, parents=True)
+        self.env["KIND_REGISTRATIONS"] = str(registry)
+        result = self.register("just", target, environment, candidate)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("outside both checkouts", result.stderr)
+        self.assertEqual(list(registry.iterdir()), [])
+
+    def test_concurrent_reservations_for_one_daemon_and_name_publish_one_record(self):
+        targets = [
+            self.prepare_target("stargazer", "shared-sandbox"),
+            self.prepare_target("observatory", "shared-sandbox"),
+        ]
+        alias = targets[1][2]
+        candidate = json.loads(alias.read_text())
+        candidate["dockerHost"] = "unix:///fixture/docker-alias.sock"
+        self.write_json(alias, candidate)
+
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            jobs = [
+                workers.submit(self.register, interface, *target)
+                for interface, target in zip(("just", "native"), targets, strict=True)
+            ]
+            results = [job.result() for job in jobs]
+        self.assertEqual(sorted(result.returncode for result in results), [0, 1])
+        refusal = next(result for result in results if result.returncode != 0)
+        self.assertIn("Docker daemon and cluster name are already reserved", refusal.stderr)
+        (registration,) = self.registrations.glob("*/*.json")
+        self.assertEqual(json.loads(registration.read_text())["daemonId"], "fixture-daemon")
+
+    def test_conflicting_keys_and_path_aliases_are_refused_without_rewriting(self):
+        target, environment, candidate = self.prepare_target("stargazer", "stargazer-sandbox")
+        published = self.register("just", target, environment, candidate)
+        self.assertEqual(published.returncode, 0, published.stderr)
+        registration = Path(published.stdout.strip())
+        original = registration.read_bytes()
+        same_key = json.loads(candidate.read_text())
+        same_key["dockerHost"] = "unix:///fixture/docker-alias.sock"
+        self.write_json(candidate, same_key)
+        result = self.register("native", target, environment, candidate)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("target key already has a different registration", result.stderr)
+
+        private_alias = self.root / "private-alias"
+        private_alias.symlink_to(candidate.parent, target_is_directory=True)
+        target, environment, candidate = self.prepare_target("observatory", "observatory-sandbox")
+        original_candidate = json.loads(candidate.read_text())
+        for field in ("state", "lock", "kubeconfig"):
+            with self.subTest(field=field):
+                collided_path = private_alias / Path(same_key[field]).name
+                self.write_json(candidate, original_candidate | {"kubeconfig": str(collided_path)})
+                result = self.register("native", target, environment, candidate)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("already reserves a canonical path", result.stderr)
+        self.assertEqual(list(self.registrations.glob("*/*.json")), [registration])
+        self.assertEqual(registration.read_bytes(), original)
+
+    def test_refuses_unsupported_inputs_and_unavailable_pins_before_reservation(self):
+        target, environment, candidate = self.prepare_target("stargazer", "stargazer-sandbox")
+        declaration = environment / "targets/sandbox.json"
+        pin = environment / "deployments/infrastructure.json"
+        original_declaration = json.loads(declaration.read_text())
+        original_pin = json.loads(pin.read_text())
+        for interface, change, message in (
+            ("just", {"nodeCount": 20}, "unsupported kind-baseline inputs"),
+            ("native", {"profile": "unknown"}, "unsupported kind-baseline inputs"),
+            ("just", {"providerPin": "missing.json"}, "reviewed, regular Git input"),
+        ):
+            with self.subTest(change=change):
+                self.write_json(declaration, original_declaration | change)
+                self.commit(environment)
+                result = self.register(interface, target, environment, candidate)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr)
+
+        self.write_json(declaration, original_declaration)
+        original_pin["source"]["revision"] = "1" * 40
+        self.write_json(pin, original_pin)
+        self.commit(environment)
+        result = self.register("native", target, environment, candidate)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("exact pinned provider commit is unavailable", result.stderr)
+        self.assertEqual(list(self.registrations.iterdir()), [])
+
+    def test_plan_refuses_missing_registration_changed_sources_and_wrong_identity(self):
+        target, environment, candidate = self.prepare_target("stargazer", "stargazer-sandbox")
+        missing = self.plan("just", target, environment)
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertIn("No registration exists", missing.stderr)
+        result = self.register("native", target, environment, candidate)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        _, wrong_checkout, _ = self.prepare_target("observatory", "stargazer-sandbox")
+        result = self.plan("just", target, wrong_checkout)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("originally selected", result.stderr)
+
+        declaration = environment / "targets/sandbox.json"
+        original = declaration.read_bytes()
+        declaration.write_bytes(original + b"\n")
+        result = self.plan("native", target, environment)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("clean, reviewed environment checkout", result.stderr)
+        self.git(environment, "update-index", "--assume-unchanged", "targets/sandbox.json")
+        result = self.plan("just", target, environment)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("clean, reviewed environment checkout", result.stderr)
+        self.git(environment, "update-index", "--no-assume-unchanged", "targets/sandbox.json")
+        declaration.write_bytes(original)
+
+        daemon = self.bin / "docker.id"
+        daemon.write_text("different-daemon\n")
+        result = self.plan("just", target, environment)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Docker daemon ID differs", result.stderr)
+        daemon.unlink()
+        (self.bin / "docker.containers").write_text("stargazer-sandbox-control-plane\n")
+        result = self.plan("native", target, environment)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("reserved kind name is already in use", result.stderr)
+        self.assertFalse((self.registrations / ".plans").exists())

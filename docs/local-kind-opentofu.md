@@ -4,6 +4,10 @@
 qualifies the procedure on the disposable pilot. Environment #434 has a
 separate cutover.
 
+Run this legacy procedure from the
+[reviewed infrastructure revision](https://github.com/stanimirivanov/k8s-infrastructure/tree/86ddee734de4903136459f7c6369d3610c1f7242).
+For a new target, use [registered kind targets](registered-kind-targets.md).
+
 ## TL;DR
 
 - Pick an operator task below and use the laptop's existing Docker daemon,
