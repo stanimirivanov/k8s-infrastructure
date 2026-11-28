@@ -11,8 +11,8 @@ separate cutover.
 - Save a plan with native commands or `just plan`. After approval, apply and
   verify the exact file with the native commands or `just apply`. Either
   interface can resume verification of the original plan.
-- Bootstrap the pinned Argo CD overlay only after verifying the registered
-  cluster UID. Record success after rollouts, an empty diff and a final UID check.
+- Bootstrap the pinned Argo CD overlay with native commands or `just bootstrap`.
+  Record success after rollouts, an empty diff and a final UID check.
 - Use [GitHub-hosted CI](kind-iac-rehearsal.md#github-hosted-rehearsal) for
   automated disposable qualification.
 
@@ -49,7 +49,6 @@ cutover is approved, with the profile, cluster and directory from the table.
 ~~~sh
 export PROFILE=pilot-74 CLUSTER=perfeng-iac-pilot-74
 export STATE_DIR="$HOME/.local/state/perfeng/kind-74"
-export OVERLAY="$PWD/clusters/local-kind/perfeng-local/addons/argocd"
 export PATH="$HOME/.local/state/perfeng/kind-74/bin:$PATH"
 export DOCKER_HOST=unix:///var/run/docker.sock KIND_EXPERIMENTAL_PROVIDER=docker
 export TF_CLI_CONFIG_FILE="$STATE_DIR/opentofu.tfrc" TF_WORKSPACE=default
@@ -57,7 +56,8 @@ unset DOCKER_CONTEXT TF_DATA_DIR TF_CLI_ARGS TF_CLI_ARGS_init \
   TF_CLI_ARGS_state TF_CLI_ARGS_state_list TF_CLI_ARGS_console TF_CLI_ARGS_plan TF_CLI_ARGS_show \
   TF_CLI_ARGS_apply TF_LOG TF_LOG_PATH TF_LOG_CORE TF_LOG_PROVIDER KUBECTL_EXTERNAL_DIFF
 umask 077
-if [[ -d "$STATE_DIR" && "$(realpath -e -- "$STATE_DIR")" == "$STATE_DIR" && ! -L "$STATE_DIR/operation.lock" ]]; then
+if [[ -d "$STATE_DIR" && "$(realpath -e -- "$STATE_DIR")" == "$STATE_DIR" &&
+      ! -L "$STATE_DIR/operation.lock" && ( ! -e "$STATE_DIR/operation.lock" || -f "$STATE_DIR/operation.lock" ) ]]; then
   flock -w 15 "$STATE_DIR/operation.lock" bash --noprofile --norc -e -o pipefail
 else
   printf '%s\n' 'The registered state directory or lock path is missing or redirected.' >&2
@@ -751,57 +751,139 @@ staged inputs.
 
 ## Bootstrap Argo CD
 
-Open a [locked session](#open-a-locked-session) and load the registration.
-Render the pinned overlay once and keep its digest with the run evidence.
+Bootstrap installs or reapplies pinned Argo CD on a registered cluster.
+Use a clean, reviewed infrastructure checkout. Both routes stage the
+overlay from Git `HEAD`, render once and keep the manifest and evidence
+in a new private `bootstrap.XXXXXX` directory under the selected target.
 
-~~~sh
-{
-  RUN_DIR=$(mktemp -d "$STATE_DIR/bootstrap.XXXXXX")
-  git rev-parse HEAD > "$RUN_DIR/source-revision.txt"
-  kubectl kustomize "$OVERLAY" > "$RUN_DIR/argocd.yaml"
-  test -s "$RUN_DIR/argocd.yaml"
-  sha256sum "$RUN_DIR/argocd.yaml" > "$RUN_DIR/SHA256SUMS"
-}
+### Bootstrap with just
+
+Run from outside the target's locked shell. The recipe acquires the lock.
+
+~~~bash
+just bootstrap pilot-74
 ~~~
 
-An existing Argo CD namespace must have the infrastructure ownership
-labels. The result file is written after the manifest check, apply, all
-seven rollouts, an empty diff and the final UID check.
+### Bootstrap with native commands
+
+Open a [locked session](#open-a-locked-session), check the private paths
+and load the managed registration. Run the complete block in that shell.
 
 ~~~sh
-{
+(
+  refuse() {
+    printf '%s\n' "$1" >&2
+    exit 1
+  }
+
+  run_kubectl() {
+    local deadline=$1 config=$2
+    shift 2
+    timeout --kill-after=5s "$deadline" kubectl --kubeconfig "$config" --context "$CTX" "$@"
+  }
+
+  check_uid() {
+    run_kubectl 15s "$KCFG" --request-timeout=10s \
+      wait --for="jsonpath={.metadata.uid}=$EXPECTED_UID" --timeout=1s namespace/kube-system || {
+      printf '%s\n' 'The live kube-system UID could not be matched to the registration.' >&2
+      return 1
+    }
+  }
+
+  check_bootstrap_manifest() {
+    [[ -f "$MANIFEST" && ! -L "$MANIFEST" && "$(< "$RUN_DIR/SHA256SUMS")" == "$MANIFEST_CHECKSUM" ]] &&
+      (cd "$RUN_DIR" && sha256sum --check --strict --status <<< "$MANIFEST_CHECKSUM") ||
+      refuse 'The rendered Argo CD manifest differs from its recorded SHA-256.'
+  }
+
+  SOURCE_REVISION=$(git rev-parse --verify 'HEAD^{commit}')
+  INDEX_FLAGS=$(git ls-files -v | LC_ALL=C awk '/^[a-zS] / {print $1}')
+  [[ -z "$INDEX_FLAGS" ]] ||
+    refuse 'Use a clean, reviewed checkout without assume-unchanged or skip-worktree flags.'
+  CHECKOUT_STATUS=$(git --no-optional-locks status --porcelain=v1 --untracked-files=all --ignore-submodules=none)
+  [[ -z "$CHECKOUT_STATUS" && "$(git rev-parse --verify 'HEAD^{commit}')" == "$SOURCE_REVISION" ]] ||
+    refuse 'Use a clean, reviewed checkout at a stable HEAD to bootstrap.'
+
+  RUN_DIR=$(mktemp -d "$STATE_DIR/bootstrap.XXXXXX")
+  BOOTSTRAP_PHASE='source staging'
+  trap '
+    if (( $? != 0 )); then
+      printf "Argo CD bootstrap stopped during %s. Private evidence is in %s.\n" "$BOOTSTRAP_PHASE" "$RUN_DIR" >&2
+    fi
+  ' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
+  OVERLAY=clusters/local-kind/perfeng-local/addons/argocd
+  printf '%s\n' "$SOURCE_REVISION" > "$RUN_DIR/source-revision.txt"
+  {
+    timeout --kill-after=5s 30s git archive --format=tar "$SOURCE_REVISION" -- "$OVERLAY" |
+      timeout --kill-after=5s 30s tar -xf - --no-same-owner --no-same-permissions -C "$RUN_DIR"
+  } 2> "$RUN_DIR/render.log"
+
+  BOOTSTRAP_PHASE=render
+  MANIFEST="$RUN_DIR/argocd.yaml"
+  timeout --kill-after=5s 120s kubectl kustomize "$RUN_DIR/$OVERLAY" \
+    > "$MANIFEST" 2>> "$RUN_DIR/render.log"
+  [[ -s "$MANIFEST" ]] || refuse 'The Argo CD render is empty.'
+  MANIFEST_CHECKSUM=$(cd "$RUN_DIR" && sha256sum -- argocd.yaml)
+  printf '%s\n' "$MANIFEST_CHECKSUM" > "$RUN_DIR/SHA256SUMS"
+
+  BOOTSTRAP_PHASE='pre-apply identity'
+  check_uid > "$RUN_DIR/identity.log" 2>&1
+
+  BOOTSTRAP_PHASE='namespace ownership'
   OWNER_PATH='{.metadata.name}{" "}{.metadata.labels.app\.kubernetes\.io/name}{" "}{.metadata.labels.app\.kubernetes\.io/managed-by}{" "}{.metadata.labels.app\.kubernetes\.io/part-of}'
-  kubectl --kubeconfig "$KCFG" --context "$CTX" --request-timeout=10s \
-    wait --for="jsonpath={.metadata.uid}=${EXPECTED_UID:?Load the registered kube-system UID}" --timeout=1s namespace/kube-system
-  ARGO_OWNER=$(kubectl --kubeconfig "$KCFG" --context "$CTX" --request-timeout=10s \
-    get namespace argocd --ignore-not-found -o "jsonpath=$OWNER_PATH")
-  if [[ -n "$ARGO_OWNER" ]]; then
-    test "$ARGO_OWNER" = 'argocd argocd k8s-infrastructure kubernetes-substrate' ||
-      { printf '%s\n' 'The argocd namespace lacks the infrastructure ownership labels.' >&2; exit 1; }
-  fi
-  sha256sum --check --strict "$RUN_DIR/SHA256SUMS"
-  kubectl --kubeconfig "$KCFG" --context "$CTX" --request-timeout=30s \
-    apply --server-side --field-manager=k8s-infrastructure \
-    -f "$RUN_DIR/argocd.yaml" 2>&1 | tee "$RUN_DIR/apply.log"
-  kubectl --kubeconfig "$KCFG" --context "$CTX" --request-timeout=240s -n argocd rollout status --timeout=240s \
+  ARGO_OWNER=$(run_kubectl 15s "$KCFG" --request-timeout=10s \
+    get namespace argocd --ignore-not-found -o "jsonpath=$OWNER_PATH" 2>> "$RUN_DIR/identity.log")
+  [[ -z "$ARGO_OWNER" || "$ARGO_OWNER" == 'argocd argocd k8s-infrastructure kubernetes-substrate' ]] ||
+    refuse 'The argocd namespace lacks the infrastructure ownership labels.'
+
+  BOOTSTRAP_PHASE=apply
+  check_bootstrap_manifest
+  run_kubectl 120s "$KCFG" --request-timeout=30s apply --server-side --field-manager=k8s-infrastructure \
+    -f "$MANIFEST" > "$RUN_DIR/apply.log" 2>&1
+
+  BOOTSTRAP_PHASE=rollout
+  run_kubectl 250s "$KCFG" --request-timeout=240s -n argocd rollout status --timeout=240s \
     deployment/argocd-applicationset-controller deployment/argocd-dex-server \
     deployment/argocd-notifications-controller deployment/argocd-redis \
     deployment/argocd-repo-server deployment/argocd-server statefulset/argocd-application-controller \
-    2>&1 | tee "$RUN_DIR/rollout.log"
-  kubectl --kubeconfig "$KCFG" --context "$CTX" --request-timeout=30s \
-    diff --server-side --field-manager=k8s-infrastructure \
-    -f "$RUN_DIR/argocd.yaml" 2>&1 | tee "$RUN_DIR/diff.log"
-  kubectl --kubeconfig "$KCFG" --context "$CTX" --request-timeout=10s \
-    wait --for="jsonpath={.metadata.uid}=$EXPECTED_UID" --timeout=1s namespace/kube-system
-  SOURCE_REVISION=$(cat "$RUN_DIR/source-revision.txt")
-  printf '# Argo CD bootstrap\n\n- Profile %s\n- Source revision %s\n- All seven rollouts passed\n- Server-side diff is empty\n- Registered UID rechecked\n' \
-    "$PROFILE" "$SOURCE_REVISION" > "$RUN_DIR/RESULT.md"
-}
+    > "$RUN_DIR/rollout.log" 2>&1
+
+  BOOTSTRAP_PHASE=diff
+  check_bootstrap_manifest
+  run_kubectl 120s "$KCFG" --request-timeout=30s diff --server-side --field-manager=k8s-infrastructure \
+    -f "$MANIFEST" > "$RUN_DIR/diff.log" 2> "$RUN_DIR/diff.stderr.log" || {
+    rc=$?
+    printf 'Argo CD server-side diff exited %s (1 means changes, greater than 1 means error).\n' "$rc" >&2
+    exit "$rc"
+  }
+  [[ ! -s "$RUN_DIR/diff.log" ]] || refuse 'The Argo CD server-side diff is not empty.'
+
+  BOOTSTRAP_PHASE='final identity'
+  check_uid >> "$RUN_DIR/identity.log" 2>&1
+
+  BOOTSTRAP_PHASE='result recording'
+  printf '# Argo CD bootstrap\n\n- Profile %s\n- Source revision %s\n- Manifest SHA-256 %s\n- All seven rollouts passed\n- Server-side diff is empty\n- Registered UID rechecked\n' \
+    "$PROFILE" "$SOURCE_REVISION" "${MANIFEST_CHECKSUM%% *}" > "$RUN_DIR/RESULT.md.tmp"
+  mv -T -- "$RUN_DIR/RESULT.md.tmp" "$RUN_DIR/RESULT.md"
+  printf 'Argo CD bootstrap verified. Private evidence is in %s.\n' "$RUN_DIR"
+)
 ~~~
 
-Exit the locked shell when the task completes. Keep the manifest checksum,
-logs and result with private Operations evidence. Argo CD reconciles
-consumer workload definitions from the consumer's GitOps source.
+An existing Argo CD namespace needs the exact infrastructure ownership
+labels. Both paths check the registered UID and namespace before applying
+the hashed file with the `k8s-infrastructure` server-side field manager.
+They check all seven rollouts, verify an empty server-side diff of the
+same hashed file, and recheck the registered UID before recording success.
+
+Keep `source-revision.txt`, `argocd.yaml`, `SHA256SUMS`, the logs and
+`RESULT.md` within private Operations evidence. The result includes the
+manifest digest. To check the checksum later, run
+`sha256sum --check --strict SHA256SUMS` inside the run directory. Exit the
+locked shell after the native task completes. Argo CD reconciles consumer
+workload definitions from the consumer's GitOps source.
 
 ## Recover an interrupted operation
 
@@ -836,10 +918,13 @@ UID when the API is reachable. Keep the plan and partial logs.
 - If `apply.status` records `complete` and registration is present, resume
   verification of the same plan. Inspect `verify.log`, `nodes.txt` and
   `repeat.log` for any incomplete checks.
-- If bootstrap lacks `RESULT.md`, check the terminal error and any apply,
-  rollout and diff logs. An identity or ownership refusal appears before
-  any apply log. Repeat bootstrap only after confirming the live UID and
-  ownership.
+- If bootstrap lacks `RESULT.md`, use the phase reported on the terminal.
+  Inspect `render.log` for staging and render, `identity.log` for UID and
+  namespace queries, and `apply.log`, `rollout.log`, `diff.log` and
+  `diff.stderr.log` for the later phases. An initial UID or ownership
+  refusal occurs before apply. After an incomplete apply, confirm the live
+  UID and namespace ownership, inspect the recorded failure and rerun from
+  the reviewed checkout once the issue is resolved.
 
 Containers without matching state or a different UID need explicit recovery
 review before another write. Teardown requires separate approval.

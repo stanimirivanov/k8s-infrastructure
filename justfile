@@ -13,6 +13,9 @@ apply PROFILE INTENT ABSOLUTE_PLAN_PATH SHA256 APPROVER APPROVAL_UTC: (_kind "ap
 # Resume readiness and repeat-plan verification after apply and registration
 verify PROFILE ABSOLUTE_PLAN_PATH: (_kind "verify" PROFILE ABSOLUTE_PLAN_PATH)
 
+# Install or reapply pinned Argo CD on a registered cluster
+bootstrap PROFILE: (_kind "bootstrap" PROFILE)
+
 [private]
 _kind OPERATION PROFILE *ARGS:
     #!/usr/bin/env bash
@@ -50,6 +53,7 @@ _kind OPERATION PROFILE *ARGS:
         INTENT=managed
         PLAN=$3
         ;;
+      bootstrap) INTENT=managed ;;
     esac
     case "$INTENT" in
       create|managed) ;;
@@ -63,7 +67,7 @@ _kind OPERATION PROFILE *ARGS:
         refuse 'Use a clean, reviewed checkout without assume-unchanged or skip-worktree flags.'
       CHECKOUT_STATUS=$(git --no-optional-locks status --porcelain=v1 --untracked-files=all --ignore-submodules=none)
       [[ -z "$CHECKOUT_STATUS" && "$(git rev-parse --verify 'HEAD^{commit}')" == "$SOURCE_REVISION" ]] ||
-        refuse 'Plan from a clean, reviewed checkout at a stable HEAD.'
+        refuse "Use a clean, reviewed checkout at a stable HEAD to $OPERATION."
     }
 
     if [[ "$OPERATION" == plan ]]; then
@@ -75,7 +79,7 @@ _kind OPERATION PROFILE *ARGS:
     export TF_CLI_CONFIG_FILE="$STATE_DIR/opentofu.tfrc" TF_WORKSPACE=default
     unset DOCKER_CONTEXT TF_DATA_DIR TF_CLI_ARGS TF_CLI_ARGS_init TF_CLI_ARGS_apply \
       TF_CLI_ARGS_state TF_CLI_ARGS_state_list TF_CLI_ARGS_console TF_CLI_ARGS_plan TF_CLI_ARGS_show \
-      TF_LOG TF_LOG_PATH TF_LOG_CORE TF_LOG_PROVIDER
+      TF_LOG TF_LOG_PATH TF_LOG_CORE TF_LOG_PROVIDER KUBECTL_EXTERNAL_DIFF
     umask 077
 
     LOCK="$STATE_DIR/operation.lock"
@@ -112,8 +116,10 @@ _kind OPERATION PROFILE *ARGS:
 
     check_uid() {
       run_kubectl 15s "$KCFG" --request-timeout=10s \
-        wait --for="jsonpath={.metadata.uid}=$EXPECTED_UID" --timeout=1s namespace/kube-system ||
-        refuse 'The live kube-system UID could not be matched to the registration.'
+        wait --for="jsonpath={.metadata.uid}=$EXPECTED_UID" --timeout=1s namespace/kube-system || {
+        printf '%s\n' 'The live kube-system UID could not be matched to the registration.' >&2
+        return 1
+      }
     }
 
     require_vacant_registration() {
@@ -126,14 +132,18 @@ _kind OPERATION PROFILE *ARGS:
       [[ "$DAEMON" == "$EXPECTED_DAEMON" ]] || refuse 'Docker daemon ID differs from the registration.'
     }
 
+    load_target_registration() {
+      [[ -f "$KCFG" && ! -L "$KCFG" && -f "$IDENTITY" && ! -L "$IDENTITY" ]] ||
+        refuse 'The kubeconfig or identity record is missing or redirected.'
+      EXPECTED_DAEMON=$(jq -er '.daemon | strings | select(length > 0)' "$IDENTITY") ||
+        refuse 'The identity record has no valid Docker daemon ID.'
+      EXPECTED_UID=$(jq -er '.uid | strings | select(length > 0)' "$IDENTITY") ||
+        refuse 'The identity record has no valid kube-system UID.'
+    }
+
     check_target_registration() {
       if [[ "$INTENT" == managed ]]; then
-        [[ -f "$KCFG" && ! -L "$KCFG" && -f "$IDENTITY" && ! -L "$IDENTITY" ]] ||
-          refuse 'The kubeconfig or identity record is missing or redirected.'
-        EXPECTED_DAEMON=$(jq -er '.daemon | strings | select(length > 0)' "$IDENTITY") ||
-          refuse 'The identity record has no valid Docker daemon ID.'
-        EXPECTED_UID=$(jq -er '.uid | strings | select(length > 0)' "$IDENTITY") ||
-          refuse 'The identity record has no valid kube-system UID.'
+        load_target_registration
       else
         : "${EXPECTED_DAEMON:?Set the registered Docker daemon ID}"
         require_vacant_registration
@@ -148,6 +158,87 @@ _kind OPERATION PROFILE *ARGS:
         [[ -z "$CLUSTER_LABELS$CLUSTER_NAMES" ]] || refuse 'The selected kind name is already in use.'
       fi
     }
+
+    bootstrap_argocd() {
+      load_target_registration
+      check_reviewed_checkout
+      RUN_DIR=$(mktemp -d "$STATE_DIR/bootstrap.XXXXXX")
+      BOOTSTRAP_PHASE='source staging'
+      trap '
+        if (( $? != 0 )); then
+          printf "Argo CD bootstrap stopped during %s. Private evidence is in %s.\n" "$BOOTSTRAP_PHASE" "$RUN_DIR" >&2
+        fi
+      ' EXIT
+      trap 'exit 130' INT
+      trap 'exit 143' TERM
+
+      OVERLAY=clusters/local-kind/perfeng-local/addons/argocd
+      printf '%s\n' "$SOURCE_REVISION" > "$RUN_DIR/source-revision.txt"
+      {
+        timeout --kill-after=5s 30s git archive --format=tar "$SOURCE_REVISION" -- "$OVERLAY" |
+          timeout --kill-after=5s 30s tar -xf - --no-same-owner --no-same-permissions -C "$RUN_DIR"
+      } 2> "$RUN_DIR/render.log"
+
+      BOOTSTRAP_PHASE=render
+      MANIFEST="$RUN_DIR/argocd.yaml"
+      timeout --kill-after=5s 120s kubectl kustomize "$RUN_DIR/$OVERLAY" \
+        > "$MANIFEST" 2>> "$RUN_DIR/render.log"
+      [[ -s "$MANIFEST" ]] || refuse 'The Argo CD render is empty.'
+      MANIFEST_CHECKSUM=$(cd "$RUN_DIR" && sha256sum -- argocd.yaml)
+      printf '%s\n' "$MANIFEST_CHECKSUM" > "$RUN_DIR/SHA256SUMS"
+
+      BOOTSTRAP_PHASE='pre-apply identity'
+      check_uid > "$RUN_DIR/identity.log" 2>&1
+
+      BOOTSTRAP_PHASE='namespace ownership'
+      OWNER_PATH='{.metadata.name}{" "}{.metadata.labels.app\.kubernetes\.io/name}{" "}{.metadata.labels.app\.kubernetes\.io/managed-by}{" "}{.metadata.labels.app\.kubernetes\.io/part-of}'
+      ARGO_OWNER=$(run_kubectl 15s "$KCFG" --request-timeout=10s \
+        get namespace argocd --ignore-not-found -o "jsonpath=$OWNER_PATH" 2>> "$RUN_DIR/identity.log")
+      [[ -z "$ARGO_OWNER" || "$ARGO_OWNER" == 'argocd argocd k8s-infrastructure kubernetes-substrate' ]] ||
+        refuse 'The argocd namespace lacks the infrastructure ownership labels.'
+
+      BOOTSTRAP_PHASE=apply
+      check_bootstrap_manifest
+      run_kubectl 120s "$KCFG" --request-timeout=30s apply --server-side --field-manager=k8s-infrastructure \
+        -f "$MANIFEST" > "$RUN_DIR/apply.log" 2>&1
+
+      BOOTSTRAP_PHASE=rollout
+      run_kubectl 250s "$KCFG" --request-timeout=240s -n argocd rollout status --timeout=240s \
+        deployment/argocd-applicationset-controller deployment/argocd-dex-server \
+        deployment/argocd-notifications-controller deployment/argocd-redis \
+        deployment/argocd-repo-server deployment/argocd-server statefulset/argocd-application-controller \
+        > "$RUN_DIR/rollout.log" 2>&1
+
+      BOOTSTRAP_PHASE=diff
+      check_bootstrap_manifest
+      run_kubectl 120s "$KCFG" --request-timeout=30s diff --server-side --field-manager=k8s-infrastructure \
+        -f "$MANIFEST" > "$RUN_DIR/diff.log" 2> "$RUN_DIR/diff.stderr.log" || {
+        rc=$?
+        printf 'Argo CD server-side diff exited %s (1 means changes, greater than 1 means error).\n' "$rc" >&2
+        exit "$rc"
+      }
+      [[ ! -s "$RUN_DIR/diff.log" ]] || refuse 'The Argo CD server-side diff is not empty.'
+
+      BOOTSTRAP_PHASE='final identity'
+      check_uid >> "$RUN_DIR/identity.log" 2>&1
+
+      BOOTSTRAP_PHASE='result recording'
+      printf '# Argo CD bootstrap\n\n- Profile %s\n- Source revision %s\n- Manifest SHA-256 %s\n- All seven rollouts passed\n- Server-side diff is empty\n- Registered UID rechecked\n' \
+        "$PROFILE" "$SOURCE_REVISION" "${MANIFEST_CHECKSUM%% *}" > "$RUN_DIR/RESULT.md.tmp"
+      mv -T -- "$RUN_DIR/RESULT.md.tmp" "$RUN_DIR/RESULT.md"
+      printf 'Argo CD bootstrap verified. Private evidence is in %s.\n' "$RUN_DIR"
+    }
+
+    check_bootstrap_manifest() {
+      [[ -f "$MANIFEST" && ! -L "$MANIFEST" && "$(< "$RUN_DIR/SHA256SUMS")" == "$MANIFEST_CHECKSUM" ]] &&
+        (cd "$RUN_DIR" && sha256sum --check --strict --status <<< "$MANIFEST_CHECKSUM") ||
+        refuse 'The rendered Argo CD manifest differs from its recorded SHA-256.'
+    }
+
+    if [[ "$OPERATION" == bootstrap ]]; then
+      bootstrap_argocd
+      exit
+    fi
 
     check_target_state() {
       if [[ "$INTENT" == managed ]]; then

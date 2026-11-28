@@ -19,7 +19,7 @@ help:
 	@echo "  make database-asset-check  Verify pinned CNPG, Barman, cert-manager and kind storage assets"
 	@echo "  make metrics-check  Strictly lint/render the verified-TLS resource metrics chart"
 	@echo "  make iac-pilot-check  Format-check, validate and test the initialized kind module offline"
-	@echo "  make kind-plan-check  Exercise local kind plan, apply and verify with the supplied KIND_TEST_JUST"
+	@echo "  make kind-plan-check  Exercise local kind operations with the supplied KIND_TEST_JUST"
 	@echo "  make pr-event-check  Validate issue linkage in the GitHub PR event"
 	@echo "  make verify     Run all offline repository-local checks"
 	@echo "  make supply-chain  Check the lock and known vulnerabilities"

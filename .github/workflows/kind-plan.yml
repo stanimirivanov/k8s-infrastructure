@@ -6,6 +6,7 @@ on:
       - .github/workflows/kind-plan.yml
       - Makefile
       - clusters/local-kind/iac-pilot/**
+      - clusters/local-kind/perfeng-local/addons/argocd/**
       - docs/local-kind-opentofu.md
       - justfile
       - tests/test_kind_just.py
@@ -15,6 +16,7 @@ on:
       - .github/workflows/kind-plan.yml
       - Makefile
       - clusters/local-kind/iac-pilot/**
+      - clusters/local-kind/perfeng-local/addons/argocd/**
       - docs/local-kind-opentofu.md
       - justfile
       - tests/test_kind_just.py
@@ -46,5 +48,5 @@ jobs:
           tar -xzf "$archive" just
           "$tools/just" --version
           printf 'KIND_TEST_JUST=%s/just\n' "$tools" >> "$GITHUB_ENV"
-      - name: Exercise local kind plan, apply and verify without cluster access
+      - name: Exercise local kind operations without cluster access
         run: make kind-plan-check
