@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import time
 from copy import deepcopy
+from urllib.parse import urlencode
 
 from . import consumer_runtime as runtime
 from .consumer_profile import LABEL, Target
@@ -35,8 +37,28 @@ def as_account(namespace: str, account: str) -> list[str]:
 
 
 def decision(
-    target: Target, actor: list[str], verb: str, kind: str, namespace: str | None, *, yes: bool
+    target: Target,
+    actor: list[str],
+    verb: str,
+    kind: str,
+    namespace: str | None,
+    *,
+    yes: bool,
+    name: str | None = None,
 ) -> None:
+    if allowed(target, actor, verb, kind, namespace, name=name) is not yes:
+        raise ValueError("Native demo SubjectAccessReview differs from expected authorization")
+
+
+def allowed(
+    target: Target,
+    actor: list[str],
+    verb: str,
+    kind: str,
+    namespace: str | None,
+    *,
+    name: str | None = None,
+) -> bool:
     attrs = {"verb": verb, "resource": kind.split(".")[0]}
     if "." in kind:
         attrs["group"] = kind.split(".", 1)[1]
@@ -44,6 +66,8 @@ def decision(
         attrs["resource"], attrs["subresource"] = attrs["resource"].split("/", 1)
     if namespace:
         attrs["namespace"] = namespace
+    if name:
+        attrs["name"] = name
     review = {
         "apiVersion": "authorization.k8s.io/v1",
         "kind": "SubjectAccessReview",
@@ -71,8 +95,9 @@ def decision(
         input_data=json.dumps(review).encode(),
     )
     status = json.loads(result)["status"]
-    if status.get("evaluationError") or status["allowed"] is not yes:
-        raise ValueError("Native demo SubjectAccessReview differs from expected authorization")
+    if status.get("evaluationError"):
+        raise ValueError("Native demo SubjectAccessReview had an evaluation error")
+    return status["allowed"]
 
 
 def create(target: Target, document: dict, actor: list[str], *, dry_run: bool = True) -> dict:
@@ -513,11 +538,131 @@ def prove(target: Target, operation: Operation, foreign: str) -> dict:
     }
 
 
+def observer_actor(operation: Operation) -> list[str]:
+    subject = operation.observer
+    if not subject or subject["kind"] != "ServiceAccount":
+        raise ValueError("Neutral Job qualification requires its provider observer ServiceAccount")
+    return as_account(subject["namespace"], subject["name"])
+
+
+def get_jobs_raw(
+    target: Target,
+    actor: list[str],
+    namespace: str,
+    *,
+    name: str | None = None,
+    selector: str | None = None,
+    watch: bool = False,
+    version: str | None = None,
+) -> str:
+    path = f"/apis/batch/v1/namespaces/{namespace}/jobs"
+    if name is not None:
+        path += f"/{name}"
+    query = {}
+    if selector is not None:
+        query["fieldSelector"] = f"metadata.name={selector}"
+    if watch:
+        query.update(watch="true", timeoutSeconds="5")
+    if version is not None:
+        query["resourceVersion"] = version
+    if query:
+        path += "?" + urlencode(query)
+    return kube(target, [*actor, "get", "--raw", path], request_timeout=15)
+
+
+def require_forbidden_job_read(
+    target: Target,
+    actor: list[str],
+    namespace: str,
+    *,
+    name: str | None = None,
+    selector: str | None = None,
+    watch: bool = False,
+) -> None:
+    try:
+        get_jobs_raw(target, actor, namespace, name=name, selector=selector, watch=watch)
+    except CommandFailure as error:
+        if error.denial == ("authorization", "forbidden"):
+            return
+        raise
+    raise ValueError("Native Job request escaped the observer's reviewed authorization")
+
+
+def prove_observer_scope(target: Target, operation: Operation, foreign: str) -> None:
+    actor, ns = observer_actor(operation), operation.namespace
+    wrong = "other-delegation-job"
+    require_forbidden_job_read(target, actor, ns, name=wrong)
+    require_forbidden_job_read(target, actor, foreign, name=operation.name)
+    for watch in (False, True):
+        require_forbidden_job_read(target, actor, ns, watch=watch)
+        require_forbidden_job_read(target, actor, ns, selector=wrong, watch=watch)
+        require_forbidden_job_read(target, actor, foreign, selector=operation.name, watch=watch)
+    denied(target, operation.job(), actor, ("authorization", "forbidden"))
+    decision(target, actor, "deletecollection", "jobs.batch", ns, yes=False)
+    for verb, resource_kind in (
+        ("update", "jobs.batch"),
+        ("patch", "jobs.batch"),
+        ("delete", "jobs.batch"),
+        ("update", "jobs/status.batch"),
+        ("patch", "jobs/status.batch"),
+    ):
+        decision(target, actor, verb, resource_kind, ns, name=operation.name, yes=False)
+
+
+def prove_observer_revoked(target: Target, operation: Operation) -> None:
+    actor, ns, name = observer_actor(operation), operation.namespace, operation.name
+    with runtime.deadline(20):
+        while allowed(target, actor, "get", "jobs.batch", ns, name=name):
+            time.sleep(1)
+    require_forbidden_job_read(target, actor, ns, name=name)
+    require_forbidden_job_read(target, actor, ns, selector=name)
+    require_forbidden_job_read(target, actor, ns, selector=name, watch=True)
+
+
+def observer_job_uid(job: dict, operation: Operation) -> str:
+    meta = job.get("metadata", {})
+    uid = meta.get("uid")
+    if (
+        job.get("kind") != "Job"
+        or job.get("apiVersion") != "batch/v1"
+        or (meta.get("namespace"), meta.get("name")) != (operation.namespace, operation.name)
+        or meta.get("labels", {}).get(ATTEMPT_LABEL) != operation.launcher
+        or not isinstance(uid, str)
+        or not uid
+    ):
+        raise ValueError("Deployment observer did not receive the exact reviewed Job identity")
+    return uid
+
+
 def run_job(target: Target, operation: Operation) -> dict:
     ns = operation.namespace
     actor = as_account(operations_namespace(target), operation.launcher)
-    job = create(target, operation.job(), actor, dry_run=False)
-    uid = job["metadata"]["uid"]
+    observer = observer_actor(operation)
+    baseline = json.loads(get_jobs_raw(target, observer, ns, selector=operation.name))
+    version = baseline.get("metadata", {}).get("resourceVersion")
+    if (
+        baseline.get("kind") != "JobList"
+        or baseline.get("items") != []
+        or not isinstance(version, str)
+        or version in {"", "0"}
+    ):
+        raise ValueError("Deployment observer could not establish an unused Job-name baseline")
+    kube(target, [*actor, "create", "-f", "-", "-o", "name"], [operation.job()])
+    # A native watch from the explicit pre-submit version replays the original
+    # addition even if the launch response arrived before the watch connects.
+    stream = get_jobs_raw(
+        target, observer, ns, selector=operation.name, watch=True, version=version
+    )
+    events = [json.loads(line) for line in stream.splitlines() if line.strip()]
+    if not events or events[0]["type"] != "ADDED":
+        raise ValueError("Deployment observer missed the original Job addition")
+    uid = observer_job_uid(events[0]["object"], operation)
+    for event in events[1:]:
+        if event["type"] != "MODIFIED" or observer_job_uid(event["object"], operation) != uid:
+            raise ValueError("Deployment observer saw a different Job or an incomplete watch")
+    observed = json.loads(get_jobs_raw(target, observer, ns, name=operation.name))
+    if observer_job_uid(observed, operation) != uid:
+        raise ValueError("Deployment observer's watch and Job read returned different identities")
     kube(
         target,
         ["-n", ns, "wait", "--for=condition=Complete", f"job/{operation.name}", "--timeout=100s"],
@@ -572,6 +717,7 @@ def run_job(target: Target, operation: Operation) -> dict:
         raise ValueError("Qualified Job Pod differs from the exact bounded operation")
     return {
         "jobUID": uid,
+        "observer": {"baselineResourceVersion": version, "firstWatchEvent": "ADDED"},
         "podUID": pod["metadata"]["uid"],
         "node": spec["nodeName"],
         "exitCode": 0,

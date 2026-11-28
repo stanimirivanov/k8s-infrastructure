@@ -236,6 +236,9 @@ def inspect_existing_job(operation: Operation, actual: dict) -> None:
 
 def preflight_attempt(target: Target, operation: Operation) -> bool:
     attempt_name = re.compile(r"demo-launch-[0-9a-f]{24}").fullmatch
+    binding_names = {operation.launcher}
+    if operation.observer:
+        binding_names.add(operation.observer_binding)
     for ns in namespaces(target):
         grants = json.loads(
             kube(
@@ -261,11 +264,11 @@ def preflight_attempt(target: Target, operation: Operation) -> bool:
                 and attempt_name(subject["name"])
                 for subject in grant.get("subjects", [])
             )
-            if not (owned or delegated):
+            if not (owned or delegated or attempt_name(meta["name"].removesuffix("-observer"))):
                 continue
             if (
                 owner != operation.launcher
-                or meta["name"] != operation.launcher
+                or meta["name"] not in binding_names
                 or ns != operation.namespace
                 or meta.get("deletionTimestamp")
             ):
@@ -298,6 +301,10 @@ def preflight_attempt(target: Target, operation: Operation) -> bool:
                 )
             ):
                 raise ValueError("Another owned Job is active or its outcome is incomplete")
+    return attempt_job(target, operation) is not None
+
+
+def attempt_job(target: Target, operation: Operation) -> dict | None:
     raw = kube(
         target,
         [
@@ -312,9 +319,10 @@ def preflight_attempt(target: Target, operation: Operation) -> bool:
         ],
     )
     if not raw.strip():
-        return False
-    inspect_existing_job(operation, json.loads(raw))
-    return True
+        return None
+    job = json.loads(raw)
+    inspect_existing_job(operation, job)
+    return job
 
 
 def configure(
@@ -323,24 +331,38 @@ def configure(
     *,
     checkpoint: Callable[[str], None] | None = None,
 ) -> None:
+    if operation:
+        try:
+            withdrawal_path(target, operation).lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            raise ValueError("Attempt has recorded withdrawal; configure a fresh reviewed attempt")
     check_prerequisites(target)
     existing_job = preflight_attempt(target, operation) if operation else False
     objects = render(target, operation)
+    if operation and operation.observer and operation.observer["kind"] == "ServiceAccount":
+        account = operation.observer
+        raw = kube(
+            target,
+            ["-n", account["namespace"], "get", "serviceaccount", account["name"], "-o", "json"],
+        )
+        if json.loads(raw)["metadata"].get("deletionTimestamp"):
+            raise ValueError("Reviewed deployment observer ServiceAccount is terminating")
     preflight = database_runtime.inventory(target, objects)
+    base = render(target) if operation else objects
+    bindings = [item for item in objects if item["kind"] == "RoleBinding"]
+    attempt_grants = [
+        item for item in bindings if item["metadata"]["labels"][OWNER_LABEL] != "base"
+    ]
     # A partially removed policy must not be silently repaired with its grants
     # still active. Withdraw the affected binding before resuming.
-    if any(key[0] == "RoleBinding" for key in preflight) and any(
-        reference(item) not in preflight
-        for item in (render(target) if operation else objects)
-        if item["kind"] != "RoleBinding"
+    if any(reference(item) in preflight for item in base if item["kind"] == "RoleBinding") and any(
+        reference(item) not in preflight for item in base if item["kind"] != "RoleBinding"
     ):
         raise ValueError("Existing base grant has incomplete controls; withdraw it before recovery")
-    if (
-        operation
-        and ("RoleBinding", operation.launcher, operation.namespace) in preflight
-        and any(
-            reference(item) not in preflight for item in objects if item["kind"] != "RoleBinding"
-        )
+    if any(reference(item) in preflight for item in attempt_grants) and any(
+        reference(item) not in preflight for item in objects if item["kind"] != "RoleBinding"
     ):
         raise ValueError(
             "Existing attempt grant has incomplete controls; withdraw it before recovery"
@@ -350,7 +372,6 @@ def configure(
         if current:
             check_document(item, current, type_checked=False)
     namespaces_to_install = [item for item in objects if item["kind"] == "Namespace"]
-    bindings = [item for item in objects if item["kind"] == "RoleBinding"]
     policies = [item for item in objects if item not in [*namespaces_to_install, *bindings]]
     if checkpoint:
         checkpoint("preflight")
@@ -402,12 +423,7 @@ def configure(
             checkpoint("controls-verified")
         for grant in bindings:
             grant_key = reference(grant)
-            if (
-                existing_job
-                and operation
-                and grant_key == ("RoleBinding", operation.launcher, operation.namespace)
-                and grant_key not in preflight
-            ):
+            if existing_job and grant in attempt_grants and grant_key not in preflight:
                 continue
             install_group(target, [grant])
             if checkpoint:
@@ -428,6 +444,7 @@ def configure_recorded(target: Target, operation: Operation | None, incarnation:
         **identity(target),
         "incarnation": incarnation,
         "operationDigest": operation.digest if operation else None,
+        **observer_handoff(operation),
         "lastCompletedPhase": "target-verified",
         "outcome": "running",
     }
@@ -449,13 +466,180 @@ def configure_recorded(target: Target, operation: Operation | None, incarnation:
     return receipt
 
 
-def qualification_operation(target: Target, image: str) -> Operation:
+def withdrawal_path(target: Target, operation: Operation) -> Path:
+    return target.directory / f"{target.name}.delegation-withdraw-{operation.launcher}.json"
+
+
+def attempt_resources(target: Target, operation: Operation) -> list[dict]:
+    return [
+        item
+        for item in render(target, operation)
+        if item["metadata"]["labels"][OWNER_LABEL] == operation.launcher
+    ]
+
+
+def withdrawal_job(target: Target, operation: Operation) -> dict:
+    job = attempt_job(target, operation)
+    uid = job["metadata"]["uid"] if job else None
+    status = job.get("status", {}) if job else {}
+    if job and (
+        status.get("active", 0)
+        or status.get("terminating", 0)
+        or any((status.get("uncountedTerminatedPods") or {}).values())
+        or not any(
+            condition["type"] in {"Complete", "Failed"} and condition["status"] == "True"
+            for condition in status.get("conditions", [])
+        )
+    ):
+        raise ValueError("Attempt must be unused or terminal before withdrawal")
+    pods = json.loads(kube(target, ["-n", operation.namespace, "get", "pods", "-o", "json"]))[
+        "items"
+    ]
+    pod_uids = []
+    for pod in pods:
+        meta = pod["metadata"]
+        owned = uid is not None and any(
+            owner.get("controller") is True
+            and (owner.get("apiVersion"), owner.get("kind"), owner.get("name"), owner.get("uid"))
+            == ("batch/v1", "Job", operation.name, uid)
+            for owner in meta.get("ownerReferences", [])
+        )
+        if not owned and meta.get("labels", {}).get(ATTEMPT_LABEL) != operation.launcher:
+            continue
+        if (
+            not owned
+            or meta.get("deletionTimestamp")
+            or pod["status"].get("phase") not in {"Succeeded", "Failed"}
+        ):
+            raise ValueError("Attempt Pods are still active or their ownership is incomplete")
+        pod_uids.append(meta["uid"])
+    return {"jobUID": uid, "podUIDs": sorted(pod_uids)}
+
+
+def delete_attempt_resource(target: Target, item: dict) -> None:
+    plurals = {
+        "RoleBinding": "rolebindings",
+        "ValidatingAdmissionPolicyBinding": "validatingadmissionpolicybindings",
+        "ValidatingAdmissionPolicy": "validatingadmissionpolicies",
+        "PodTemplate": "podtemplates",
+        "Role": "roles",
+        "ServiceAccount": "serviceaccounts",
+    }
+    kind, name, ns = reference(item)
+    path = "/api/v1" if item["apiVersion"] == "v1" else f"/apis/{item['apiVersion']}"
+    if ns:
+        path += f"/namespaces/{ns}"
+    path += f"/{plurals[kind]}/{name}"
+    runtime.command(
+        target,
+        [
+            "kubectl",
+            "--kubeconfig",
+            str(target.path("kubeconfig")),
+            "--context",
+            target.context,
+            "--request-timeout=30s",
+            "delete",
+            "--raw",
+            path,
+            "-f",
+            "-",
+        ],
+        input_data=json.dumps(
+            {
+                "apiVersion": "v1",
+                "kind": "DeleteOptions",
+                "preconditions": {key: item["metadata"][key] for key in ("uid", "resourceVersion")},
+            }
+        ).encode(),
+    )
+
+
+def withdraw(target: Target, operation: Operation, incarnation: str) -> dict:
+    """Retire one reviewed attempt under the caller's existing provider lock."""
+    path = withdrawal_path(target, operation)
+    own = {
+        **identity(target),
+        "incarnation": incarnation,
+        "operationDigest": operation.digest,
+        **observer_handoff(operation),
+    }
+    try:
+        receipt = json.loads(read_bounded(path))
+    except FileNotFoundError:
+        receipt = None
+    if receipt is not None and (
+        any(receipt.get(key) != value for key, value in own.items())
+        or receipt.get("outcome") not in {"withdrawing", "withdrawn"}
+    ):
+        raise ValueError("Withdrawal receipt does not match the reviewed attempt and target")
+    desired = attempt_resources(target, operation)
+    present = database_runtime.inventory(target, desired)
+    for item in desired:
+        actual = present.get(reference(item))
+        if actual is not None:
+            check_document(item, actual, type_checked=False)
+    uids = {
+        "/".join(part for part in key if part): item["metadata"]["uid"]
+        for key, item in present.items()
+    }
+    if receipt is not None and any(
+        receipt["resourceUIDs"].get(key) != uid for key, uid in uids.items()
+    ):
+        raise ValueError("Attempt resource was replaced after withdrawal began")
+    if receipt is not None and receipt["outcome"] == "withdrawn":
+        if present:
+            raise ValueError("Withdrawn attempt resources reappeared")
+        return receipt
+    observed = withdrawal_job(target, operation)
+    if receipt is None:
+        if not present:
+            raise ValueError("No reviewed attempt resources exist to withdraw")
+        receipt = {**own, **observed, "resourceUIDs": uids, "outcome": "withdrawing"}
+        minimal_network.save_receipt(path, receipt)
+    elif receipt["jobUID"] is not None and receipt["jobUID"] != observed["jobUID"]:
+        raise ValueError("Reviewed Job identity changed after withdrawal began")
+    launcher_key = "RoleBinding", operation.launcher, operation.namespace
+    if launcher_key in present:
+        delete_attempt_resource(target, present.pop(launcher_key))
+    launcher = probe.as_account(operations_namespace(target), operation.launcher)
+    with runtime.deadline(20):
+        while probe.allowed(target, launcher, "create", "jobs.batch", operation.namespace):
+            time.sleep(1)
+    if withdrawal_job(target, operation) != observed:
+        raise ValueError("Attempt changed during withdrawal; inspect its outcome before retrying")
+    receipt.update(observed)
+    minimal_network.save_receipt(path, receipt)
+    # Removing the admission bindings before their parameter keeps other
+    # flows free of missing-parameter errors.
+    for kind in (
+        "RoleBinding",
+        "ValidatingAdmissionPolicyBinding",
+        "ValidatingAdmissionPolicy",
+        "PodTemplate",
+        "Role",
+        "ServiceAccount",
+    ):
+        for key, item in present.items():
+            if key[0] == kind:
+                delete_attempt_resource(target, item)
+    if database_runtime.inventory(target, desired):
+        raise ValueError("Attempt withdrawal is incomplete; inspect and retry")
+    receipt["outcome"] = "withdrawn"
+    minimal_network.save_receipt(path, receipt)
+    return receipt
+
+
+def qualification_operation(
+    target: Target, image: str, *, observer: dict | None = None
+) -> Operation:
     return load_operation(
         target,
         {
             "namespace": namespaces(target)[0],
             "name": "delegation-job-probe",
             "deadlineSeconds": 90,
+            **({"observer": observer} if observer else {}),
             "podSpec": {
                 "securityContext": {"runAsUser": 65532, "runAsGroup": 65532},
                 "containers": [
@@ -593,12 +777,17 @@ def qualify(target: Target, request: dict, host_id: str) -> dict:
         ):
             raise ValueError("Predecessor installed evidence is incomplete or changed")
         images = probe_images()
-        operation = qualification_operation(target, images[0])
+        foreign = f"{target.consumer}-demo-foreign-control"
+        observer_account = "delegation-job-observer"
+        operation = qualification_operation(
+            target,
+            images[0],
+            observer={"kind": "ServiceAccount", "name": observer_account, "namespace": foreign},
+        )
         cached = minimal_network.staged_images(
             target, journals, {"control-plane": [], "worker": list(images)}
         )
         bounds = worker_headroom(target, database, network)
-        foreign = f"{target.consumer}-demo-foreign-control"
         spaces = [*render_namespaces(target), resource("Namespace", foreign, None)]
         if database_runtime.inventory(
             target, [*spaces, *render(target, operation)]
@@ -616,6 +805,7 @@ def qualify(target: Target, request: dict, host_id: str) -> dict:
             "incarnation": incarnation,
             "databaseReceiptDigest": host_admission.digest(database),
             "operationDigest": operation.digest,
+            **observer_handoff(operation),
             "namespaceRoles": list(namespaces(target)),
             "cachedImages": cached,
             "hostAdmission": cold["networkAdmission"],
@@ -640,12 +830,34 @@ def qualify(target: Target, request: dict, host_id: str) -> dict:
                     [],
                     dry_run=False,
                 )
+                probe.create(
+                    target,
+                    resource(
+                        "ServiceAccount",
+                        observer_account,
+                        foreign,
+                        automountServiceAccountToken=False,
+                    ),
+                    [],
+                    dry_run=False,
+                )
                 configure(target, operation)
                 publish("delegation")
             with failure.phase("authorization-and-admission", "dependency-failure"):
                 receipt["nativeControls"] = probe.prove(target, operation, foreign)
+                probe.prove_observer_scope(target, operation, foreign)
                 receipt["nativeControls"]["neutralJob"] = probe.run_job(target, operation)
                 publish("authorization-and-admission")
+            with failure.phase("attempt-withdrawal", "dependency-failure"):
+                withdrawal = withdraw(target, operation, incarnation)
+                probe.prove_observer_revoked(target, operation)
+                receipt["nativeControls"]["attemptWithdrawal"] = {
+                    "jobUID": withdrawal["jobUID"],
+                    "observerAccessRevoked": True,
+                }
+                if withdrawal["jobUID"] != receipt["nativeControls"]["neutralJob"]["jobUID"]:
+                    raise ValueError("Withdrawal did not retain the observer's exact Job identity")
+                publish("attempt-withdrawal")
             with failure.phase("retained-filesystem", "dependency-failure"):
                 minimal_network.disk_floor(request, host_id, cold["networkAdmission"])
                 verify_storage_helper(target, database)
@@ -665,7 +877,7 @@ def qualify(target: Target, request: dict, host_id: str) -> dict:
                     or minimal_bootstrap.source_digest() != cold["artifactDigest"]
                 ):
                     raise ValueError("Unrelated resource, target identity or source changed")
-                inspect(target, render(target, operation))
+                inspect(target, render(target))
                 receipt["finalHostDiskFreeBytes"] = minimal_network.disk_floor(
                     request, host_id, cold["networkAdmission"]
                 )
@@ -682,7 +894,11 @@ def qualify(target: Target, request: dict, host_id: str) -> dict:
 
 
 def preview(target: Target, action: str, operation: Operation | None) -> dict:
-    objects = render(target, operation)
+    objects = (
+        attempt_resources(target, operation)
+        if action == "withdraw" and operation
+        else render(target, operation)
+    )
     return {
         **identity(target),
         "action": action,
@@ -694,6 +910,7 @@ def preview(target: Target, action: str, operation: Operation | None) -> dict:
             "digest": operation.digest,
             "namespace": operation.namespace,
             "launcher": operation.launcher,
+            **observer_handoff(operation),
         }
         if operation
         else None,
@@ -703,9 +920,17 @@ def preview(target: Target, action: str, operation: Operation | None) -> dict:
     }
 
 
+def observer_handoff(operation: Operation | None) -> dict:
+    if operation and operation.observer:
+        return {
+            "observer": {"subject": operation.observer, "roleBinding": operation.observer_binding}
+        }
+    return {}
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("configure", "health", "qualify", "job"))
+    parser.add_argument("action", choices=("configure", "health", "qualify", "job", "withdraw"))
     parser.add_argument("--consumer", required=True)
     parser.add_argument("--docker-context", required=True)
     parser.add_argument("--state-root", required=True, type=Path)
@@ -729,6 +954,8 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError(
                 "Qualification uses a disposable qual- target and a built-in neutral attempt"
             )
+        if args.action == "withdraw" and operation is None:
+            raise ValueError("Withdrawal requires the reviewed operation file")
         if args.action == "job":
             if args.execute or operation is None:
                 raise ValueError(
@@ -751,6 +978,8 @@ def main(argv: list[str] | None = None) -> int:
                     owned = consumer_lifecycle.owned(target, require_ready=False)
                     if args.action == "configure":
                         result = configure_recorded(target, operation, owned["incarnation"])
+                    elif args.action == "withdraw" and operation is not None:
+                        result = withdraw(target, operation, owned["incarnation"])
                     else:
                         check_prerequisites(target)
                         inspect(target, render(target, operation))
@@ -759,6 +988,7 @@ def main(argv: list[str] | None = None) -> int:
                             "incarnation": owned["incarnation"],
                             "outcome": "observed",
                             "operationDigest": operation.digest if operation else None,
+                            **observer_handoff(operation),
                         }
         print(json.dumps(result, indent=2))
         return 0

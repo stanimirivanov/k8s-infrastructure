@@ -10,6 +10,8 @@ Status: installed qualification requires a separately authorized disposable run.
   workload namespaces. The provider owns the separate launcher namespace.
 - Approve one exact application or data Job attempt at a time. The attempt
   binds one launcher identity, one Job name and one reviewed Pod specification.
+- Opt in an existing deployment observer to read the exact Job and watch its
+  creation from an empty list. Withdraw both grants when the attempt ends.
 - Qualify the permissions and filesystem on a disposable target. Keep the
   receipt, Pods and retained claim for inspection.
 
@@ -97,6 +99,14 @@ application attempt with the filesystem probe image uses this input:
 
 Review every image, command, credential reference, mount and resource bound.
 Store the document outside Git and supply references instead of secret values.
+To delegate observation, add `"observer": {"kind": "ServiceAccount", "name":
+"job-observer", "namespace": "deployment"}` to the operation document. An
+individual Kubernetes `User` uses `kind` and `name`, with the exact authenticated
+username. Select an existing identity whose other roles and group memberships
+provide no additional Job permissions. Include this subject in the existing
+attempt review. The subject participates in the operation digest. A document
+without `observer` keeps its existing digest and authorization.
+
 Use the preview's digest to identify the approved attempt. Render its exact
 Job manifest offline into a private file for the launcher:
 
@@ -119,6 +129,18 @@ data namespace can host a separately reviewed administrative operation.
 The deployment operator reviews and stages any Secret and ConfigMap references
 before approval. Stage immutable operator-owned inputs for attempts that
 consume credentials or execute commands from configuration.
+
+The observer grant provides Batch Job `get`, `list` and `watch` for the
+reviewed Job name in its workload namespace. Both list and watch require
+`fieldSelector=metadata.name=<reviewed-job-name>`. Before the initial POST,
+list that name as the observer, verify `items` is empty and retain the list's
+`metadata.resourceVersion`. Start a namespaced Job watch with the same
+selector and that resource version. Use the first `ADDED` event to obtain the
+server-assigned UID and compare the named GET with it. Treat an expired watch
+version, a missing creation event, or different Job identity as incomplete
+observation. The [Kubernetes RBAC resource-name rules](https://kubernetes.io/docs/reference/access-authn-authz/rbac/#referring-to-resources)
+and [watch version semantics](https://kubernetes.io/docs/reference/using-api/api-concepts/#semantics-for-watch)
+define this behavior.
 
 ## Configure and inspect
 
@@ -146,6 +168,12 @@ The provider records completed phases and the last observed grant in a
 private `<target>.delegation-configure-*.json` receipt. If configure is interrupted,
 inspect the exact grants and the receipt before retrying. Run `health` with
 the same inputs and explicit target confirmation for live inventory.
+The preview and configure receipt identify the observer subject and the
+attempt RoleBinding. Use that identity, target, namespace, Job name and digest
+for handoff. Review which groups and roles affect the observer on the target.
+A `Forbidden` on collection reads warrants checking the selected namespace,
+exact `metadata.name` selector and binding. Treat a withdrawn attempt as
+retired and prepare a fresh reviewed name for the next attempt.
 
 ## Disposable qualification and evidence
 
@@ -169,8 +197,12 @@ The gate checks positive and forbidden API operations as the exact scoped
 identities. It tests ordinary controllers, refused controller credential
 paths, denied reconciler access to Secrets and operator-side CNPG admission.
 It also dry-runs unrelated Jobs in the reviewed and a foreign namespace.
-It submits one neutral Job as the launcher and verifies its terminal success
-and exact Pod owner. Each workload namespace opts into `local-retained`
+Its neutral observer lists the unused name, watches from the pre-submit
+resource version and reads the first server-assigned UID. The launcher
+submits one neutral Job. The gate checks terminal success and the exact Pod
+owner, verifies that unfiltered, wrong-name and wrong-namespace reads and
+Job mutations are denied, and confirms that the exact observer reads are
+revoked after withdrawal. Each workload namespace opts into `local-retained`
 Filesystem RWO claims of whole 1–4Gi, with at most four and 8Gi requested per
 namespace. The quotas measure requested storage. The installed filesystem
 probe binds one neutral 1Gi application claim, verifies its Retain PV identity
@@ -186,7 +218,9 @@ waits are at most 90 seconds within that deadline. The private
 `<target>.delegation-qualification.json` records source, target, admission,
 binding, checks and outcomes. A failed gate leaves its neutral objects and
 the last completed phase for diagnosis. Keep kubeconfig, raw diagnostics and
-credentials outside Git. Whole-target cleanup uses the separately confirmed
+credentials outside Git. Record the reviewed, published provider commit in
+the downstream qualification and compare it with the provider receipt's
+`sourceProvenance`. Whole-target cleanup uses the separately confirmed
 [cold-bootstrap removal procedure](minimal-bootstrap.md#failure-diagnosis-and-explicit-cleanup).
 
 ## Withdrawal and retained state
@@ -198,16 +232,26 @@ application results in its private receipt. Give downstream consumers the
 sanitized receipt. The launcher has named Job and PodTemplate reads and does
 not have Pod logs, exec or cleanup access.
 
-Verify the exact attempt is unused or wait for its Job to reach a terminal
-condition with all Pods accounted for and its receipt collected. The provider
-then withdraws the attempt RoleBinding. Select the `launcher` name from the
-preview and verify the binding UID, subject and ownership labels. Under
-provider authority, remove or disable the attempt's named parameterized
-ValidatingAdmissionPolicyBinding before deleting its PodTemplate parameter.
-The namespace and attempt marker constrain missing-parameter denial to
-the reviewed attempt. Keep shared admission policies and namespace state.
-Remove the attempt's remaining controller policy and ServiceAccounts only
-after outstanding execution is accounted for.
+Stop launcher submissions and close any observer watch connections. Verify
+the exact attempt is unused or wait for its Job to reach a terminal condition
+with all Pods accounted for and its receipt collected. Preview withdrawal
+with the same reviewed operation, then execute it on the same exact target.
+
+```sh
+uv run --locked --offline python -m scripts.minimal_delegation withdraw \
+  --consumer example --docker-context default --state-root /private/state \
+  --https-port 18443 --operation /private/attempt.json \
+  --confirm-target example-local --execute
+```
+
+Withdrawal verifies the target, matching subject, rules and ownership labels.
+It revokes the launcher binding and rechecks outstanding execution before
+removing the observer binding and attempt controls. The provider deletes the
+parameterized admission binding before its PodTemplate. The Job, Pods,
+existing observer identity, shared admission and namespace state are retained.
+The private `<target>.delegation-withdraw-*.json` receipt records the exact
+resource UIDs so a retry can refuse replacement objects. If interrupted,
+inspect the Job and receipt and repeat withdrawal with the same operation.
 
 The deployment operator can then delete the exact owned Job and its Pods with
 UID-scoped cleanup. Retain historical receipts and use a fresh reviewed Job

@@ -6,6 +6,7 @@ import unittest
 from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import patch
+from urllib.parse import parse_qs, urlsplit
 
 from scripts import minimal_delegation
 from scripts.consumer_profile import LABEL, MINIMAL_PROFILE, Target
@@ -19,6 +20,245 @@ from scripts.minimal_delegation_policy import (
 
 
 class MinimalDelegationTests(unittest.TestCase):
+    def test_neutral_job_uses_observer_uid_from_the_pre_submit_list_version(self):
+        target = Target("qual-demo", "default", Path("/tmp"), MINIMAL_PROFILE, 18443)
+        operation = minimal_delegation.qualification_operation(
+            target,
+            "probe@sha256:" + "1" * 64,
+            observer={"kind": "ServiceAccount", "namespace": "deployment", "name": "observer"},
+        )
+        submitted = False
+        observed_uid = "server-assigned-uid"
+        job = operation.job()
+        job["metadata"]["uid"] = observed_uid
+        job["status"] = {"succeeded": 1}
+        actions = []
+        observer = "--as=system:serviceaccount:deployment:observer"
+
+        def api(_target, args, documents=None, **_kwargs):
+            nonlocal submitted
+            if "--raw" in args:
+                self.assertIn(observer, args)
+                uri = urlsplit(args[args.index("--raw") + 1])
+                self.assertTrue(
+                    uri.path.startswith(f"/apis/batch/v1/namespaces/{operation.namespace}/jobs")
+                )
+                if uri.path.endswith("/" + operation.name):
+                    self.assertTrue(submitted)
+                    actions.append("get")
+                    return json.dumps(job)
+                query = parse_qs(uri.query)
+                self.assertEqual(query["fieldSelector"], [f"metadata.name={operation.name}"])
+                if query.get("watch") == ["true"]:
+                    self.assertTrue(submitted)
+                    self.assertEqual(query["resourceVersion"], ["401"])
+                    actions.append("watch")
+                    return json.dumps({"type": "ADDED", "object": job}) + "\n"
+                self.assertFalse(submitted)
+                actions.append("list")
+                return '{"kind":"JobList","metadata":{"resourceVersion":"401"},"items":[]}'
+            if "create" in args:
+                self.assertFalse(submitted)
+                self.assertNotIn(observer, args)
+                self.assertEqual(documents, [operation.job()])
+                submitted = True
+                actions.append("submit")
+                self.assertEqual(args[-2:], ["-o", "name"])
+                return "job.batch/delegation-job-probe\n"
+            if "wait" in args:
+                return ""
+            if "job" in args:
+                return json.dumps(job)
+            self.assertIn(f"batch.kubernetes.io/controller-uid={observed_uid}", args)
+            pod = {
+                "metadata": {
+                    "uid": "exact-pod",
+                    "ownerReferences": [{"controller": True, "uid": observed_uid}],
+                },
+                "spec": {**operation.pod, "nodeName": target.name + "-worker"},
+                "status": {
+                    "phase": "Succeeded",
+                    "containerStatuses": [
+                        {"restartCount": 0, "state": {"terminated": {"exitCode": 0}}}
+                    ],
+                },
+            }
+            return json.dumps({"items": [pod]})
+
+        with patch.object(minimal_delegation.probe, "kube", side_effect=api):
+            evidence = minimal_delegation.probe.run_job(target, operation)
+        self.assertEqual(actions, ["list", "submit", "watch", "get"])
+        self.assertEqual(evidence["jobUID"], observed_uid)
+        self.assertEqual(evidence["observer"]["baselineResourceVersion"], "401")
+
+    def test_withdrawal_refuses_an_inflight_job_and_does_not_regrant_an_unused_attempt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Target("qual-demo", "default", Path(directory), MINIMAL_PROFILE, 18443)
+            target.directory.mkdir()
+            operation = minimal_delegation.qualification_operation(
+                target,
+                "probe@sha256:" + "1" * 64,
+                observer={"kind": "ServiceAccount", "namespace": "deployment", "name": "observer"},
+            )
+            job = operation.job()
+            uid = "b3be3cd3-9b8e-4681-9132-ce9e9a78526f"
+            job["metadata"]["uid"] = uid
+            job["spec"].update(
+                suspend=False,
+                manualSelector=False,
+                completionMode="NonIndexed",
+                selector={"matchLabels": {"batch.kubernetes.io/controller-uid": uid}},
+            )
+            job["spec"]["template"]["metadata"]["labels"].update(
+                {
+                    "batch.kubernetes.io/controller-uid": uid,
+                    "batch.kubernetes.io/job-name": operation.name,
+                    "controller-uid": uid,
+                    "job-name": operation.name,
+                }
+            )
+            job_raw = json.dumps(job)
+            objects = {}
+            for item in render(target, operation):
+                key = minimal_delegation.reference(item)
+                item["metadata"].update(
+                    uid="uid-" + "-".join(x for x in key if x), resourceVersion="99"
+                )
+                objects[key] = item
+            deleted = []
+            interrupt = True
+
+            def delete(_target, args, *, input_data):
+                nonlocal interrupt
+                path = args[args.index("--raw") + 1]
+                preconditions = json.loads(input_data)["preconditions"]
+                found = next(
+                    key
+                    for key, item in objects.items()
+                    if path.endswith("/" + key[1])
+                    and item["metadata"]["uid"] == preconditions["uid"]
+                )
+                self.assertEqual(preconditions["resourceVersion"], "99")
+                if found[:2] == ("RoleBinding", operation.observer_binding) and interrupt:
+                    interrupt = False
+                    raise OSError("interrupted before observer binding deletion")
+                deleted.append(found)
+                objects.pop(found)
+                return "{}"
+
+            def cluster(_target, args):
+                if args[:5] == ["-n", operation.namespace, "get", "job", operation.name]:
+                    return job_raw
+                if args[:4] == ["-n", operation.namespace, "get", "pods"]:
+                    return '{"items": []}'
+                self.fail(args)
+
+            with (
+                patch.object(minimal_delegation, "kube", side_effect=cluster),
+                patch.object(minimal_delegation, "check_prerequisites"),
+                patch.object(
+                    minimal_delegation.database_runtime,
+                    "inventory",
+                    side_effect=lambda _, desired: {
+                        key: objects[key]
+                        for item in desired
+                        if (key := minimal_delegation.reference(item)) in objects
+                    },
+                ),
+                patch.object(minimal_delegation.probe, "allowed", return_value=False),
+                patch.object(minimal_delegation.runtime, "command", side_effect=delete),
+            ):
+                with self.assertRaisesRegex(ValueError, "unused or terminal"):
+                    minimal_delegation.withdraw(target, operation, "incarnation")
+                self.assertEqual(deleted, [])
+                job_raw = ""
+                with self.assertRaisesRegex(OSError, "interrupted"):
+                    minimal_delegation.withdraw(target, operation, "incarnation")
+                with self.assertRaisesRegex(ValueError, "withdrawal"):
+                    minimal_delegation.configure(target, operation)
+                key = "RoleBinding", operation.observer_binding, operation.namespace
+                metadata = objects[key]["metadata"]
+                original_uid = metadata["uid"]
+                metadata["uid"] = "replacement-uid"
+                with self.assertRaisesRegex(ValueError, "replaced"):
+                    minimal_delegation.withdraw(target, operation, "incarnation")
+                self.assertIn(key, objects)
+                metadata["uid"] = original_uid
+                receipt = minimal_delegation.withdraw(target, operation, "incarnation")
+                self.assertEqual(receipt["outcome"], "withdrawn")
+                self.assertEqual(
+                    deleted[:2],
+                    [
+                        ("RoleBinding", operation.launcher, operation.namespace),
+                        ("RoleBinding", operation.observer_binding, operation.namespace),
+                    ],
+                )
+                self.assertTrue(
+                    all(
+                        item["metadata"]["labels"][OWNER_LABEL] == "base"
+                        for item in objects.values()
+                    )
+                )
+                self.assertEqual(
+                    minimal_delegation.withdraw(target, operation, "incarnation"), receipt
+                )
+                with self.assertRaisesRegex(ValueError, "withdrawal"):
+                    minimal_delegation.configure(target, operation)
+
+    def test_observer_is_opt_in_and_exact_job_authority_is_bound_to_the_review(self):
+        target = Target("qual-demo", "default", Path("/tmp"), MINIMAL_PROFILE, 18443)
+        reviewed = {
+            "namespace": "qual-demo-apps",
+            "name": "neutral-attempt",
+            "deadlineSeconds": 60,
+            "podSpec": {
+                "containers": [
+                    {
+                        "name": "run",
+                        "image": "probe@sha256:" + "1" * 64,
+                        "resources": {
+                            "requests": {"cpu": "50m", "memory": "64Mi"},
+                            "limits": {"cpu": "100m", "memory": "64Mi"},
+                        },
+                    }
+                ]
+            },
+        }
+        subject = {"kind": "ServiceAccount", "namespace": "deployment", "name": "observer"}
+        legacy = load_operation(target, reviewed)
+        operation = load_operation(target, {**reviewed, "observer": subject})
+        self.assertNotEqual(operation.digest, legacy.digest)
+        self.assertEqual(
+            legacy.digest, "sha256:0710ee191080bee6da77edf3c4f949230f3b1095ed499018a43a55013cca2f5b"
+        )
+        name = operation.launcher + "-observer"
+        added = [item for item in render(target, operation) if item["metadata"]["name"] == name]
+        self.assertEqual(len(added), 2)
+        role, grant = added
+        for item in added:
+            self.assertEqual(item["metadata"]["namespace"], "qual-demo-apps")
+            self.assertEqual(item["metadata"]["labels"][OWNER_LABEL], operation.launcher)
+        self.assertEqual(
+            role["rules"],
+            [
+                {
+                    "apiGroups": ["batch"],
+                    "resources": ["jobs"],
+                    "verbs": ["get", "list", "watch"],
+                    "resourceNames": ["neutral-attempt"],
+                }
+            ],
+        )
+        self.assertEqual(grant["subjects"], [subject])
+        self.assertEqual(grant["roleRef"]["name"], name)
+        self.assertFalse(
+            any(item["metadata"]["name"].endswith("-observer") for item in render(target, legacy))
+        )
+        self.assertEqual(
+            minimal_delegation.preview(target, "configure", operation)["operation"]["observer"],
+            {"subject": subject, "roleBinding": name},
+        )
+
     def test_launcher_receives_one_named_attempt_without_runtime_or_reconciler_authority(self):
         with tempfile.TemporaryDirectory() as directory:
             target = Target("qual-demo", "default", Path(directory), MINIMAL_PROFILE, 18443)
